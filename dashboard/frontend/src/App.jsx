@@ -1,16 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
-  Activity, AlertTriangle, Cpu, Database, GitBranch, Hand, Pause, Play,
-  Radio, Square, Zap,
+  Activity, AlertTriangle, Cpu, Database, GitBranch, Radio, Satellite, Zap,
 } from 'lucide-react'
 import {
   CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
 
 import { Wordmark } from './components/Logo'
+import { Launcher } from './components/Launcher'
+import { MissionControl } from './components/MissionControl'
 import { Pipeline } from './components/Pipeline'
-import { Backdrop, Badge, Button, Meter, Panel, PanelTitle, Ring, Stat, cn } from './components/ui'
+import { Backdrop, Badge, Meter, Panel, PanelTitle, Ring, Stat, cn } from './components/ui'
 
 // Relative base so the app works at "/" locally and under SageMaker's
 // /jupyterlab/default/proxy/8501/ prefix without a rebuild.
@@ -135,19 +136,12 @@ export default function App() {
         <Pipeline snapshot={snap} />
 
         {/* ---- control deck ---- */}
-        <Panel glow>
-          <PanelTitle right={<span className="font-mono text-[0.6rem] text-slate-600">{snap?.logs_dir}</span>}>
-            Mission Control
-          </PanelTitle>
-          <div className="flex flex-wrap items-center gap-3 px-4 py-4">
-            <ControlDeck state={state} post={post} notify={notify} />
-            <div className="mx-1 h-8 w-px bg-edge" />
-            <Launcher
-              datasets={datasets}
-              agentRunning={snap?.agent_running}
-              post={post}
-              notify={notify}
-            />
+        <MissionControl snap={snap} post={post} notify={notify} datasets={datasets} />
+
+        <Panel>
+          <PanelTitle>Launch</PanelTitle>
+          <div className="px-4 py-3">
+            <Launcher datasets={datasets} snap={snap} post={post} notify={notify} />
           </div>
         </Panel>
 
@@ -159,25 +153,29 @@ export default function App() {
             >
               Current Run
             </PanelTitle>
-            <div className="grid grid-cols-2 divide-x divide-y divide-edge/50 sm:grid-cols-3 lg:grid-cols-4">
-              <Stat label="Dataset" value={run.dataset || '--'} sub={run.task_type} />
-              <Stat label="Model" value={run.model || '--'} sub={run.optimizer} />
-              <Stat
-                label="Epoch"
-                value={run.epochs ? `${run.epoch ?? 0}/${run.epochs}` : '--'}
-                sub={run.scheduler ? `sched ${run.scheduler}` : null}
-              />
-              <Stat label="Train loss" value={fmtNum(run.train_loss)} tone="text-amber-300" />
-              <Stat
-                label={run.metric_name || 'val metric'}
-                value={fmtNum(run.val_metric)}
-                tone="text-emerald-300"
-                sub="VALIDATION split"
-              />
-              <Stat label="Best so far" value={fmtNum(run.best_val_metric)} tone="text-emerald-300" />
-              <Stat label="Elapsed" value={fmtDur(run.elapsed_seconds)} />
-              <Stat label="ETA" value={fmtDur(snap?.eta_seconds)} tone="text-sky-300" />
-            </div>
+            {run.run_id ? (
+              <div className="grid grid-cols-2 divide-x divide-y divide-edge/50 sm:grid-cols-3 lg:grid-cols-4">
+                <Stat label="Dataset" value={run.dataset || '--'} sub={run.task_type} />
+                <Stat label="Model" value={run.model || '--'} sub={run.optimizer} />
+                <Stat
+                  label="Epoch"
+                  value={run.epochs ? `${run.epoch ?? 0}/${run.epochs}` : '--'}
+                  sub={run.scheduler ? `sched ${run.scheduler}` : null}
+                />
+                <Stat label="Train loss" value={fmtNum(run.train_loss)} tone="text-amber-300" />
+                <Stat
+                  label={run.metric_name || 'val metric'}
+                  value={fmtNum(run.val_metric)}
+                  tone="text-emerald-300"
+                  sub="VALIDATION split"
+                />
+                <Stat label="Best so far" value={fmtNum(run.best_val_metric)} tone="text-emerald-300" />
+                <Stat label="Elapsed" value={fmtDur(run.elapsed_seconds)} />
+                <Stat label="ETA" value={fmtDur(snap?.eta_seconds)} tone="text-sky-300" />
+              </div>
+            ) : (
+              <IdleNotice agentRunning={snap?.agent_running} />
+            )}
           </Panel>
 
           <Panel className="lg:col-span-4">
@@ -185,12 +183,12 @@ export default function App() {
             <div className="flex items-center justify-around px-2 py-4">
               <Ring
                 value={epochPct}
-                label={run.epochs ? `${Math.round(epochPct * 100)}%` : '--'}
+                label={run.run_id ? (run.epochs ? `${Math.round(epochPct * 100)}%` : '--') : '—'}
                 sub="run"
               />
               <Ring
                 value={typeof run.val_metric === 'number' ? run.val_metric : 0}
-                label={fmtNum(run.val_metric, 3)}
+                label={run.run_id ? fmtNum(run.val_metric, 3) : '—'}
                 sub="val"
                 tone="#22c55e"
                 size={96}
@@ -352,113 +350,21 @@ export default function App() {
   )
 }
 
-/** Buttons mirror gotrain/control.py's VALID_TRANSITIONS exactly -- an
- *  action that isn't legal from the current state is simply not offered. */
-function ControlDeck({ state, post, notify }) {
-  const act = async (action, label) => {
-    const r = await post('api/control', { action })
-    if (r) notify(label)
-  }
-  if (!state) return <span className="font-mono text-xs text-slate-600">waiting for state...</span>
-
+/** Shown in place of a blank/dashed stats grid when no run is active --
+ *  distinguishes "the agent is up and will start a run shortly" from
+ *  "nothing is running at all", instead of looking like broken telemetry. */
+function IdleNotice({ agentRunning }) {
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      {state === 'RUNNING_AUTONOMOUSLY' && (
-        <>
-          <Button variant="warn" onClick={() => act('pause', 'Pause requested')}>
-            <Pause className="h-4 w-4" /> Pause
-          </Button>
-          <Button onClick={() => act('manual', 'Manual control taken')}>
-            <Hand className="h-4 w-4" /> Manual
-          </Button>
-        </>
-      )}
-      {state === 'PAUSE_REQUESTED' && (
-        <Button variant="ghost" onClick={() => act('cancel_pause', 'Pause cancelled')}>
-          Cancel pause
-        </Button>
-      )}
-      {state === 'PAUSED_FOR_ENGINEER' && (
-        <>
-          <Button variant="primary" onClick={() => act('resume', 'Resume requested')}>
-            <Play className="h-4 w-4" /> Resume
-          </Button>
-          <Button onClick={() => act('manual', 'Manual control taken')}>
-            <Hand className="h-4 w-4" /> Manual
-          </Button>
-        </>
-      )}
-      {state === 'MANUAL_CONTROL' && (
-        <Button variant="primary" onClick={() => act('resume', 'Resume requested')}>
-          <Play className="h-4 w-4" /> Resume autonomous
-        </Button>
-      )}
-      {state === 'FAILED_SAFE' && (
-        <Button variant="danger" onClick={() => act('acknowledge_failure', 'Failure acknowledged')}>
-          <AlertTriangle className="h-4 w-4" /> Acknowledge
-        </Button>
-      )}
-      {(state === 'ROLLBACK_REQUESTED' || state === 'ROLLBACK_VERIFYING') && (
-        <span className="font-mono text-xs text-amber-300">rollback in progress...</span>
-      )}
-      {state === 'COMPLETED' && (
-        <span className="font-mono text-xs text-emerald-300">final model submitted</span>
-      )}
-    </div>
-  )
-}
-
-function Launcher({ datasets, agentRunning, post, notify }) {
-  const [dataset, setDataset] = useState('')
-  const [maxRuns, setMaxRuns] = useState(6)
-  const [runMinutes, setRunMinutes] = useState(5)
-
-  useEffect(() => {
-    if (!dataset && datasets.length) setDataset(datasets[0].dataset)
-  }, [datasets, dataset])
-
-  const start = async () => {
-    const r = await post('api/agent/start', {
-      dataset,
-      max_runs: Number(maxRuns),
-      run_minutes: Number(runMinutes),
-    })
-    if (r) notify(`Agent started on ${dataset} (pid ${r.pid})`)
-  }
-  const stop = async () => {
-    const r = await post('api/agent/stop')
-    if (r) notify(`Agent stopped (pid ${r.stopped_pid})`)
-  }
-
-  const field = 'rounded-md border border-edge bg-slate-900/70 px-2 py-1.5 font-mono text-xs text-slate-200'
-
-  return (
-    <div className="flex flex-wrap items-center gap-2">
-      <select className={field} value={dataset} onChange={(e) => setDataset(e.target.value)}>
-        {datasets.length === 0 && <option value="">no datasets</option>}
-        {datasets.map((d) => (
-          <option key={d.dataset} value={d.dataset}>{d.dataset}</option>
-        ))}
-      </select>
-      <label className="flex items-center gap-1 font-mono text-[0.6rem] uppercase text-slate-500">
-        runs
-        <input type="number" min={1} max={50} value={maxRuns}
-          onChange={(e) => setMaxRuns(e.target.value)} className={cn(field, 'w-14')} />
-      </label>
-      <label className="flex items-center gap-1 font-mono text-[0.6rem] uppercase text-slate-500">
-        min/run
-        <input type="number" min={1} max={600} value={runMinutes}
-          onChange={(e) => setRunMinutes(e.target.value)} className={cn(field, 'w-16')} />
-      </label>
-      {agentRunning ? (
-        <Button variant="danger" onClick={stop}>
-          <Square className="h-4 w-4" /> Stop agent
-        </Button>
-      ) : (
-        <Button variant="primary" onClick={start} disabled={!dataset}>
-          <Play className="h-4 w-4" /> Start GoTrain
-        </Button>
-      )}
+    <div className="flex flex-col items-center justify-center gap-2 px-4 py-10 text-center">
+      <Satellite className={cn('h-6 w-6 text-slate-600', agentRunning && 'animate-pulse text-sky-400')} />
+      <div className="font-mono text-xs uppercase tracking-[0.15em] text-slate-500">
+        {agentRunning ? 'Waiting for next experiment…' : 'No mission running'}
+      </div>
+      <div className="font-mono text-[0.62rem] text-slate-600">
+        {agentRunning
+          ? 'the agent is between runs -- planning, evaluating, or deciding next steps'
+          : 'use Launch below to start a Quick Test or a full Mission'}
+      </div>
     </div>
   )
 }

@@ -208,6 +208,71 @@ def api_control(req: TransitionRequest) -> dict:
     return {"ok": True, "control": data}
 
 
+# ---------------------------------------------------------------------------
+# Manual-control actions: approvals + rollback. Thin passthroughs to
+# gotrain.approval / gotrain.rollback -- the same functions the old
+# Streamlit dashboard called directly. No new business logic here.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/approvals")
+def api_approvals(status: Optional[str] = None) -> dict:
+    from gotrain import approval
+
+    return {"proposals": approval.list_proposals(status=status)}
+
+
+class ApprovalDecisionRequest(BaseModel):
+    key: str
+    approve: bool
+    decision_reason: Optional[str] = None
+
+
+@app.post("/api/approvals/decide")
+def api_approvals_decide(req: ApprovalDecisionRequest) -> dict:
+    from gotrain import approval
+
+    try:
+        record = approval.decide(
+            req.key, req.approve, decided_by="engineer", decision_reason=req.decision_reason
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"ok": True, "proposal": record}
+
+
+@app.get("/api/rollback/versions")
+def api_rollback_versions(dataset: str) -> dict:
+    from gotrain import registry
+    from gotrain.rollback import get_active_version
+
+    try:
+        versions = registry.list_versions(dataset)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"dataset": dataset, "active_version": get_active_version(dataset), "versions": versions}
+
+
+class RollbackRequest(BaseModel):
+    dataset: str
+    version: str
+    task_type: str
+
+
+@app.post("/api/rollback/execute")
+def api_rollback_execute(req: RollbackRequest) -> dict:
+    from gotrain.rollback import RollbackConflictError, RollbackVerificationError, execute_rollback
+
+    try:
+        result = execute_rollback(req.dataset, req.version, req.task_type, requested_by="engineer")
+    except RollbackConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RollbackVerificationError as exc:
+        # execute_rollback already drove control to FAILED_SAFE; surface
+        # the reason but this is not a "retry the request" style error.
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"ok": True, "result": result}
+
+
 class StartRequest(BaseModel):
     dataset: str
     max_runs: int = 6
