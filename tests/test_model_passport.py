@@ -168,3 +168,33 @@ def test_format_passport_markdown_includes_key_sections(isolated_env):
     assert "## Data Provenance and Quality" in text
     assert "## Known Limitations" in text
     assert "## Robustness Results" in text
+
+
+def test_format_passport_html_renders_self_contained_document(isolated_env):
+    record = ledger.add_run("m-eurosat", {"backbone": "resnet18"}, val_metric=0.9, task_type="classification")
+    ledger.update_run(record["run_id"], submitted_final=True)
+    passport = model_passport.generate_passport("m-eurosat")
+
+    html = model_passport.format_passport_html(passport)
+    assert "<!doctype html>" in html.lower()
+    assert "m-eurosat Passport" in html
+    assert record["run_id"] in html
+    assert "Data Provenance and Quality" in html
+    assert "Known Limitations" in html
+    # theme-aware tokens present for all three viewer states
+    assert ":root {" in html
+    assert "prefers-color-scheme: dark" in html
+    assert 'data-theme="dark"' in html
+
+
+def test_format_passport_html_never_fabricates_missing_fields(isolated_env):
+    # A passport generated before GeoGuard ever ran for this dataset has
+    # no sensor/band info -- must render honestly, not invent a value.
+    record = ledger.add_run("m-eurosat", {"backbone": "resnet18"}, val_metric=0.9, task_type="classification")
+    ledger.update_run(record["run_id"], submitted_final=True)
+    passport = model_passport.generate_passport("m-eurosat")
+    assert passport["sensor"] is None  # no geoguard report in this isolated env
+
+    html = model_passport.format_passport_html(passport)
+    assert "StressLab not implemented" in html  # robustness honestly absent, not invented
+    assert "Not yet evaluated" in html  # no test result, since none was run

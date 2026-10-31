@@ -125,11 +125,18 @@ def generate_passport(dataset: str, run_id: Optional[str] = None) -> dict:
     test_result = _find_test_result(dataset, run_id)
     lineage = ledger.get_lineage(run_id)
 
+    if config.get("backbone"):
+        architecture = config["backbone"]
+    elif config.get("architecture") or config.get("encoder"):
+        architecture = f"{config.get('architecture')}/{config.get('encoder')}"
+    else:
+        architecture = None  # neither recorded -- never render a fabricated "None/None"
+
     passport = {
         "model_id": run_id,
         "dataset": dataset,
         "task_type": task_type,
-        "architecture": config.get("backbone") or f"{config.get('architecture')}/{config.get('encoder')}",
+        "architecture": architecture,
         "pretrained": config.get("pretrained"),
         "fine_tuning_strategy": config.get("fine_tuning_strategy", "full"),
         "input_channels": (geoguard or {}).get("pixel_diagnostics", {}).get("n_channels"),
@@ -245,3 +252,328 @@ def format_passport_markdown(passport: dict) -> str:
         lines.append("- None recorded.")
     lines += ["", "## Robustness Results", "- Not run in this pass (StressLab not implemented)."]
     return "\n".join(lines)
+
+
+def _esc(value) -> str:
+    import html as _html
+
+    if value is None:
+        return "—"
+    return _html.escape(str(value))
+
+
+def _code(value) -> str:
+    return f"<code>{_esc(value)}</code>"
+
+
+def _kv(label: str, value_html: str) -> str:
+    return f'<div class="row"><span class="k">{_esc(label)}</span><span class="v">{value_html}</span></div>'
+
+
+def _status_pill(label: str, kind: str) -> str:
+    return f'<span class="pill pill-{kind}">{_esc(label)}</span>'
+
+
+def format_passport_html(passport: dict) -> str:
+    """Render a Model Passport as a self-contained, theme-aware HTML
+    document -- a judge/engineer-facing dossier, not a dashboard panel.
+    Every field renders "—" rather than a fabricated value when the
+    underlying data was never recorded (e.g. a passport generated before
+    GeoGuard ran has no sensor/band information -- that's shown honestly,
+    not invented).
+    """
+    dp = passport["data_provenance"]
+    eh = passport["experiment_history"]
+    approval_info = passport["engineer_approval"]
+
+    submitted = approval_info.get("submitted_final")
+    status_pill = _status_pill("Submitted", "verified") if submitted else _status_pill("Not submitted", "pending")
+
+    test_block = (
+        _kv("Test metric", _code(passport["test_metrics"]))
+        + _kv("Evaluated at", _esc(passport["test_evaluated_at"]))
+        if passport["test_metrics"] is not None
+        else f'<p class="prose muted">Not yet evaluated — the test split is opened exactly once, '
+        f"by a human running <code>run_final_eval.py</code>, after a model is submitted.</p>"
+    )
+
+    gated_rows = approval_info.get("config_gate_decisions") or []
+    gated_html = "".join(
+        _kv(
+            f"{g['field']} → {g['value']}",
+            _status_pill(g["status"], "verified" if g["status"] == "approved" else "limitation")
+            + f' <span class="muted small">{_esc(g.get("decision_reason"))}</span>',
+        )
+        for g in gated_rows
+    ) or '<p class="prose muted">No gated architecture/backbone changes were proposed for this model.</p>'
+
+    approved_actions = dp.get("approved_data_actions") or []
+    rejected_actions = dp.get("rejected_data_actions") or []
+    actions_html = "".join(
+        _kv(f"Sample #{a['sample_id']} — {a['action']}", _status_pill("approved", "verified") + f' <span class="muted small">{_esc(a.get("reason"))}</span>')
+        for a in approved_actions
+    ) + "".join(
+        _kv(f"Sample #{a['sample_id']} — {a['action']}", _status_pill("rejected", "limitation") + f' <span class="muted small">{_esc(a.get("reason"))}</span>')
+        for a in rejected_actions
+    )
+    if not actions_html:
+        actions_html = '<p class="prose muted">No sample-level data-quality actions were proposed for this model.</p>'
+
+    limitations = passport.get("known_limitations") or []
+    limitations_html = (
+        "".join(f'<li>{_esc(item)}</li>' for item in limitations)
+        if limitations
+        else '<li class="muted">None recorded.</li>'
+    )
+
+    hyperparams = passport.get("hyperparameters") or {}
+    hyperparam_rows = "".join(_kv(k, _code(v)) for k, v in sorted(hyperparams.items()))
+
+    title = f"{passport['dataset']} Passport"
+
+    return f"""<!doctype html>
+<title>{_esc(title)}</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {{
+  --ink: #121821;
+  --ink-soft: #3b4350;
+  --paper: #EDEEE6;
+  --paper-raised: #F7F8F2;
+  --line: #C9CCC0;
+  --accent: #1E5A8C;
+  --verified: #3C7A4E;
+  --pending: #A8731E;
+  --limitation: #9B3A32;
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", "JetBrains Mono", Consolas, monospace;
+  --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root:not([data-theme="light"]) {{
+    --ink: #E7E8E1;
+    --ink-soft: #AEB4BC;
+    --paper: #11151A;
+    --paper-raised: #171C22;
+    --line: #2A3038;
+    --accent: #6AA8DD;
+    --verified: #6FBE85;
+    --pending: #D9A85A;
+    --limitation: #D97D73;
+  }}
+}}
+:root[data-theme="dark"] {{
+  --ink: #E7E8E1;
+  --ink-soft: #AEB4BC;
+  --paper: #11151A;
+  --paper-raised: #171C22;
+  --line: #2A3038;
+  --accent: #6AA8DD;
+  --verified: #6FBE85;
+  --pending: #D9A85A;
+  --limitation: #D97D73;
+}}
+
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 16px;
+  line-height: 1.55;
+}}
+.sheet {{
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 48px 28px 80px;
+}}
+.stamp {{
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 24px 26px;
+  background: var(--paper-raised);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  margin-bottom: 36px;
+}}
+.eyebrow {{
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}}
+.model-id {{
+  font-family: var(--mono);
+  font-size: 0.95rem;
+  color: var(--accent);
+  word-break: break-all;
+}}
+h1 {{
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: 2rem;
+  margin: 2px 0 0;
+  text-wrap: balance;
+}}
+.stamp-meta {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+}}
+section {{
+  margin-top: 40px;
+}}
+section > h2 {{
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+  margin: 0 0 16px;
+}}
+.row {{
+  display: grid;
+  grid-template-columns: minmax(140px, 220px) 1fr;
+  gap: 14px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.92rem;
+  align-items: baseline;
+}}
+.row:last-child {{ border-bottom: none; }}
+.k {{
+  font-family: var(--mono);
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+}}
+.v {{ font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }}
+code {{
+  font-family: var(--mono);
+  font-size: 0.88em;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 1px 5px;
+}}
+.prose {{ font-size: 0.97rem; }}
+.muted {{ color: var(--ink-soft); }}
+.small {{ font-size: 0.82rem; }}
+.pill {{
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+}}
+.pill-verified {{ color: var(--verified); }}
+.pill-pending {{ color: var(--pending); }}
+.pill-limitation {{ color: var(--limitation); }}
+ul.limits {{ margin: 0; padding-left: 20px; }}
+ul.limits li {{ margin-bottom: 6px; font-size: 0.92rem; }}
+.footer {{
+  margin-top: 56px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 0.74rem;
+  color: var(--ink-soft);
+}}
+.wrap-x {{ overflow-x: auto; }}
+a {{ color: var(--accent); }}
+</style>
+
+<div class="sheet">
+  <div class="stamp">
+    <span class="eyebrow">GoTrain &middot; Model Passport</span>
+    <h1>{_esc(passport['dataset'])}</h1>
+    <span class="model-id">{_esc(passport['model_id'])}</span>
+    <div class="stamp-meta">
+      <span>{_esc(passport['architecture'])}</span>
+      <span>&middot;</span>
+      <span>{_esc(passport['task_type'])}</span>
+      <span>&middot;</span>
+      <span>fine-tuning: {_esc(passport['fine_tuning_strategy'])}</span>
+      <span>&middot;</span>
+      {status_pill}
+    </div>
+  </div>
+
+  <section>
+    <h2>Identity</h2>
+    {_kv("Architecture", _esc(passport['architecture']))}
+    {_kv("Pretrained", _esc(passport['pretrained']))}
+    {_kv("Fine-tuning strategy", _esc(passport['fine_tuning_strategy']))}
+    {_kv("Sensor", _esc(passport.get('sensor')))}
+    {_kv("Input channels", _esc(passport.get('input_channels')))}
+    {_kv("Random seed", _code(passport.get('random_seed')))}
+  </section>
+
+  <section>
+    <h2>Validation (official metric)</h2>
+    {_kv("Validation metric", _code(passport['validation_metrics']['val_metric']))}
+  </section>
+
+  <section>
+    <h2>Test (human-triggered, one-time)</h2>
+    {test_block}
+  </section>
+
+  <section>
+    <h2>Experiment History</h2>
+    {_kv("Ancestor runs", _esc(eh['n_ancestors']))}
+    {_kv("Hypothesis", _esc(eh.get('hypothesis', {}).get('change') if isinstance(eh.get('hypothesis'), dict) else eh.get('hypothesis')))}
+    {_kv("Hypothesis outcome", _esc(eh.get('hypothesis_outcome')))}
+  </section>
+
+  <section>
+    <h2>Data Provenance and Quality</h2>
+    {_kv("Training manifest", _code(dp['training_manifest_id']))}
+    {_kv("Excluded samples", _esc(dp['excluded_sample_count']))}
+    <p class="prose muted small" style="margin-top:10px;">Approved / rejected sample-level data actions:</p>
+    {actions_html}
+  </section>
+
+  <section>
+    <h2>Governance &amp; Approvals</h2>
+    {gated_html}
+  </section>
+
+  <section>
+    <h2>Hyperparameters</h2>
+    <div class="wrap-x">{hyperparam_rows or '<p class="prose muted">No hyperparameters recorded.</p>'}</div>
+  </section>
+
+  <section>
+    <h2>Checkpoint</h2>
+    {_kv("Registry version", _esc(passport['checkpoint_version']))}
+    {_kv("SHA-256", _code(passport.get('checkpoint_sha256')))}
+  </section>
+
+  <section>
+    <h2>Known Limitations</h2>
+    <ul class="limits">{limitations_html}</ul>
+  </section>
+
+  <section>
+    <h2>Robustness Results</h2>
+    <p class="prose muted">{_esc(passport.get('robustness_results')) if passport.get('robustness_results') else "Not run in this pass (StressLab not implemented) — not fabricated to fill this section."}</p>
+  </section>
+
+  <div class="footer">
+    Generated by gotrain.model_passport.generate_passport — every value above is read from this
+    project's own ledger, model registry, and governance logs. Nothing on this page is estimated or invented.
+  </div>
+</div>
+"""

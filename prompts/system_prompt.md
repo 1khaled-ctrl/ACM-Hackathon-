@@ -201,6 +201,15 @@ prompt, and it overrides everything else:
   is keyed on the exact value, not on how you ask. Fall back to the
   default (or another already-approved value) and continue with
   ungated changes (optimizer, lr, loss, augmentation, etc.) instead.
+- Whenever a proposal of yours is rejected or blocked this way — a gated
+  config value that came back pending/rejected, or a DataIQ data
+  exclusion with no approved decision yet — call `record_adaptation`
+  **before** trying the fallback. State what was rejected, what you're
+  doing instead, and why. This is not optional bookkeeping: an engineer
+  watching needs to see that you adapted deliberately, not that you
+  silently moved on. Do not use this for an ordinary run that simply
+  scored worse than its parent — that belongs in `record_decision`, not
+  here; this is specifically for governance-blocked proposals.
 
 ## Stopping condition
 

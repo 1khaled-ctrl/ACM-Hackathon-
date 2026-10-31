@@ -59,7 +59,7 @@ def test_agent_tool_list_excludes_final_test_eval(isolated_logs):
         "submit_final_model", "upload_to_s3", "download_from_s3",
         "run_dataiq_structural_scan", "run_dataiq_loss_scan", "list_data_proposals", "create_data_manifest",
         "list_compatible_models", "estimate_model_resources", "validate_model_compatibility",
-        "get_training_diagnostics", "recommend_experiments",
+        "get_training_diagnostics", "recommend_experiments", "record_adaptation",
     ]:
         assert name in agent.tool_names
 
@@ -150,6 +150,27 @@ def test_tool_calls_are_logged(isolated_logs):
     assert tool_call_events[0]["tool"] == "list_datasets"
     assert tool_call_events[0]["status"] == "success"
     assert "duration_seconds" in tool_call_events[0]
+
+
+def test_record_adaptation_through_agent_tool_pipeline(isolated_logs):
+    agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=40)
+
+    result = agent.tool.record_adaptation(
+        dataset="m-eurosat",
+        rejected_proposal="backbone=resnet50, rejected for GPU budget limits",
+        new_plan="fell back to the default backbone and increased augmentation instead",
+        rationale="augmentation is ungated and targets the same overfitting signal",
+    )
+    assert result["status"] == "success"
+
+    events = [
+        json.loads(line)
+        for line in (isolated_logs / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    adaptation_events = [e for e in events if e["event"] == "adaptation_recorded"]
+    assert len(adaptation_events) == 1
+    assert adaptation_events[0]["dataset"] == "m-eurosat"
 
 
 def test_submit_final_model_does_not_touch_test_split(isolated_logs):
