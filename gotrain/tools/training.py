@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from gotrain import ledger, status
+from gotrain.config_schema import ConfigValidationError, validate_config
 from gotrain.logging_utils import log_event
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -42,6 +43,12 @@ def launch_training(
     """
     if task_type not in TEMPLATES:
         raise ValueError(f"task_type must be one of {list(TEMPLATES)}, got {task_type!r}")
+
+    # Validate before spawning anything or touching the run budget — a bad
+    # config value (e.g. an unsupported optimizer name) must be rejected
+    # here, not discovered after a subprocess has already been counted
+    # against max_runs by the agent's limit hook.
+    validate_config(task_type, config)
 
     template_path = TEMPLATES[task_type]
     status.set_action("training", from_=parent_id or "agent", where=dataset)

@@ -38,6 +38,7 @@ DEFAULTS = {
     "class_weights": None,
     "augmentation": "none",
     "bands": None,
+    "amp": True,
     "time_budget_minutes": None,
     "seed": 0,
     "max_train_samples": None,
@@ -45,6 +46,21 @@ DEFAULTS = {
 }
 
 BENCHMARK_DIRS = ["classification_v1.0", "segmentation_v1.0"]
+
+
+def is_oom_error(exc: BaseException) -> bool:
+    """True for a CUDA/MPS OutOfMemoryError, and also for plain CPU
+    allocation failures — torch raises a generic RuntimeError for those
+    (e.g. "DefaultCPUAllocator: not enough memory"), not OutOfMemoryError,
+    so catching only torch.OutOfMemoryError misses CPU-only OOMs entirely.
+    Mirrors gotrain/templates/train_classification.py's is_oom_error.
+    """
+    import torch
+
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message or "not enough memory" in message
 
 
 def find_task_dir(dataset: str):
@@ -273,10 +289,14 @@ def main() -> None:
     set_seed(cfg["seed"])
 
     import torch
+    from torch.amp import GradScaler, autocast
     from torch.utils.data import DataLoader
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Device: {device}")
+    amp_enabled = bool(cfg["amp"]) and device.type == "cuda"
+    if cfg["amp"] and device.type != "cuda":
+        logger.info("AMP requested but no CUDA device is available — running in full precision.")
+    logger.info(f"Device: {device}, AMP enabled: {amp_enabled}")
 
     task_dir = find_task_dir(dataset)
     import geobench
@@ -315,7 +335,9 @@ def main() -> None:
     try:
         model = build_model(cfg["architecture"], cfg["encoder"], cfg["pretrained"], n_bands, n_classes)
         model = model.to(device)
-    except torch.OutOfMemoryError:
+    except (torch.OutOfMemoryError, RuntimeError) as e:
+        if not is_oom_error(e):
+            raise
         logger.error("Out of memory while building/moving the model to device.")
         print("OUT OF MEMORY while constructing the model. Try a smaller --batch_size or a lighter encoder.", file=sys.stderr)
         sys.exit(1)
@@ -325,6 +347,7 @@ def main() -> None:
 
     loss_fn = build_loss(cfg["loss"], n_classes, class_weights, device)
     optimizer = build_optimizer(cfg["optimizer"], model.parameters(), cfg["lr"], cfg["weight_decay"])
+    scaler = GradScaler(device="cuda", enabled=amp_enabled)
 
     best_val_iou = -1.0
     best_metrics = None
@@ -342,13 +365,17 @@ def main() -> None:
             for images, masks in train_loader:
                 images, masks = images.to(device), masks.to(device)
                 optimizer.zero_grad()
-                logits = model(images)
-                loss = loss_fn(logits, masks)
-                loss.backward()
-                optimizer.step()
+                with autocast(device_type=device.type, enabled=amp_enabled):
+                    logits = model(images)
+                    loss = loss_fn(logits, masks)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 running_loss += loss.item()
                 n_batches += 1
-        except torch.OutOfMemoryError:
+        except (torch.OutOfMemoryError, RuntimeError) as e:
+            if not is_oom_error(e):
+                raise
             logger.error(f"Out of memory during training at epoch {epoch}.")
             print(
                 f"OUT OF MEMORY during training (epoch {epoch}, batch_size={cfg['batch_size']}). "
@@ -365,8 +392,11 @@ def main() -> None:
             for images, masks in val_loader:
                 images = images.to(device)
                 try:
-                    logits = model(images)
-                except torch.OutOfMemoryError:
+                    with autocast(device_type=device.type, enabled=amp_enabled):
+                        logits = model(images)
+                except (torch.OutOfMemoryError, RuntimeError) as e:
+                    if not is_oom_error(e):
+                        raise
                     logger.error("Out of memory during validation.")
                     print(
                         f"OUT OF MEMORY during validation (batch_size={cfg['batch_size']}). "
@@ -417,6 +447,7 @@ def main() -> None:
         "run_id": run_id,
         "dataset": dataset,
         "device": str(device),
+        "amp_enabled": amp_enabled,
         "n_params": n_params,
         "n_bands": n_bands,
         "band_names": band_names,
@@ -431,7 +462,6 @@ def main() -> None:
     logger.info(f"Run finished in {total_seconds:.1f}s. Best val_mean_iou={best_val_iou:.4f}")
     logger.info(f"FINAL_VAL_METRIC: {final_val_metric}")
 
-    print(f"FINAL_VAL_METRIC: {final_val_metric}")
     print(json.dumps({
         "val_metric": final_val_metric,
         "gpu_minutes": gpu_minutes,

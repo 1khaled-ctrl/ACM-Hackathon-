@@ -138,3 +138,52 @@ def test_submit_final_model_rejects_mismatched_dataset(isolated_logs):
 
     result = agent.tool.submit_final_model(dataset="m-so2sat", run_id=run_id)
     assert result["status"] == "error"
+
+
+def test_bad_config_rejection_does_not_count_against_max_runs(isolated_logs):
+    """A launch rejected for an unsupported config value (e.g. an optimizer
+    name the current trainer doesn't support) must not consume one of the
+    agent's max_runs — only a launch that actually attempts training should.
+    """
+    agent = agent_mod.build_agent("m-eurosat", max_runs=1, run_minutes=5, max_tool_calls=40)
+
+    rejected = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="classification", config={"optimizer": "adamw"}
+    )
+    assert rejected["status"] == "error"
+    rejected_text = _tool_result_text(rejected)
+    assert "adamw" in rejected_text
+    # the error must name the valid values, not just say "invalid"
+    assert "adam" in rejected_text and "sgd" in rejected_text
+
+    # max_runs=1 and none consumed yet -> this real run must still succeed
+    real_run = agent.tool.launch_training(dataset="m-eurosat", task_type="fake", config={})
+    assert real_run["status"] == "success"
+
+    # now the one real run budget is spent -> a second real attempt is blocked
+    blocked = agent.tool.launch_training(dataset="m-eurosat", task_type="fake", config={"seed": 1})
+    assert blocked["status"] == "error"
+    assert "run budget exhausted" in _tool_result_text(blocked).lower()
+
+    # exactly one ledger record should exist (the rejected call never ran)
+    history = agent.tool.query_history(dataset="m-eurosat")
+    assert len(json.loads(_tool_result_text(history))) == 1
+
+
+def test_final_test_eval_lock_is_independent_per_dataset(isolated_logs):
+    """All 4 GEO-Bench datasets must each be evaluable exactly once,
+    independently — locking one dataset's test split must not affect any
+    other dataset.
+    """
+    datasets = ["m-eurosat", "m-so2sat", "m-pv4ger-seg", "m-nz-cattle"]
+
+    for ds in datasets:
+        record = final_eval.final_test_eval(ds, f"run-{ds}", lambda: {"metric": 1.0})
+        assert record["task"] == ds
+
+    for ds in datasets:
+        with pytest.raises(final_eval.TestAlreadyEvaluatedError):
+            final_eval.final_test_eval(ds, f"run-{ds}-again", lambda: {"metric": 0.0})
+
+    lock_files = sorted(p.name for p in isolated_logs.glob("test_lock_*.json"))
+    assert lock_files == sorted(f"test_lock_{ds}.json" for ds in datasets)

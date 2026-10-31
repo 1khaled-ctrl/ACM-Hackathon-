@@ -25,6 +25,7 @@ from strands import Agent, tool
 from strands.hooks import AfterToolCallEvent, BeforeToolCallEvent, HookRegistry
 
 from gotrain import config, ledger, status
+from gotrain.config_schema import ConfigValidationError
 from gotrain.logging_utils import log_event
 from gotrain.tools import datasets as datasets_tools
 from gotrain.tools import training as training_tools
@@ -243,15 +244,18 @@ class LimitsAndLoggingHooks:
             return
 
         if tool_name == "launch_training":
-            self.run_count += 1
-            # inject the per-run time budget and this agent's dataset's task_type
-            # resolution is left to the model via the config/task_type it supplies;
-            # we only enforce the timeout here.
+            # Run counting happens in _on_after, once we know whether the
+            # call actually attempted training or was rejected pre-flight
+            # for a bad config value (ConfigValidationError) — a rejected
+            # launch must not cost the agent one of its max_runs.
             event.tool_use["input"]["timeout_seconds"] = self.run_seconds
 
     def _on_after(self, event: AfterToolCallEvent) -> None:
         tool_name = event.tool_use["name"]
         tool_input = event.tool_use.get("input", {})
+
+        if tool_name == "launch_training" and not isinstance(event.exception, ConfigValidationError):
+            self.run_count += 1
 
         result_text = ""
         if event.result is not None:
@@ -270,6 +274,9 @@ class LimitsAndLoggingHooks:
             status=event.result.get("status") if event.result else "error",
             duration_seconds=event.duration,
             exception=str(event.exception) if event.exception else None,
+            counted_against_run_budget=(
+                tool_name == "launch_training" and not isinstance(event.exception, ConfigValidationError)
+            ),
         )
         status.write_status(last_event=f"called {tool_name}")
 
