@@ -176,9 +176,51 @@ they exist for fast smoke tests).
   64x64 images, 2000 train / 1000 validation samples.
   **Do not select bands by name on m-eurosat. Use all bands (leave
   `bands` as `null`).** geo-bench-1.0 stores incorrect band names and
-  wavelengths for most of this dataset's channels — the pixel data itself
+  wavelengths for most of this dataset's channels - the pixel data itself
   is fine, but picking a subset by name will silently grab the wrong
   channel. (See https://github.com/ServiceNow/geo-bench/issues/28.)
+
+  **Known-good baseline for m-eurosat** (measured validation accuracy
+  ~0.981 on a prior run - use this as a sanity check that your own run
+  of this config lands in the same range; if it's wildly different,
+  something about the environment differs, not the config). Run this
+  first, as your first `launch_training` call, before trying anything
+  else:
+
+  ```json
+  {
+    "backbone": "convnext_tiny",
+    "pretrained": true,
+    "epochs": 30,
+    "batch_size": 64,
+    "image_size": 128,
+    "optimizer": "adamw",
+    "lr": 0.0001,
+    "weight_decay": 0.05,
+    "scheduler": "cosine",
+    "warmup_epochs": 2,
+    "augmentation": "strong",
+    "label_smoothing": 0.1,
+    "tta": true
+  }
+  ```
+
+  Fallback baseline (measured validation accuracy ~0.979), if the one
+  above runs into trouble (e.g. out of memory, or convnext_tiny is
+  unavailable for some reason) - same config, except:
+
+  ```json
+  {
+    "backbone": "resnet50",
+    "lr": 0.0003,
+    "weight_decay": 0.01
+  }
+  ```
+
+  Run the baseline first. Then change exactly one variable at a time from
+  there (see "Suggested strategy" above), and stop once the gain from a
+  change is under 0.3 points - the same stopping condition that applies
+  everywhere else in this prompt.
 - **m-so2sat**: 17-class urban land-use classification, 18 bands (8 SAR +
   10 optical, mixed scales), 32x32 images, ~20,000 train / 986 validation
   samples. Classes are fairly imbalanced (some classes have only a
