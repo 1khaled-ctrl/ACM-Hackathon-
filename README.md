@@ -25,15 +25,15 @@ pip install -r requirements.txt
 local version tags only exist on PyTorch's own wheel index, not on PyPI, so a plain
 `pip install -r requirements.txt` would fail to resolve them otherwise. The plain PyPI
 wheel is CUDA-capable on Linux (SageMaker) and falls back to CPU automatically where
-there's no GPU (a laptop).
+there's no GPU (a laptop). `torch` is pinned as a **minimum** version (`>=2.9`), not
+an exact one, specifically so it doesn't fight with whatever build is already present.
 
-**On the SageMaker GPU lab, `torch` is already preinstalled with CUDA** — do not
-`pip install` it again from this file (that would silently replace the CUDA build
-with a CPU-only one). Install everything else:
-
-```bash
-pip install $(grep -v '^torch\b' requirements.txt)
-```
+**On the SageMaker GPU lab, `torch` is already preinstalled with CUDA — do not
+reinstall it.** Do not run a plain `pip install torch` or `pip install -U torch`
+there; that would silently replace the preinstalled CUDA build with a CPU-only one
+from PyPI. A plain `pip install -r requirements.txt` is safe to run as-is on the lab:
+pip sees the installed torch already satisfies `>=2.9` and leaves it alone,
+installing only the other packages.
 
 Or run `setup.sh` on a fresh Linux machine (installs deps + downloads the 4 GEO-Bench
 tasks used in this project).
