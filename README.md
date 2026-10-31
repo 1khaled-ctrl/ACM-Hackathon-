@@ -27,6 +27,14 @@ local version tags only exist on PyTorch's own wheel index, not on PyPI, so a pl
 wheel is CUDA-capable on Linux (SageMaker) and falls back to CPU automatically where
 there's no GPU (a laptop).
 
+**On the SageMaker GPU lab, `torch` is already preinstalled with CUDA** — do not
+`pip install` it again from this file (that would silently replace the CUDA build
+with a CPU-only one). Install everything else:
+
+```bash
+pip install $(grep -v '^torch\b' requirements.txt)
+```
+
 Or run `setup.sh` on a fresh Linux machine (installs deps + downloads the 4 GEO-Bench
 tasks used in this project).
 
