@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 from gotrain import approval, control, ledger, registry, status
-from gotrain.config_schema import ConfigValidationError, validate_config, validate_hypothesis
+from gotrain.config_schema import (
+    ConfigValidationError,
+    validate_config,
+    validate_fine_tuning_strategy,
+    validate_hypothesis,
+)
+from gotrain.dataiq import manifest as dataiq_manifest
 from gotrain.logging_utils import log_event
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -49,9 +55,13 @@ def launch_training(
 
     Also refuses to run while the engineer control plane
     (gotrain.control) is in a blocking state (paused, manual takeover,
-    rollback in progress), and refuses a config that changes a gated
-    field (backbone/architecture/encoder) to a value that hasn't been
-    engineer-approved yet (gotrain.approval).
+    rollback in progress); refuses a config that changes a gated field
+    (backbone/architecture/encoder) to a value that hasn't been
+    engineer-approved yet (gotrain.approval); refuses linear_probe/partial
+    fine-tuning on a non-pretrained backbone (gotrain.config_schema);
+    and refuses an unknown config["manifest_id"] (gotrain.dataiq.manifest)
+    -- every exclusion in a manifest was already approval-checked at the
+    manifest's *creation* time, so this is just an existence check.
     """
     if task_type not in TEMPLATES:
         raise ValueError(f"task_type must be one of {list(TEMPLATES)}, got {task_type!r}")
@@ -63,8 +73,10 @@ def launch_training(
     # been counted against max_runs by the agent's limit hook.
     control.raise_if_blocking()
     validate_config(task_type, config)
+    validate_fine_tuning_strategy(task_type, config)
     validate_hypothesis(hypothesis, has_parent=parent_id is not None)
     approval.check_gate(dataset, task_type, config)
+    dataiq_manifest.validate_manifest_exists(dataset, config.get("manifest_id"))
 
     template_path = TEMPLATES[task_type]
     status.set_action("training", from_=parent_id or "agent", where=dataset)

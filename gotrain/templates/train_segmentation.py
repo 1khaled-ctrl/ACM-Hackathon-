@@ -67,6 +67,8 @@ DEFAULTS = {
     "seed": 0,
     "max_train_samples": None,
     "max_val_samples": None,
+    "fine_tuning_strategy": "full",
+    "manifest_id": None,
 }
 
 BENCHMARK_DIRS = ["classification_v1.0", "segmentation_v1.0"]
@@ -108,14 +110,27 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger):
+def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None):
     """Load every sample of `split` into memory as (N, H, W, C) uint8 images
     and (N, H, W) uint8 masks. GEO-Bench segmentation tasks here are small
     enough (a few thousand 320x320x3 or 500x500x3 samples) that this is
     simpler and fast enough for a hackathon training loop than writing a
     lazy on-disk Dataset; it also makes computing TRAIN-only normalization
     stats a single pass instead of two.
+
+    `excluded_ids` (a DataIQ manifest's excluded_sample_ids, see
+    gotrain/dataiq/manifest.py) skips those indices entirely. Mirrors
+    train_classification.py's identical guard: a non-empty `excluded_ids`
+    for any split other than "train" is refused outright, so a manifest
+    can never touch validation even by mistake.
     """
+    if excluded_ids and split != "train":
+        raise ValueError(
+            f"excluded_ids was given for split={split!r} -- DataIQ manifests may only "
+            "ever filter the TRAIN split."
+        )
+    excluded_ids = excluded_ids or set()
+
     geobench_split = {"train": "train", "validation": "valid"}[split]
     ds = task_specs.get_dataset(split=geobench_split)
 
@@ -125,7 +140,11 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
 
     images = []
     masks = []
+    n_excluded_in_range = 0
     for i in range(n):
+        if i in excluded_ids:
+            n_excluded_in_range += 1
+            continue
         sample = ds[i]
         arr, _ = sample.pack_to_3d(band_names=band_names)
         images.append(arr)
@@ -133,7 +152,11 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
 
     images = np.stack(images, axis=0)
     masks = np.stack(masks, axis=0)
-    logger.info(f"Loaded {split} split: {images.shape[0]} samples, images {images.shape}, masks {masks.shape}")
+    exclusion_note = f", {n_excluded_in_range} excluded by manifest" if n_excluded_in_range else ""
+    logger.info(
+        f"Loaded {split} split: {images.shape[0]} samples, images {images.shape}, "
+        f"masks {masks.shape}{exclusion_note}"
+    )
     return images, masks
 
 
@@ -204,7 +227,30 @@ class SegmentationArrayDataset:
         return torch.from_numpy(image.copy()).float(), torch.from_numpy(mask.copy()).long()
 
 
+def pad_to_multiple(height: int, width: int, multiple: int = 32) -> tuple:
+    """Bottom/right padding needed to bring (height, width) up to the next
+    multiple of `multiple` -- (0, 0) when already aligned. Pure arithmetic,
+    no torch, so it's unit-testable without the ML stack installed.
+    """
+    return (-height) % multiple, (-width) % multiple
+
+
 def build_model(architecture: str, encoder: str, pretrained: bool, in_channels: int, n_classes: int):
+    """segmentation_models_pytorch's encoders downsample by 32x (5
+    stride-2 stages) before the decoder upsamples back with skip
+    connections. An input whose H/W isn't a multiple of 32 (e.g.
+    m-nz-cattle's 500x500: 500 % 32 == 20) makes a decoder stage's
+    upsampled feature map mismatch its skip connection's size, raising a
+    RuntimeError on concatenation. m-pv4ger-seg's 320x320 is already a
+    clean multiple of 32 and is unaffected.
+
+    Padding/cropping is applied here, inside the model's own forward,
+    rather than in the training loop, so every caller gets it for free:
+    this template's train/val loops, gotrain/tools/final_eval.py,
+    gotrain/rollback.py's inference sanity check, and
+    gotrain/dataiq/loss_scan.py all call this same build_model.
+    """
+    import torch.nn.functional as F
     import segmentation_models_pytorch as smp
 
     encoder_weights = "imagenet" if pretrained else None
@@ -215,10 +261,23 @@ def build_model(architecture: str, encoder: str, pretrained: bool, in_channels: 
         classes=n_classes,
     )
     if architecture == "unet":
-        return smp.Unet(**kwargs)
-    if architecture == "fpn":
-        return smp.FPN(**kwargs)
-    raise ValueError(f"architecture must be 'unet' or 'fpn', got {architecture!r}")
+        model = smp.Unet(**kwargs)
+    elif architecture == "fpn":
+        model = smp.FPN(**kwargs)
+    else:
+        raise ValueError(f"architecture must be 'unet' or 'fpn', got {architecture!r}")
+
+    original_forward = model.forward
+
+    def padded_forward(x):
+        h, w = x.shape[-2:]
+        pad_h, pad_w = pad_to_multiple(h, w)
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+        return original_forward(x)[..., :h, :w]
+
+    model.forward = padded_forward
+    return model
 
 
 def build_loss(loss_name: str, n_classes: int, class_weights, focal_alpha, focal_gamma, device):
@@ -372,8 +431,15 @@ def main() -> None:
     logger.info(f"Bands ({n_bands}/{len(all_band_names)} used): {band_names}")
     logger.info(f"Image size: {task_specs.patch_size}, classes: {n_classes} ({task_specs.label_type.class_names})")
 
+    excluded_ids = set()
+    if cfg["manifest_id"]:
+        from gotrain.dataiq.manifest import get_excluded_ids
+
+        excluded_ids = get_excluded_ids(dataset, cfg["manifest_id"])
+        logger.info(f"DataIQ manifest {cfg['manifest_id']!r}: excluding {len(excluded_ids)} TRAIN sample(s)")
+
     train_images, train_masks = build_dataset_arrays(
-        task_specs, "train", band_names, cfg["max_train_samples"], logger
+        task_specs, "train", band_names, cfg["max_train_samples"], logger, excluded_ids=excluded_ids
     )
     val_images, val_masks = build_dataset_arrays(
         task_specs, "validation", band_names, cfg["max_val_samples"], logger
@@ -395,8 +461,11 @@ def main() -> None:
     train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
 
+    fine_tuning_strategy = cfg["fine_tuning_strategy"]
+    effective_pretrained = cfg["pretrained"] and fine_tuning_strategy != "from_scratch"
+
     try:
-        model = build_model(cfg["architecture"], cfg["encoder"], cfg["pretrained"], n_bands, n_classes)
+        model = build_model(cfg["architecture"], cfg["encoder"], effective_pretrained, n_bands, n_classes)
         model = model.to(device)
     except (torch.OutOfMemoryError, RuntimeError) as e:
         if not is_oom_error(e):
@@ -405,11 +474,19 @@ def main() -> None:
         print("OUT OF MEMORY while constructing the model. Try a smaller --batch_size or a lighter encoder.", file=sys.stderr)
         sys.exit(1)
 
-    n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model: {cfg['architecture']}/{cfg['encoder']} (pretrained={cfg['pretrained']}), {n_params:,} parameters")
+    from gotrain.finetuning import apply_fine_tuning_strategy, trainable_parameters
+
+    fine_tuning_summary = apply_fine_tuning_strategy(model, "smp", fine_tuning_strategy)
+    n_params = fine_tuning_summary["total_parameters"]
+    logger.info(
+        f"Model: {cfg['architecture']}/{cfg['encoder']} (pretrained={effective_pretrained}), {n_params:,} parameters, "
+        f"fine_tuning_strategy={fine_tuning_strategy!r} -- "
+        f"{fine_tuning_summary['trainable_parameters']:,} trainable / "
+        f"{fine_tuning_summary['frozen_parameters']:,} frozen"
+    )
 
     loss_fn = build_loss(cfg["loss"], n_classes, class_weights, cfg["focal_alpha"], cfg["focal_gamma"], device)
-    optimizer = build_optimizer(cfg["optimizer"], model.parameters(), cfg["lr"], cfg["weight_decay"])
+    optimizer = build_optimizer(cfg["optimizer"], trainable_parameters(model), cfg["lr"], cfg["weight_decay"])
     scheduler = build_scheduler(cfg["scheduler"], optimizer, cfg["epochs"], cfg["warmup_epochs"])
     scaler = GradScaler(device="cuda", enabled=amp_enabled)
 
@@ -559,6 +636,9 @@ def main() -> None:
         "total_train_seconds": total_seconds,
         "interrupted": interrupted_reason is not None,
         "interrupted_reason": interrupted_reason,
+        "fine_tuning": fine_tuning_summary,
+        "manifest_id": cfg["manifest_id"],
+        "n_excluded_by_manifest": len(excluded_ids),
     }
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     logger.info(f"Run finished in {total_seconds:.1f}s. Best val_mean_iou={best_val_iou:.4f}")
@@ -578,6 +658,11 @@ def main() -> None:
             "foreground_iou": best_metrics.get("val_foreground_iou"),
             "interrupted": interrupted_reason is not None,
             "interrupted_reason": interrupted_reason,
+            "fine_tuning_strategy": fine_tuning_summary["fine_tuning_strategy"],
+            "trainable_parameters": fine_tuning_summary["trainable_parameters"],
+            "frozen_parameters": fine_tuning_summary["frozen_parameters"],
+            "manifest_id": cfg["manifest_id"],
+            "n_excluded_by_manifest": len(excluded_ids),
         },
     }))
 

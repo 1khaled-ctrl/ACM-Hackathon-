@@ -216,6 +216,50 @@ def test_recommend_rare_classes_sets_normalized_class_weights():
     assert weights[2] > weights[0]  # rarer class gets a larger weight
 
 
+def test_inverse_frequency_weights_are_capped_not_unbounded():
+    # A class at freq 0.001 would get raw weight 1000 -- must be capped
+    # well below that before normalization ("do not apply extreme
+    # inverse-frequency weights without safeguards").
+    weights = decision._inverse_frequency_weights([0.001, 0.999], cap=decision.CLASS_WEIGHT_CAP)
+    raw_ratio_if_uncapped = (1 / 0.001) / (1 / 0.999)
+    actual_ratio = weights[0] / weights[1]
+    assert actual_ratio < raw_ratio_if_uncapped
+    assert actual_ratio <= decision.CLASS_WEIGHT_CAP + 1e-6
+
+
+def test_median_frequency_weights_are_also_capped():
+    weights = decision._median_frequency_weights([0.0001, 0.5, 0.4999], cap=decision.CLASS_WEIGHT_CAP)
+    assert weights[0] / weights[1] <= decision.CLASS_WEIGHT_CAP + 1e-6
+
+
+def test_recommend_uses_median_frequency_for_extreme_imbalance():
+    class_diag = _class_diag(rare=["c"], unit="samples", frequencies=[0.9, 0.0999, 0.0001])
+    class_diag["imbalance_ratio"] = 9000.0  # far beyond EXTREME_IMBALANCE_RATIO
+
+    result = decision.recommend(
+        dataset="m-so2sat", task_type="classification",
+        pixel_diagnostics=_pixel_diag(n_samples=20000), class_diagnostics=class_diag,
+        band_classification=diagnostics.classify_bands(["VH.Real", "02 - Blue"]),
+        dataset_notes={"sensor": "SAR+optical", "warnings": []},
+    )
+    assert any("median-frequency" in r.lower() for r in result["rationale"])
+    assert any("extreme" in f.lower() for f in result["findings"])
+
+
+def test_recommend_uses_inverse_frequency_for_moderate_imbalance():
+    class_diag = _class_diag(rare=["c"], unit="samples", frequencies=[0.7, 0.2, 0.1])
+    class_diag["imbalance_ratio"] = 7.0  # well below EXTREME_IMBALANCE_RATIO
+
+    result = decision.recommend(
+        dataset="m-so2sat", task_type="classification",
+        pixel_diagnostics=_pixel_diag(n_samples=20000), class_diagnostics=class_diag,
+        band_classification=diagnostics.classify_bands(["VH.Real", "02 - Blue"]),
+        dataset_notes={"sensor": "SAR+optical", "warnings": []},
+    )
+    assert any("inverse-frequency" in r.lower() for r in result["rationale"])
+    assert not any("median-frequency" in r.lower() for r in result["rationale"])
+
+
 def test_recommend_multimodal_dataset_adds_rationale_without_log_transform():
     result = decision.recommend(
         dataset="m-so2sat", task_type="classification",

@@ -27,8 +27,11 @@ from strands.hooks import AfterToolCallEvent, BeforeToolCallEvent, HookRegistry
 from gotrain import config, control, ledger, status
 from gotrain.config_schema import PreflightValidationError
 from gotrain.logging_utils import log_event
+from gotrain.tools import dataiq as dataiq_tools
 from gotrain.tools import datasets as datasets_tools
+from gotrain.tools import experiment_planner as experiment_planner_tools
 from gotrain.tools import geoguard as geoguard_tools
+from gotrain.tools import pretrained as pretrained_tools
 from gotrain.tools import s3 as s3_tools
 from gotrain.tools import training as training_tools
 
@@ -93,6 +96,168 @@ def run_geoguard(dataset: str, task_type: str, max_samples: int = 300) -> dict:
             itself computes, which always use the full train split).
     """
     return geoguard_tools.run_geoguard(dataset, task_type, max_samples)
+
+
+@tool
+def run_dataiq_structural_scan(dataset: str, task_type: str, max_samples: int = 300) -> dict:
+    """Scan a TRAIN sample for corrupted/invalid files and exact
+    duplicates (NaN/Inf pixels, constant images, out-of-range labels/
+    masks, byte-identical duplicate samples) -- deterministic, model-free
+    checks. Objectively corrupted samples are automatically quarantined
+    under policy (no engineer approval needed for these specifically) and
+    immediately folded into a ready-to-use manifest, returned as
+    "quarantine_manifest_id". Call this once, alongside run_geoguard,
+    before your first launch_training call.
+
+    Args:
+        dataset: the GEO-Bench dataset name.
+        task_type: "classification" or "segmentation".
+        max_samples: how many TRAIN images to inspect (bounded for speed).
+    """
+    return dataiq_tools.run_dataiq_structural_scan(dataset, task_type, max_samples)
+
+
+@tool
+def run_dataiq_loss_scan(dataset: str, task_type: str, run_id: str) -> dict:
+    """Model-assisted scan for suspicious training examples: loads
+    `run_id`'s saved checkpoint and computes per-example training loss /
+    predicted class / confidence (classification) or per-image mean pixel
+    loss / foreground IoU (segmentation). Flags samples with a high loss
+    AND a high-confidence wrong prediction as PENDING data-quality
+    proposals (never auto-approved -- call list_data_proposals to see
+    them, and they require engineer review before any manifest can use
+    them). This is a signal, not proof: a genuinely hard example can look
+    identical to a mislabeled one by this metric. Call this after a
+    baseline model has trained (needs a real checkpoint to load).
+
+    Args:
+        dataset: the GEO-Bench dataset name.
+        task_type: "classification" or "segmentation".
+        run_id: the run whose checkpoint to scan against.
+    """
+    return dataiq_tools.run_dataiq_loss_scan(dataset, task_type, run_id)
+
+
+@tool
+def list_data_proposals(dataset: Optional[str] = None, status_filter: Optional[str] = None) -> list:
+    """List DataIQ data-quality proposals (from run_dataiq_structural_scan
+    or run_dataiq_loss_scan), optionally filtered by dataset and/or status
+    ("pending", "approved", "rejected"). Call this to check whether an
+    engineer has decided on a proposal before trying to build a manifest
+    from it with create_data_manifest.
+
+    Args:
+        dataset: restrict to one dataset, or omit for all datasets.
+        status_filter: restrict to one status, or omit for all.
+    """
+    return dataiq_tools.list_data_proposals(dataset, status_filter)
+
+
+@tool
+def create_data_manifest(dataset: str, excluded_sample_ids: list, reason: str, base_manifest_id: str = "base") -> dict:
+    """Create a new DataIQ training-data manifest excluding
+    `excluded_sample_ids` from `dataset`'s TRAIN split -- never deletes or
+    modifies any file, only records which indices a training run should
+    skip. Every id must already have an APPROVED EXCLUDE_FROM_TRAINING_
+    CANDIDATE or QUARANTINE_INVALID_SAMPLE decision (check with
+    list_data_proposals first) -- raises an error naming exactly which
+    id isn't approved otherwise, at no cost to your run budget. Pass the
+    returned manifest's "manifest_id" as config["manifest_id"] in your
+    next launch_training call to run the controlled comparison (Experiment
+    B) against your baseline (Experiment A).
+
+    Args:
+        dataset: the GEO-Bench dataset name.
+        excluded_sample_ids: list of TRAIN-split sample indices to exclude.
+        reason: why this manifest was created.
+        base_manifest_id: an existing manifest to layer on top of
+            (defaults to "base" -- the original, unmodified train split).
+    """
+    return dataiq_tools.create_data_manifest(dataset, excluded_sample_ids, reason, base_manifest_id)
+
+
+@tool
+def list_compatible_models(task_type: str, dataset: Optional[str] = None) -> list:
+    """List candidate pretrained backbones/encoders for `task_type` from
+    the curated model registry (gotrain.pretrained), each with its
+    architecture, pretraining source/domain, expected input channels, and
+    (if `dataset` is given) any cached compatibility-verification result
+    for that dataset. This is metadata only -- it never downloads
+    anything.
+
+    Args:
+        task_type: "classification" or "segmentation".
+        dataset: if given, include cached verification status for this
+            dataset.
+    """
+    return pretrained_tools.list_compatible_models(task_type, dataset)
+
+
+@tool
+def estimate_model_resources(model_id: str) -> dict:
+    """Get a rough, explicitly-labeled ESTIMATE (never a measurement) of
+    a catalog model's parameter count and approximate training GPU
+    memory, from gotrain.pretrained.CATALOG.
+
+    Args:
+        model_id: a model_id from list_compatible_models's results.
+    """
+    return pretrained_tools.estimate_model_resources(model_id)
+
+
+@tool
+def validate_model_compatibility(model_id: str, dataset: str, task_type: str, n_bands: int, n_classes: int) -> dict:
+    """Actually construct `model_id` for `dataset`'s real band/class
+    count and run one forward pass -- the ONLY way a catalog entry's
+    compatibility is ever confirmed (never assumed from its metadata
+    alone). Raises/returns compatible=false for catalog entries with no
+    loader implemented in this environment (the aspirational geospatial-
+    foundation-model candidates) rather than attempting an unverified
+    download.
+
+    Args:
+        model_id: a model_id from list_compatible_models's results.
+        dataset: the GEO-Bench dataset to validate against.
+        task_type: "classification" or "segmentation".
+        n_bands: the dataset's actual band count (see get_dataset_info).
+        n_classes: the dataset's actual class count (see get_dataset_info).
+    """
+    return pretrained_tools.validate_model_compatibility(model_id, dataset, task_type, n_bands, n_classes)
+
+
+@tool
+def get_training_diagnostics(dataset: str, run_id: str) -> dict:
+    """Deterministic diagnosis of one completed run, from its ALREADY-
+    RECORDED ledger entry and metrics.json -- no model inference is
+    re-run. Returns labeled diagnoses (e.g. "possible_overfitting",
+    "possible_underfitting", "class_imbalance_hurting_minority_classes",
+    "diminishing_returns", "change_did_not_help") plus the evidence
+    (actual numbers) behind each one. A diagnosis is a hypothesis worth
+    testing, not a proven cause.
+
+    Args:
+        dataset: the GEO-Bench dataset name.
+        run_id: the run to diagnose.
+    """
+    return experiment_planner_tools.get_training_diagnostics(dataset, run_id)
+
+
+@tool
+def recommend_experiments(dataset: str, run_id: str, remaining_run_budget: Optional[int] = None) -> dict:
+    """Evidence-based experiment planner: diagnoses `run_id` (see
+    get_training_diagnostics) and proposes ranked, single-variable
+    candidate experiments drawn only from already-allowlisted config
+    values -- cheapest and lowest-risk first, excluding anything you've
+    already tried and anything that doesn't apply to this task_type. Use
+    this instead of picking your next change arbitrarily.
+
+    Args:
+        dataset: the GEO-Bench dataset name.
+        run_id: the run to plan the next experiment from.
+        remaining_run_budget: how many launch_training calls you have
+            left -- when tight, costlier candidates are ranked lower.
+    """
+    return experiment_planner_tools.recommend_experiments(dataset, run_id, remaining_run_budget)
 
 
 @tool
@@ -228,6 +393,21 @@ def submit_final_model(dataset: str, run_id: str) -> dict:
     status.write_status(stage="FINALIZE", action=f"submitted {run_id} as final model", where=dataset)
     log_event("final_model_submitted", dataset=dataset, run_id=run_id)
     control.transition(control.COMPLETED, reason=f"final model submitted: {run_id}", requested_by="agent")
+
+    # Best-effort: the Model Passport documents what was submitted, but a
+    # failure to generate it must never make submit_final_model itself
+    # fail (the submission above has already succeeded and is what
+    # matters) -- same philosophy as report_progress in the training
+    # templates.
+    try:
+        from gotrain import model_passport
+
+        passport = model_passport.generate_passport(dataset, run_id)
+        model_passport.write_passport(dataset, passport)
+        log_event("model_passport_generated", dataset=dataset, run_id=run_id)
+    except Exception as e:
+        log_event("model_passport_generation_failed", dataset=dataset, run_id=run_id, error=str(e))
+
     return updated
 
 
@@ -262,6 +442,15 @@ ALL_TOOLS = [
     list_datasets,
     get_dataset_info,
     run_geoguard,
+    run_dataiq_structural_scan,
+    run_dataiq_loss_scan,
+    list_data_proposals,
+    create_data_manifest,
+    list_compatible_models,
+    estimate_model_resources,
+    validate_model_compatibility,
+    get_training_diagnostics,
+    recommend_experiments,
     launch_training,
     get_run_status,
     get_run_metrics,
@@ -289,13 +478,27 @@ class LimitsAndLoggingHooks:
     allowed to run) has finished, with its result/duration/exception.
     """
 
-    def __init__(self, dataset: str, max_runs: int, run_minutes: float, max_tool_calls: int):
+    def __init__(
+        self,
+        dataset: str,
+        max_runs: int,
+        run_minutes: float,
+        max_tool_calls: int,
+        max_data_experiments: Optional[int] = config.DEFAULT_MAX_DATA_EXPERIMENTS,
+    ):
         self.dataset = dataset
         self.max_runs = max_runs
         self.run_seconds = run_minutes * 60
         self.max_tool_calls = max_tool_calls
+        self.max_data_experiments = max_data_experiments
         self.tool_call_count = 0
         self.run_count = 0
+        self.data_experiment_count = 0
+
+    @staticmethod
+    def _uses_data_experiment(tool_input: dict) -> bool:
+        manifest_id = (tool_input.get("config") or {}).get("manifest_id")
+        return manifest_id not in (None, "base")
 
     def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
         registry.add_callback(BeforeToolCallEvent, self._on_before)
@@ -342,6 +545,22 @@ class LimitsAndLoggingHooks:
             )
             return
 
+        if (
+            tool_name == "launch_training"
+            and self.max_data_experiments is not None
+            and self._uses_data_experiment(event.tool_use.get("input", {}))
+            and self.data_experiment_count >= self.max_data_experiments
+        ):
+            event.cancel_tool = (
+                f"Data-correction experiment budget exhausted ({self.max_data_experiments} used "
+                f"for {self.dataset}). Repeatedly testing sample exclusions against the same "
+                "validation set risks overfitting to validation, not genuine generalization "
+                "improvement. Do not propose another exclusion-based run -- proceed with your "
+                "best already-validated configuration (which may or may not be a data-corrected "
+                "one; check query_history)."
+            )
+            return
+
         if tool_name == "launch_training":
             # Run counting happens in _on_after, once we know whether the
             # call actually attempted training or was rejected pre-flight
@@ -355,6 +574,8 @@ class LimitsAndLoggingHooks:
 
         if tool_name == "launch_training" and not isinstance(event.exception, PreflightValidationError):
             self.run_count += 1
+            if self._uses_data_experiment(tool_input):
+                self.data_experiment_count += 1
 
         result_text = ""
         if event.result is not None:
@@ -390,10 +611,12 @@ def build_agent(
     max_runs: int = config.DEFAULT_MAX_RUNS,
     run_minutes: float = config.DEFAULT_RUN_MINUTES,
     max_tool_calls: int = config.DEFAULT_MAX_TOOL_CALLS,
+    max_data_experiments: Optional[int] = config.DEFAULT_MAX_DATA_EXPERIMENTS,
 ) -> Agent:
     """Build a Strands Agent wired to the GoTrain tools for one dataset.
 
-    Hard limits (max runs, per-run time budget, max tool calls) are
+    Hard limits (max runs, per-run time budget, max tool calls, and a
+    separate max_data_experiments for DataIQ sample-exclusion runs) are
     enforced by LimitsAndLoggingHooks, not left to the system prompt alone.
     The agent's tools never include final_test_eval — the test split is
     only ever touched by a human, via run_final_eval.py.
@@ -407,6 +630,7 @@ def build_agent(
         max_runs=max_runs,
         run_minutes=run_minutes,
         max_tool_calls=max_tool_calls,
+        max_data_experiments=max_data_experiments,
     )
 
     # launch_training's real implementation (not the @tool stub above) is

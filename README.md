@@ -126,6 +126,101 @@ Post-preprocessing QA checks (`gotrain/geoguard/qa.py`) validate an
 already-normalized batch — shape, channel count, NaN/Inf, label/mask
 alignment and range — independent of GeoGuard's dataset-level diagnostics.
 
+GeoGuard's class-imbalance recommendation (`gotrain/geoguard/decision.py`)
+caps inverse-frequency weights at 10x (never an unbounded ratio) and
+switches to median-frequency balancing instead of plain inverse-frequency
+once the imbalance ratio is extreme (>50x) — both are starting points for
+a controlled comparison against the unweighted baseline, not guaranteed
+improvements.
+
+## Model Intelligence — pretrained-model registry and fine-tuning strategy
+
+`gotrain/pretrained.py` is a curated, static catalog (never a live model-hub
+query) distinguishing architecture, pretraining source/domain, expected
+input channels, and license per candidate. `list_compatible_models`/
+`estimate_model_resources` are metadata-only; `validate_model_compatibility`
+is the *only* way an entry is ever marked verified — it actually
+constructs the model for the target dataset's real band/class count and
+runs one forward pass, caching the result. Aspirational geospatial
+foundation-model candidates (torchgeo/dinov2/Prithvi) are listed with no
+loader implemented — `load_pretrained_backbone` raises `NotImplementedError`
+for them rather than attempting an unverified download; only the
+timm/segmentation_models_pytorch backbones the training templates already
+use are actually loadable today.
+
+`config["fine_tuning_strategy"]` (`gotrain/finetuning.py`) controls which
+parameters receive gradients: `"full"` (default), `"linear_probe"` (freeze
+the backbone, train only the head), `"partial"` (unfreeze only the
+backbone's later layers), or `"from_scratch"` (forces `pretrained=false`).
+`linear_probe`/`partial` with `pretrained=false` is rejected pre-flight
+(`gotrain/config_schema.py::validate_fine_tuning_strategy`) — freezing a
+randomly-initialized backbone cannot learn. Trainable/frozen parameter
+counts are recorded in `metrics.json`'s `"fine_tuning"` block.
+
+## DataIQ — autonomous training-data intelligence
+
+`gotrain/dataiq/` never deletes or modifies original data — everything is
+a **versioned, reversible manifest** (`gotrain/dataiq/manifest.py`)
+recording which TRAIN-split sample indices a training run should skip.
+Manifests only ever affect the train split, by construction (no function
+in that module accepts anything but a train-split index), and compose on
+top of each other (lineage via `base_manifest_id`).
+
+- **Structural scan** (`run_dataiq_structural_scan`): deterministic,
+  model-free checks for corrupted samples (NaN/Inf, constant images,
+  out-of-range labels/masks) and exact (byte-identical, never
+  near-duplicate) duplicates. Objectively corrupted samples are
+  auto-quarantined under policy and immediately folded into a ready-to-use
+  manifest — no engineer approval needed for these specifically.
+- **Loss scan** (`run_dataiq_loss_scan`): model-assisted — loads a run's
+  checkpoint and computes per-example training loss/predicted
+  class/confidence (classification) or per-image mean pixel loss/
+  foreground IoU (segmentation). This is a **signal, not proof**: flagged
+  samples become PENDING proposals that always require engineer review,
+  never auto-approved.
+- **Data-quality decisions** (`gotrain/dataiq/decision.py`) share the
+  *same* review queue, `decide()`, and audit trail as config-gate
+  approvals (`gotrain/approval.py`) — extended, not duplicated — keyed by
+  `(dataset, sample_id, action)`, so a rejected exclusion can't be let
+  through by resubmitting it differently, exactly like a rejected
+  backbone value.
+- **Controlled data-correction experiments**: once a sample's exclusion is
+  approved, `create_data_manifest` builds a manifest from it (raises
+  naming exactly which sample isn't approved otherwise), and
+  `config["manifest_id"]` on a `launch_training` call runs the controlled
+  comparison — same hypothesis/`parent_id`/`config_diff` machinery as any
+  other single-variable experiment. A separate, smaller
+  `max_data_experiments` budget (default 2, independent of `--max-runs`)
+  caps how many such exclusion-based runs the agent may launch, guarding
+  against "adaptive validation overfitting" from repeatedly probing
+  exclusions against the same validation set.
+
+## Evidence-based experiment planning
+
+`get_training_diagnostics` reads a run's already-recorded ledger entry +
+`metrics.json` (no model re-inference) and derives labeled diagnoses —
+`possible_overfitting`, `possible_underfitting`,
+`class_imbalance_hurting_minority_classes`, `diminishing_returns`,
+`change_did_not_help` — each with the actual evidence behind it.
+`recommend_experiments` turns diagnoses into ranked, single-variable
+candidate experiments drawn only from already-allowlisted config values,
+filtered against prior history (never re-suggests an already-tried
+direction) and ranked cheapest-and-lowest-risk-first, more aggressively
+once `remaining_run_budget` is tight (`gotrain/experiment_planner.py`).
+
+## Model Passport
+
+`gotrain/model_passport.py::generate_passport` assembles one reproducible
+record from data this project already recorded — ledger, model registry,
+GeoGuard/DataIQ reports, the approval queue — including a **Data
+Provenance and Quality** section (training manifest, excluded sample
+count, approved/rejected data actions). Test-split results are only ever
+included if `run_final_eval.py` has already been run (read from
+`events.jsonl`, never triggered). `robustness_results` is explicitly
+`null` — StressLab isn't implemented in this pass, and nothing here is
+fabricated to fill the field. Generated automatically (best-effort) when
+`submit_final_model` is called; viewable in the dashboard's DataIQ tab.
+
 ## The safety rail
 
 - The agent trains on the **train** split and tunes/compares on the **validation**
@@ -212,6 +307,17 @@ pointer, and a successful rollback always leaves the system
   above), written by `gotrain/approval.py`.
 - `models/<dataset>/active_version.json` — the dataset's currently active
   model version after a verified rollback, written by `gotrain/rollback.py`.
+- `logs/dataiq/manifests/<dataset>/<manifest_id>.json` — a versioned,
+  reversible training-data manifest (see above), written by
+  `gotrain/dataiq/manifest.py`.
+- `logs/dataiq/structural_scan/<dataset>.json` — `run_dataiq_structural_scan`'s
+  report (corrupted/duplicate findings), written by `gotrain/dataiq/report.py`.
+- `logs/dataiq/sample_losses/<dataset>/<run_id>.json` — `run_dataiq_loss_scan`'s
+  full per-sample report, written by `gotrain/dataiq/loss_scan.py`.
+- `logs/pretrained/verification/<model_id>__<dataset>.json` — a cached
+  `validate_model_compatibility` result, written by `gotrain/pretrained.py`.
+- `logs/model_passports/<dataset>.json` — the Model Passport (see above),
+  written by `gotrain/model_passport.py`.
 - `runs/<dataset>/<run_id>/` — scratch output from one training process
   (`config.json`, `metrics.json`, `train.log`, checkpoint). Not tracked by git.
 - `models/<dataset>/<version>/` — the durable model registry: a run's config,

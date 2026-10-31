@@ -13,6 +13,17 @@ from gotrain.config_schema import validate_config
 
 SMALL_DATASET_THRESHOLD = 1000
 
+# Class-imbalance intelligence (see recommend()'s rare_classes branch
+# below). CLASS_WEIGHT_CAP bounds how large any single class's weight
+# can get -- "do not apply extreme inverse-frequency weights without
+# safeguards." Beyond EXTREME_IMBALANCE_RATIO, median-frequency balancing
+# (weighting relative to the dataset's typical class frequency) is
+# recommended instead of plain inverse-frequency (weighting relative to
+# a fixed baseline of 1.0), since it degrades more gracefully when one
+# class is vanishingly rare.
+CLASS_WEIGHT_CAP = 10.0
+EXTREME_IMBALANCE_RATIO = 50.0
+
 
 def recommend(
     dataset: str,
@@ -91,11 +102,31 @@ def recommend(
         findings.append(
             f"Rare classes (<2% of {class_diagnostics['unit']}): {class_diagnostics['rare_classes']}"
         )
-        config["class_weights"] = _inverse_frequency_weights(class_diagnostics["frequencies"])
-        rationale.append(
-            "class_weights set to inverse-frequency (normalized to sum to "
-            "n_classes) to counter the rare classes found above."
-        )
+        imbalance_ratio = class_diagnostics.get("imbalance_ratio")
+        if imbalance_ratio is not None and imbalance_ratio > EXTREME_IMBALANCE_RATIO:
+            config["class_weights"] = _median_frequency_weights(class_diagnostics["frequencies"])
+            findings.append(
+                f"Imbalance ratio is extreme ({imbalance_ratio:.0f}x between the most- and "
+                "least-frequent class with any samples)."
+            )
+            rationale.append(
+                f"class_weights set via median-frequency balancing (capped at {CLASS_WEIGHT_CAP:.0f}x, "
+                "normalized to sum to n_classes) rather than plain inverse-frequency -- with imbalance "
+                "this extreme, inverse-frequency would assign the rarest class a weight wildly "
+                "disproportionate to everything else in a batch; median-frequency balancing weights "
+                "relative to the dataset's typical class frequency instead. This is a starting point "
+                "for a controlled comparison against the unweighted baseline (same architecture/seed, "
+                "only class_weights differing), not a guaranteed improvement -- validate both before "
+                "keeping either, and track minority-class metrics, not just overall accuracy."
+            )
+        else:
+            config["class_weights"] = _inverse_frequency_weights(class_diagnostics["frequencies"])
+            rationale.append(
+                f"class_weights set to inverse-frequency (capped at {CLASS_WEIGHT_CAP:.0f}x, normalized "
+                "to sum to n_classes) to counter the rare classes found above -- capped so no single "
+                "rare class can dominate the loss. A starting point for a controlled comparison against "
+                "the unweighted baseline, not a guaranteed improvement."
+            )
 
     if class_diagnostics["background_dominant"]:
         findings.append(
@@ -141,11 +172,34 @@ def recommend(
     }
 
 
-def _inverse_frequency_weights(frequencies: list) -> list:
+def _inverse_frequency_weights(frequencies: list, cap: float = CLASS_WEIGHT_CAP) -> list:
+    """weight_c = 1 / freq_c, capped at `cap` before normalizing so no
+    single rare class can dominate the loss ("do not apply extreme
+    inverse-frequency weights without safeguards").
+    """
+    raw = [1.0 / f if f > 0 else 0.0 for f in frequencies]
+    return _normalize_weights([min(w, cap) for w in raw])
+
+
+def _median_frequency_weights(frequencies: list, cap: float = CLASS_WEIGHT_CAP) -> list:
+    """Median-frequency balancing (Eigen & Fergus): weight_c =
+    median(nonzero frequencies) / freq_c. Weights relative to the
+    dataset's typical class frequency instead of a fixed baseline of
+    1.0, so it degrades more gracefully than plain inverse-frequency
+    when one class is vanishingly rare. Also capped at `cap`.
+    """
+    positive = sorted(f for f in frequencies if f > 0)
+    if not positive:
+        return [1.0] * len(frequencies)
+    median_freq = positive[len(positive) // 2]
+    raw = [median_freq / f if f > 0 else 0.0 for f in frequencies]
+    return _normalize_weights([min(w, cap) for w in raw])
+
+
+def _normalize_weights(weights: list) -> list:
     """Normalize so weights sum to n_classes (keeps the loss's overall
     magnitude comparable to unweighted CE instead of scaling it up/down).
     """
-    weights = [1.0 / f if f > 0 else 0.0 for f in frequencies]
     total = sum(weights)
     n = len(weights)
     if total == 0:

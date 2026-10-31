@@ -30,8 +30,11 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from gotrain import approval, control, ledger, registry, rollback
+from gotrain import approval, control, ledger, model_passport, registry, rollback
 from gotrain import status as status_mod
+from gotrain.dataiq import decision as dataiq_decision
+from gotrain.dataiq import manifest as dataiq_manifest
+from gotrain.dataiq import report as dataiq_report
 from gotrain.geoguard import report as geoguard_report
 from gotrain.logging_utils import EVENTS_PATH
 
@@ -311,7 +314,7 @@ def render_sidebar(status_data: dict, training_open: bool) -> str:
     with st.sidebar:
         st.markdown('<div class="gt-logo">🛰️&nbsp; GoTrain</div>', unsafe_allow_html=True)
         view = st.radio(
-            "Navigate", ["Dashboard", "Experiments", "Models", "Control", "Agent Logs"], label_visibility="collapsed"
+            "Navigate", ["Dashboard", "Experiments", "Models", "DataIQ", "Control", "Agent Logs"], label_visibility="collapsed"
         )
         st.markdown("<hr class='gt-sidebar-hr'/>", unsafe_allow_html=True)
 
@@ -462,7 +465,11 @@ def render_control_panel() -> None:
 
 
 def render_approvals_panel() -> None:
-    pending = approval.list_proposals(status=approval.PENDING)
+    """Config-gate (backbone/architecture/encoder) proposals only --
+    DataIQ sample-level proposals get their own panel
+    (render_dataiq_approvals_panel) so the two never mix in one list.
+    """
+    pending = approval.list_proposals(status=approval.PENDING, kind="config_gate")
     blocks = []
     if not pending:
         blocks.append(empty("No pending approval requests"))
@@ -488,7 +495,9 @@ def render_approvals_panel() -> None:
             approval.decide(p["key"], approve=False, decided_by="engineer", decision_reason=reason or None)
             st.rerun()
 
-    decided = approval.list_proposals(status=approval.APPROVED) + approval.list_proposals(status=approval.REJECTED)
+    decided = approval.list_proposals(status=approval.APPROVED, kind="config_gate") + approval.list_proposals(
+        status=approval.REJECTED, kind="config_gate"
+    )
     if decided:
         rows = []
         for p in sorted(decided, key=lambda x: x["decided_at"] or ""):
@@ -519,6 +528,122 @@ def render_rollback_panel(dataset: str, task_type: str) -> None:
         except rollback.RollbackVerificationError as e:
             st.error(f"Rollback verification FAILED — active version left unchanged. {e}")
         st.rerun()
+
+
+def render_dataiq_overview_panel(dataset: str) -> None:
+    rep = dataiq_report.read_report(dataset)
+    if not rep:
+        st.markdown(card("DataIQ — Structural Scan", empty("No DataIQ structural scan yet for this dataset")), unsafe_allow_html=True)
+        return
+    inner = (
+        kv_row("Samples scanned", esc(rep.get("n_samples_scanned", "—")))
+        + kv_row("Invalid/corrupted samples", esc(rep.get("n_invalid", 0)))
+        + kv_row("Duplicate groups", esc(rep.get("n_duplicate_groups", 0)))
+        + kv_row("Auto-quarantine manifest", esc(rep.get("quarantine_manifest_id") or "none created"))
+    )
+    st.markdown(card("DataIQ — Structural Scan", inner), unsafe_allow_html=True)
+
+
+def render_dataiq_approvals_panel(dataset: str) -> None:
+    """Sample-level data-quality proposals (gotrain.dataiq.decision) --
+    deliberately separate from render_approvals_panel's config-gate list.
+    Approve/Reject here call the SAME gotrain.approval.decide used for
+    config gates (one shared audit trail, two purpose-built views).
+    """
+    pending = dataiq_decision.list_data_proposals(dataset=dataset, status=approval.PENDING)
+    blocks = []
+    if not pending:
+        blocks.append(empty("No pending data-quality proposals for this dataset"))
+    for p in pending:
+        evidence_text = ", ".join(f"{k}={v}" for k, v in (p.get("evidence") or {}).items())
+        blocks.append(
+            f"<div style='margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border);'>"
+            f"<b>Sample #{esc(p['sample_id'])}</b> &mdash; <code>{esc(p['action'])}</code> "
+            f"<span style='color:var(--muted);font-size:0.75rem'>(severity: {esc(p['severity'])})</span><br>"
+            f"<span style='color:var(--text-2);font-size:0.85rem'>{esc(p['reason'])}</span><br>"
+            f"<span style='color:var(--muted);font-size:0.78rem'>Evidence: {esc(evidence_text) or '—'}</span></div>"
+        )
+    st.markdown(card("Suspicious Training Examples — Pending Review", "".join(blocks)), unsafe_allow_html=True)
+
+    for p in pending:
+        reason = st.text_input(
+            "Decision reason", key=f"data_reason_{p['key']}", label_visibility="collapsed",
+            placeholder=f"Reason for approving/rejecting sample #{p['sample_id']} (optional)",
+        )
+        c1, c2 = st.columns(2)
+        if c1.button(f"✅ Approve #{p['sample_id']}", key=f"data_approve_{p['key']}", use_container_width=True):
+            approval.decide(p["key"], approve=True, decided_by="engineer", decision_reason=reason or None)
+            st.rerun()
+        if c2.button(f"❌ Reject #{p['sample_id']}", key=f"data_reject_{p['key']}", use_container_width=True):
+            approval.decide(p["key"], approve=False, decided_by="engineer", decision_reason=reason or None)
+            st.rerun()
+
+    decided = dataiq_decision.list_data_proposals(dataset=dataset, status=approval.APPROVED) + \
+        dataiq_decision.list_data_proposals(dataset=dataset, status=approval.REJECTED)
+    manual_decisions = [p for p in decided if p.get("decided_by") not in ("policy", "system")]
+    if manual_decisions:
+        rows = []
+        for p in sorted(manual_decisions, key=lambda x: x["decided_at"] or ""):
+            pill = decision_pill("kept" if p["status"] == approval.APPROVED else "discarded")
+            rows.append(
+                f"<div style='padding:3px 0;'>{pill} Sample #{esc(p['sample_id'])} "
+                f"<code>{esc(p['action'])}</code> — {esc(p.get('decision_reason') or 'no reason given')}</div>"
+            )
+        st.markdown(card("Data-Quality Decision History", "".join(rows)), unsafe_allow_html=True)
+
+
+def render_data_experiment_comparison_panel(dataset: str, ds_history: list) -> None:
+    """Runs whose config used a non-base DataIQ manifest, next to their
+    parent (baseline) run -- the "Experiment A vs B" comparison the
+    design brief asks for, read straight from the ledger's own
+    config_diff/delta_vs_parent (never recomputed here).
+    """
+    experiments = [r for r in ds_history if (r.get("config") or {}).get("manifest_id") not in (None, dataiq_manifest.BASE_MANIFEST_ID)]
+    if not experiments:
+        st.markdown(card("Data-Correction Experiments", empty("No data-correction experiments run yet")), unsafe_allow_html=True)
+        return
+
+    rows_html = []
+    for r in sorted(experiments, key=lambda x: x["timestamp"]):
+        manifest_id = r["config"]["manifest_id"]
+        manifest = dataiq_manifest.get_manifest(dataset, manifest_id)
+        n_excluded = manifest["n_excluded"] if manifest else "?"
+        delta = r.get("delta_vs_parent")
+        delta_text = f"{delta * 100:+.1f} pts" if isinstance(delta, (int, float)) else "—"
+        outcome_pill = hypothesis_outcome_pill(r.get("hypothesis_outcome"))
+        rows_html.append(
+            f'<tr><td>{esc(manifest_id[:8])}</td><td>{esc(n_excluded)}</td>'
+            f'<td>{pct(r.get("val_metric"))}</td><td>{esc(delta_text)}</td><td>{outcome_pill}</td></tr>'
+        )
+    table = (
+        '<div class="gt-table-wrap"><table class="gt-table">'
+        "<thead><tr><th>Manifest</th><th>Excluded</th><th>Val Metric</th><th>vs. Baseline</th><th>Hypothesis Outcome</th></tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody></table></div>"
+    )
+    st.markdown(card("Data-Correction Experiments", table), unsafe_allow_html=True)
+
+
+def render_model_passport_panel(dataset: str) -> None:
+    passport = model_passport.read_passport(dataset)
+    if not passport:
+        st.markdown(card("Model Passport", empty("No final model submitted for this dataset yet")), unsafe_allow_html=True)
+        return
+
+    provenance = passport["data_provenance"]
+    inner = (
+        kv_row("Model ID", f"<code>{esc(passport['model_id'][:8])}</code>")
+        + kv_row("Architecture", esc(passport["architecture"]))
+        + kv_row("Fine-tuning strategy", esc(passport["fine_tuning_strategy"]))
+        + kv_row("Validation metric", pct(passport["validation_metrics"]["val_metric"]))
+        + kv_row("Test metric", esc(passport["test_metrics"] or "not yet evaluated"))
+        + kv_row("Excluded samples", esc(provenance["excluded_sample_count"]))
+        + kv_row("Checkpoint SHA-256", f"<code style='font-size:0.7rem'>{esc((passport['checkpoint_sha256'] or '—')[:16])}…</code>")
+    )
+    if passport["known_limitations"]:
+        inner += '<div class="gt-decision-block"><div class="gt-decision-label">Known limitations</div>' + "".join(
+            f"<div style='font-size:0.85rem;color:var(--text-2);padding:2px 0;'>• {esc(lim)}</div>" for lim in passport["known_limitations"]
+        ) + "</div>"
+    st.markdown(card("Model Passport", inner, "gt-card-best"), unsafe_allow_html=True)
 
 
 def render_geoguard_panel(dataset: str) -> None:
@@ -1055,6 +1180,15 @@ def main() -> None:
             render_approvals_panel()
         with ctl_right:
             render_rollback_panel(selected_dataset, selected_task_type)
+
+    if view == "DataIQ":
+        diq_left, diq_right = st.columns(2, gap="large")
+        with diq_left:
+            render_dataiq_overview_panel(selected_dataset)
+            render_data_experiment_comparison_panel(selected_dataset, ds_history)
+            render_model_passport_panel(selected_dataset)
+        with diq_right:
+            render_dataiq_approvals_panel(selected_dataset)
 
     if view in ("Dashboard", "Agent Logs"):
         feed_limit = 40 if view == "Agent Logs" else 20

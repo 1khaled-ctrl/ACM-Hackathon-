@@ -18,7 +18,9 @@ sys.path.insert(0, str(REPO_ROOT))
 os.environ.setdefault("GEO_BENCH_DIR", str(REPO_ROOT / "data" / "geobench"))
 
 from gotrain import agent as agent_mod
-from gotrain import control, ledger, logging_utils, status
+from gotrain import approval, control, ledger, logging_utils, model_passport, status
+from gotrain.dataiq import decision as dataiq_decision
+from gotrain.dataiq import manifest as dataiq_manifest
 from gotrain.tools import final_eval
 
 
@@ -34,6 +36,11 @@ def isolated_logs(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger, "LEDGER_PATH", logs_dir / "ledger.jsonl")
     monkeypatch.setattr(final_eval, "LOGS_DIR", logs_dir)
     monkeypatch.setattr(control, "CONTROL_PATH", logs_dir / "control.json")
+    monkeypatch.setattr(model_passport, "EVENTS_PATH", logs_dir / "events.jsonl")
+    monkeypatch.setattr(model_passport, "PASSPORTS_DIR", logs_dir / "model_passports")
+    monkeypatch.setattr(approval, "APPROVALS_STATE_PATH", logs_dir / "approvals_state.json")
+    monkeypatch.setattr(approval, "APPROVALS_LOG_PATH", logs_dir / "approvals.jsonl")
+    monkeypatch.setattr(dataiq_manifest, "MANIFESTS_DIR", logs_dir / "dataiq" / "manifests")
 
     return logs_dir
 
@@ -50,6 +57,9 @@ def test_agent_tool_list_excludes_final_test_eval(isolated_logs):
         "list_datasets", "get_dataset_info", "run_geoguard", "launch_training", "get_run_status",
         "get_run_metrics", "query_history", "compare_runs", "record_decision",
         "submit_final_model", "upload_to_s3", "download_from_s3",
+        "run_dataiq_structural_scan", "run_dataiq_loss_scan", "list_data_proposals", "create_data_manifest",
+        "list_compatible_models", "estimate_model_resources", "validate_model_compatibility",
+        "get_training_diagnostics", "recommend_experiments",
     ]:
         assert name in agent.tool_names
 
@@ -157,6 +167,21 @@ def test_submit_final_model_does_not_touch_test_split(isolated_logs):
     assert not list(isolated_logs.glob("test_lock_*.json"))
 
 
+def test_submit_final_model_generates_a_model_passport(isolated_logs):
+    from gotrain import model_passport
+
+    agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=40)
+    launch_result = agent.tool.launch_training(dataset="m-eurosat", task_type="fake", config={"lr": 0.01})
+    run_id = json.loads(_tool_result_text(launch_result))["run_id"]
+
+    agent.tool.submit_final_model(dataset="m-eurosat", run_id=run_id)
+
+    passport = model_passport.read_passport("m-eurosat")
+    assert passport is not None
+    assert passport["model_id"] == run_id
+    assert passport["engineer_approval"]["submitted_final"] is True
+
+
 def test_submit_final_model_rejects_mismatched_dataset(isolated_logs):
     agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=40)
 
@@ -243,6 +268,53 @@ def test_missing_hypothesis_rejection_does_not_count_against_max_runs(isolated_l
 
     history = agent.tool.query_history(dataset="m-eurosat")
     assert len(json.loads(_tool_result_text(history))) == 2
+
+
+def test_data_experiment_budget_enforced_independently_of_run_budget(isolated_logs):
+    """A launch_training call using a DataIQ manifest (an actual
+    data-correction experiment) is capped by max_data_experiments,
+    separately from --max-runs, so the agent can't repeatedly probe
+    sample exclusions against validation even with run budget to spare.
+    """
+    agent = agent_mod.build_agent(
+        "m-eurosat", max_runs=10, run_minutes=5, max_tool_calls=40, max_data_experiments=1
+    )
+
+    baseline = agent.tool.launch_training(dataset="m-eurosat", task_type="fake", config={"lr": 0.01})
+    baseline_id = json.loads(_tool_result_text(baseline))["run_id"]
+
+    for sample_id in (1, 2):
+        proposal = dataiq_decision.propose_action(
+            "m-eurosat", sample_id=sample_id, action="QUARANTINE_INVALID_SAMPLE",
+            evidence={}, severity="high", reason="corrupted",
+        )
+    first_manifest = dataiq_manifest.create_manifest("m-eurosat", excluded_sample_ids=[1], reason="x")
+    second_manifest = dataiq_manifest.create_manifest(
+        "m-eurosat", excluded_sample_ids=[2], reason="y", base_manifest_id=first_manifest["manifest_id"],
+    )
+
+    first_experiment = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="fake", config={"manifest_id": first_manifest["manifest_id"]},
+        parent_id=baseline_id,
+        hypothesis={"change": "excluded sample 1", "why": "corrupted", "expected_direction": "increase"},
+    )
+    assert first_experiment["status"] == "success"
+
+    second_experiment = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="fake", config={"manifest_id": second_manifest["manifest_id"]},
+        parent_id=baseline_id,
+        hypothesis={"change": "excluded sample 2 too", "why": "corrupted", "expected_direction": "increase"},
+    )
+    assert second_experiment["status"] == "error"
+    assert "data-correction experiment budget exhausted" in _tool_result_text(second_experiment).lower()
+
+    # the blocked call must not have consumed run budget -- a THIRD
+    # ordinary (non-data-experiment) run must still succeed.
+    ordinary = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="fake", config={"lr": 0.002}, parent_id=baseline_id,
+        hypothesis={"change": "lowered lr", "why": "testing", "expected_direction": "increase"},
+    )
+    assert ordinary["status"] == "success"
 
 
 def test_control_plane_blocks_every_tool_call_while_paused(isolated_logs):

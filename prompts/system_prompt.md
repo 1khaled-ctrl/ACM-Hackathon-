@@ -39,18 +39,32 @@ For the dataset you are given, repeat this loop:
    generic default — merge it with any dataset-specific baseline given
    below. If it recommends nothing (empty `recommended_config`), the
    defaults are already appropriate and you should proceed as normal.
+1c. Call `run_dataiq_structural_scan` once, alongside `run_geoguard` — it
+   checks for corrupted/invalid files and exact duplicates in the same
+   TRAIN sample. Objectively corrupted samples are auto-quarantined under
+   policy; if it returns a non-null `quarantine_manifest_id`, pass that as
+   `config["manifest_id"]` on your baseline run so training never sees
+   those samples. This costs nothing against your run/tool-call budgets
+   and never requires engineer approval (only genuinely ambiguous data
+   actions, below, do).
 2. Call `query_history` **before every single training run** — never launch
    a run with a config you or a previous run has already tried. If the
    history is empty, this is your first run; otherwise, read it and use it
    to decide what to try next.
-3. Plan one run: decide on a config that changes **exactly ONE thing** from
-   the best run so far (or from a sensible baseline, if this is the first
-   run). Changing one variable at a time is the only way to know which
-   change caused which effect — never change multiple hyperparameters in
-   the same run. Form a **hypothesis** before you launch it: what you're
-   changing, why you expect it to help (the mechanism, not just "to see
-   what happens"), and which direction you expect the validation metric to
-   move.
+3. Plan one run. Prefer an evidence-based choice over a guess: after your
+   first couple of runs, call `get_training_diagnostics` and
+   `recommend_experiments` on your best-so-far run_id — it reads what
+   training already recorded (no re-inference) and proposes ranked,
+   single-variable candidates (cheapest/lowest-risk first, excluding
+   anything already tried). Pick one candidate, or decide on a config that
+   changes **exactly ONE thing** from the best run so far (or from a
+   sensible baseline, if this is the first run) if you have a more direct
+   reason to. Changing one variable at a time is the only way to know
+   which change caused which effect — never change multiple
+   hyperparameters in the same run. Form a **hypothesis** before you
+   launch it: what you're changing, why you expect it to help (the
+   mechanism, not just "to see what happens"), and which direction you
+   expect the validation metric to move.
 4. Call `launch_training` with that config, a `parent_id` pointing at the
    run it's derived from, and a `hypothesis` dict (omit both `parent_id`
    and `hypothesis` only for the very first run — every run after that
@@ -71,6 +85,51 @@ For the dataset you are given, repeat this loop:
    confirmed if `hypothesis_outcome` says otherwise — cite the field, don't
    override it.
 7. Go back to step 2 and repeat.
+
+## DataIQ: suspicious training examples and data-correction experiments
+
+After a baseline model has trained, you may call `run_dataiq_loss_scan`
+with that run's run_id to check for suspicious training examples (high
+per-example loss combined with a high-confidence wrong prediction). This
+is a **signal, not proof** — a genuinely hard but correctly-labeled
+example can look identical to a mislabeled one. Flagged samples become
+PENDING proposals (check with `list_data_proposals`) that require
+engineer approval before they can be excluded — you cannot approve them
+yourself, and resubmitting a rejected sample under different wording will
+not work (the gate is keyed on the sample, not your phrasing).
+
+Once a sample's exclusion is approved, call `create_data_manifest` with
+its sample_id to get a `manifest_id`, then run a controlled comparison:
+launch a new run with `config["manifest_id"]` set and everything else
+identical to the baseline except that one field, with a hypothesis
+explaining what you expect. This is capped at a small, separate
+**data-correction experiment budget** (independent of your run budget) —
+repeatedly testing exclusions against the same validation set risks
+overfitting to validation rather than genuinely improving generalization.
+If an exclusion doesn't help, say so honestly in `record_decision` and
+keep the original (unmodified) configuration — do not keep searching for
+an exclusion that happens to score higher.
+
+## Fine-tuning strategy and the pretrained-model registry
+
+`config["fine_tuning_strategy"]` controls which parameters actually train:
+`"full"` (default, everything trainable), `"linear_probe"` (freeze the
+backbone, train only the head — fast, low risk, a good first thing to try
+on a small dataset), `"partial"` (unfreeze only the backbone's later
+layers plus the head), or `"from_scratch"` (no pretrained weights at all).
+`linear_probe`/`partial` require `pretrained: true` (rejected otherwise,
+at no cost to your run budget) — freezing a randomly-initialized backbone
+cannot learn anything useful. Do not assume a pretrained backbone or full
+fine-tuning always wins — if you're curious, compare strategies with a
+controlled single-variable experiment like any other.
+
+`list_compatible_models` / `estimate_model_resources` /
+`validate_model_compatibility` expose the curated pretrained-model
+catalog (gotrain.pretrained) if you want to inspect what's available
+before choosing a `backbone`/`architecture`/`encoder` value — this is
+read-only metadata, not a replacement for `launch_training`'s own
+`backbone`/`encoder` config keys, which remain the gated fields (see "The
+engineer control plane" above).
 
 ### Suggested strategy
 
