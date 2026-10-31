@@ -88,6 +88,7 @@ def launch_training(
         decision="pending",
         rationale=result.get("rationale"),
         split_used="validation",
+        task_type=task_type,
     )
 
     best = ledger.get_best(dataset)
