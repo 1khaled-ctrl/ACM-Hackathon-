@@ -115,6 +115,22 @@ def read_telemetry() -> dict:
 
 
 def agent_process_alive() -> bool:
+    """True only if the pid in logs/agent.pid is actually still a
+    run_gotrain.py process -- not just any live process with that number.
+
+    run_gotrain.py never touches agent.pid itself (it doesn't know the
+    file exists); only api_agent_start() writes it and api_agent_stop()
+    removes it. When a mission finishes on its own -- the normal,
+    successful path, where the agent submits a final model and its
+    process exits without anyone calling /api/agent/stop -- nothing ever
+    cleans the file up. psutil.pid_exists(pid) alone would then report
+    "running" forever afterward, because PIDs get reused by the OS: the
+    very next unrelated process the kernel happens to assign that number
+    to makes a finished mission look permanently stuck as "agent
+    running", exactly as hit on the lab. Checking the command line is
+    what actually answers "is OUR agent still alive", and self-heals the
+    stale file the moment it notices the mismatch.
+    """
     if not AGENT_PID_PATH.exists():
         return False
     try:
@@ -124,8 +140,25 @@ def agent_process_alive() -> bool:
     try:
         import psutil
 
-        return psutil.pid_exists(pid)
+        if not psutil.pid_exists(pid):
+            AGENT_PID_PATH.unlink(missing_ok=True)
+            return False
+        proc = psutil.Process(pid)
+        cmdline = " ".join(proc.cmdline())
+        if "run_gotrain.py" not in cmdline:
+            # The pid is alive but belongs to some other process now --
+            # the OS reused it after our agent exited. Stale file; clean
+            # it up rather than reporting a phantom "agent running".
+            AGENT_PID_PATH.unlink(missing_ok=True)
+            return False
+        return True
+    except psutil.NoSuchProcess:
+        AGENT_PID_PATH.unlink(missing_ok=True)
+        return False
     except Exception:
+        # Any other psutil failure (permissions, zombie state, etc.) --
+        # fail closed to "not alive" rather than wedge Start forever, but
+        # do NOT delete the file on an error we don't understand.
         return False
 
 
