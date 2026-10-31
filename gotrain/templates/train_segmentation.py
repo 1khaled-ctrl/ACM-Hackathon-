@@ -43,6 +43,21 @@ def report_progress(**fields) -> None:
         set_current_run(fields)
     except Exception:
         pass
+    try:
+        from gotrain.logging_utils import log_live_metric
+
+        log_live_metric(
+            run_id=fields.get("run_id"),
+            dataset=fields.get("dataset"),
+            epoch=fields.get("epoch"),
+            train_loss=fields.get("train_loss"),
+            val_metric=fields.get("val_metric"),
+            elapsed_seconds=fields.get("elapsed_seconds"),
+            task_type=fields.get("task_type"),
+            metric_name=fields.get("metric_name"),
+        )
+    except Exception:
+        pass
 
 
 DEFAULTS = {

@@ -32,6 +32,7 @@ DEFAULT_LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOGS_DIR = Path(os.environ.get("GOTRAIN_LOGS_DIR", DEFAULT_LOGS_DIR))
 EVENTS_PATH = LOGS_DIR / "events.jsonl"
 STATUS_PATH = LOGS_DIR / "status.json"
+LIVE_METRICS_PATH = LOGS_DIR / "live_metrics.jsonl"
 
 VALID_SPLITS = {"train", "validation", "test"}
 
@@ -71,6 +72,41 @@ def log_evaluation(
         metrics=metrics,
         **extra,
     )
+
+
+def log_live_metric(
+    run_id: str,
+    dataset: str,
+    epoch: int,
+    train_loss: Optional[float] = None,
+    val_metric: Optional[float] = None,
+    elapsed_seconds: Optional[float] = None,
+    **extra: Any,
+) -> dict:
+    """Append one row of per-epoch training history to
+    logs/live_metrics.jsonl — a persistent record of every epoch of every
+    run, kept distinct from status.json (which only ever holds the
+    *current* run's latest snapshot and gets overwritten every epoch).
+
+    Append-only, same pattern as log_event. Never raises into a training
+    loop — callers (report_progress in the training templates) already
+    wrap this in a best-effort try/except, same as the existing
+    set_current_run call it sits next to.
+    """
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": _now(),
+        "run_id": run_id,
+        "dataset": dataset,
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "val_metric": val_metric,
+        "elapsed_seconds": elapsed_seconds,
+        **extra,
+    }
+    with open(LIVE_METRICS_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    return record
 
 
 def read_status() -> dict:

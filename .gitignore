@@ -25,6 +25,7 @@ __pycache__/
 /logs/events.jsonl
 /logs/control.json
 /logs/test_lock_*.json
+/logs/live_metrics.jsonl
 
 # Secrets
 .env
