@@ -1,0 +1,142 @@
+"""Training/run-management tools for the agent.
+
+launch_training runs a training template as a subprocess (so a crash in
+training code can't take down the agent process) and records the run in the
+ledger. Everything else here queries the ledger/status — no tool in this
+module ever touches the test split; final_test_eval (in final_eval.py) is
+the one exception, gated by a lock file.
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+from gotrain import ledger, status
+from gotrain.logging_utils import log_event
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+TEMPLATES = {
+    "classification": REPO_ROOT / "gotrain" / "templates" / "train_classification.py",
+    "segmentation": REPO_ROOT / "gotrain" / "templates" / "train_segmentation.py",
+    "fake": REPO_ROOT / "gotrain" / "templates" / "fake_train.py",
+}
+
+
+def launch_training(
+    dataset: str,
+    task_type: str,
+    config: dict,
+    parent_id: Optional[str] = None,
+) -> dict:
+    """Run a training template synchronously and record the result in the ledger.
+
+    `task_type` selects the template ("classification" or "segmentation").
+    The template is expected to print a single JSON line to stdout with at
+    least a "val_metric" key (and anything else it wants recorded), having
+    trained on the train split and evaluated on the validation split only.
+    """
+    if task_type not in TEMPLATES:
+        raise ValueError(f"task_type must be one of {list(TEMPLATES)}, got {task_type!r}")
+
+    template_path = TEMPLATES[task_type]
+    status.set_action("training", from_=parent_id or "agent", where=dataset)
+    log_event("training_started", dataset=dataset, task_type=task_type, config=config)
+
+    import json
+
+    proc = subprocess.run(
+        [sys.executable, str(template_path), "--dataset", dataset, "--config", json.dumps(config)],
+        capture_output=True,
+        text=True,
+    )
+
+    if proc.returncode != 0:
+        log_event(
+            "training_failed",
+            dataset=dataset,
+            task_type=task_type,
+            stderr=proc.stderr[-4000:],
+        )
+        raise RuntimeError(f"Training failed for {dataset}: {proc.stderr[-2000:]}")
+
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    val_metric = result["val_metric"]
+
+    record = ledger.add_run(
+        dataset=dataset,
+        config=config,
+        val_metric=val_metric,
+        parent_id=parent_id,
+        gpu_minutes=result.get("gpu_minutes"),
+        decision="pending",
+        rationale=result.get("rationale"),
+        split_used="validation",
+    )
+
+    best = ledger.get_best(dataset)
+    if best is not None:
+        status.set_best_so_far(best["run_id"], dataset, best["val_metric"])
+    status.set_last_event(f"training finished for {dataset}: run {record['run_id']}")
+    log_event("training_finished", dataset=dataset, run_id=record["run_id"], val_metric=val_metric)
+
+    return record
+
+
+def get_run_status(run_id: str) -> dict:
+    """Return the ledger record for a run (includes decision, metrics, lineage pointer)."""
+    for record in ledger.get_history():
+        if record["run_id"] == run_id:
+            return record
+    raise ValueError(f"run_id {run_id!r} not found")
+
+
+def get_run_metrics(run_id: str) -> dict:
+    """Return just the metric-related fields for a run."""
+    record = get_run_status(run_id)
+    return {
+        "run_id": record["run_id"],
+        "dataset": record["dataset"],
+        "val_metric": record["val_metric"],
+        "delta_vs_parent": record["delta_vs_parent"],
+        "split_used": record["split_used"],
+        "gpu_minutes": record["gpu_minutes"],
+    }
+
+
+def query_history(dataset: Optional[str] = None) -> list:
+    """Return all run records, optionally filtered to one dataset."""
+    return ledger.get_history(dataset)
+
+
+def compare_runs(run_id_a: str, run_id_b: str) -> dict:
+    """Compare two runs' configs and validation metrics."""
+    a = get_run_status(run_id_a)
+    b = get_run_status(run_id_b)
+
+    config_diff = {}
+    keys = set(a["config"]) | set(b["config"])
+    for key in keys:
+        va, vb = a["config"].get(key), b["config"].get(key)
+        if va != vb:
+            config_diff[key] = {run_id_a: va, run_id_b: vb}
+
+    metric_delta = None
+    if isinstance(a["val_metric"], (int, float)) and isinstance(b["val_metric"], (int, float)):
+        metric_delta = b["val_metric"] - a["val_metric"]
+
+    return {
+        "run_id_a": run_id_a,
+        "run_id_b": run_id_b,
+        "val_metric_a": a["val_metric"],
+        "val_metric_b": b["val_metric"],
+        "metric_delta_b_minus_a": metric_delta,
+        "config_diff": config_diff,
+    }
+
+
+def record_decision(run_id: str, decision: str, rationale: str) -> dict:
+    """Mark a run as kept/discarded/pending, with a rationale."""
+    record = ledger.update_run(run_id, decision=decision, rationale=rationale)
+    log_event("decision_recorded", run_id=run_id, decision=decision, rationale=rationale)
+    return record
