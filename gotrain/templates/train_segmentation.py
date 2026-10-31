@@ -34,7 +34,11 @@ DEFAULTS = {
     "epochs": 2,
     "optimizer": "adam",
     "weight_decay": 0.0,
+    "scheduler": "none",
+    "warmup_epochs": 0,
     "loss": "ce",
+    "focal_alpha": None,
+    "focal_gamma": 2.0,
     "class_weights": None,
     "augmentation": "none",
     "bands": None,
@@ -197,7 +201,14 @@ def build_model(architecture: str, encoder: str, pretrained: bool, in_channels: 
     raise ValueError(f"architecture must be 'unet' or 'fpn', got {architecture!r}")
 
 
-def build_loss(loss_name: str, n_classes: int, class_weights, device):
+def build_loss(loss_name: str, n_classes: int, class_weights, focal_alpha, focal_gamma, device):
+    """Dice and focal both help with class imbalance (pv4ger-seg is ~75/25,
+    nz-cattle is sparser still): Dice directly optimizes the overlap metric
+    instead of per-pixel cross-entropy, and focal down-weights easy
+    (already-confident) pixels so the loss focuses on the hard/minority
+    ones. class_weights (inverse frequency) is a third, complementary way
+    to the same end and can be combined with ce or ce+dice.
+    """
     import torch
     import segmentation_models_pytorch as smp
 
@@ -207,16 +218,25 @@ def build_loss(loss_name: str, n_classes: int, class_weights, device):
 
     ce = torch.nn.CrossEntropyLoss(weight=weight_tensor)
     dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
+    focal = smp.losses.FocalLoss(mode="multiclass", alpha=focal_alpha, gamma=focal_gamma)
 
     if loss_name == "ce":
         return ce
     if loss_name == "dice":
         return dice
     if loss_name == "ce+dice":
-        def combined(logits, target):
+        def combined_ce_dice(logits, target):
             return ce(logits, target) + dice(logits, target)
-        return combined
-    raise ValueError(f"loss must be 'ce', 'dice', or 'ce+dice', got {loss_name!r}")
+        return combined_ce_dice
+    if loss_name == "focal":
+        return focal
+    if loss_name == "ce+focal":
+        def combined_ce_focal(logits, target):
+            return ce(logits, target) + focal(logits, target)
+        return combined_ce_focal
+    raise ValueError(
+        f"loss must be 'ce', 'dice', 'ce+dice', 'focal', or 'ce+focal', got {loss_name!r}"
+    )
 
 
 def build_optimizer(name: str, params, lr: float, weight_decay: float):
@@ -224,9 +244,32 @@ def build_optimizer(name: str, params, lr: float, weight_decay: float):
 
     if name == "adam":
         return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     if name == "sgd":
         return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=0.9)
-    raise ValueError(f"optimizer must be 'adam' or 'sgd', got {name!r}")
+    raise ValueError(f"optimizer must be 'adam', 'adamw', or 'sgd', got {name!r}")
+
+
+def build_scheduler(name: str, optimizer, epochs: int, warmup_epochs: int):
+    """Mirrors train_classification.py's build_scheduler: "none" (default)
+    or "cosine" (LinearLR warmup -> CosineAnnealingLR decay, combined via
+    SequentialLR). Call .step() once per epoch.
+    """
+    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+    if name == "none":
+        return None
+    if name != "cosine":
+        raise ValueError(f"scheduler must be 'none' or 'cosine', got {name!r}")
+
+    warmup_epochs = min(warmup_epochs, max(epochs - 1, 0))
+    if warmup_epochs <= 0:
+        return CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+
+    warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    cosine = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
+    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
 
 
 def compute_mean_iou(pred: "np.ndarray", target: "np.ndarray", n_classes: int):
@@ -345,8 +388,9 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: {cfg['architecture']}/{cfg['encoder']} (pretrained={cfg['pretrained']}), {n_params:,} parameters")
 
-    loss_fn = build_loss(cfg["loss"], n_classes, class_weights, device)
+    loss_fn = build_loss(cfg["loss"], n_classes, class_weights, cfg["focal_alpha"], cfg["focal_gamma"], device)
     optimizer = build_optimizer(cfg["optimizer"], model.parameters(), cfg["lr"], cfg["weight_decay"])
+    scheduler = build_scheduler(cfg["scheduler"], optimizer, cfg["epochs"], cfg["warmup_epochs"])
     scaler = GradScaler(device="cuda", enabled=amp_enabled)
 
     best_val_iou = -1.0
@@ -414,6 +458,9 @@ def main() -> None:
 
         # For binary tasks, report the foreground (class 1) IoU explicitly.
         foreground_iou = per_class_iou[1] if n_classes == 2 and len(per_class_iou) > 1 else None
+
+        if scheduler is not None:
+            scheduler.step()
 
         epoch_seconds = time.time() - epoch_start
         logger.info(

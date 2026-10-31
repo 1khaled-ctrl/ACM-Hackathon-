@@ -24,10 +24,11 @@ CLASSIFICATION_VALID_VALUES = {
 
 SEGMENTATION_VALID_VALUES = {
     "architecture": ["unet", "fpn"],
-    "optimizer": ["adam", "sgd"],
-    "loss": ["ce", "dice", "ce+dice"],
+    "optimizer": ["adam", "sgd", "adamw"],
+    "scheduler": ["none", "cosine"],
+    "loss": ["ce", "dice", "ce+dice", "focal", "ce+focal"],
     "augmentation": ["none", "basic", "strong"],
-    "encoder": ["resnet34"],
+    "encoder": ["resnet34", "resnet50", "efficientnet-b3"],
 }
 
 VALID_VALUES_BY_TASK_TYPE = {
