@@ -13,6 +13,8 @@ trainer's own default, so old configs (saved runs, hardcoded examples)
 keep working after this registry grows.
 """
 
+from typing import Optional
+
 TASK_TYPES = ["classification", "segmentation", "fake"]
 
 CLASSIFICATION_VALID_VALUES = {
@@ -38,12 +40,19 @@ VALID_VALUES_BY_TASK_TYPE = {
 }
 
 
-class ConfigValidationError(ValueError):
+class PreflightValidationError(ValueError):
+    """Base class for anything rejected before a training subprocess is
+    spawned (bad config value, malformed hypothesis). gotrain/agent.py's
+    limit hook recognizes this base class so a rejected launch_training
+    call never counts against --max-runs, regardless of which specific
+    preflight check rejected it.
+    """
+
+
+class ConfigValidationError(PreflightValidationError):
     """Raised when a config value isn't recognized, before any training
     subprocess is spawned. gotrain/tools/training.py raises this instead of
-    letting the bad value reach the subprocess, and the agent's hook
-    (gotrain/agent.py) recognizes this exception type specifically so a
-    rejected launch_training call does not count against --max-runs.
+    letting the bad value reach the subprocess.
     """
 
     def __init__(self, task_type: str, field: str, value, valid_values: list):
@@ -73,3 +82,67 @@ def validate_config(task_type: str, config: dict) -> None:
     for field, allowed in valid_values.items():
         if field in config and config[field] is not None and config[field] not in allowed:
             raise ConfigValidationError(task_type, field, config[field], allowed)
+
+
+# ---------------------------------------------------------------------------
+# Structured experiment hypotheses (see the system prompt's workflow step 3
+# and gotrain/ledger.py's hypothesis_outcome computation). Every
+# launch_training call that has a parent_id (i.e. every run after the first
+# baseline) must state a hypothesis -- what it changed, why, and what effect
+# it expects -- enforced here in code, not left to the prompt, exactly like
+# every other guardrail in this module.
+# ---------------------------------------------------------------------------
+
+EXPECTED_DIRECTIONS = ["increase", "decrease", "no_change"]
+HYPOTHESIS_MAGNITUDES = ["small", "moderate", "large"]
+HYPOTHESIS_REQUIRED_TEXT_FIELDS = ["change", "why"]
+
+
+class HypothesisValidationError(PreflightValidationError):
+    """Raised when a launch_training call's hypothesis is missing (while a
+    parent_id is given) or malformed (missing/empty required text fields,
+    or an expected_direction/expected_magnitude outside the allowed set).
+    """
+
+
+def validate_hypothesis(hypothesis: Optional[dict], has_parent: bool) -> None:
+    """Raise HypothesisValidationError on a missing or malformed hypothesis.
+
+    `hypothesis=None` is only allowed when `has_parent` is False -- the
+    very first baseline run on a dataset has no prior run to form a
+    hypothesis against. Every subsequent run must supply one.
+    """
+    if hypothesis is None:
+        if has_parent:
+            raise HypothesisValidationError(
+                "hypothesis is required for every run after the first baseline "
+                "(parent_id was given, but hypothesis was omitted). State what "
+                "you changed vs. the parent run and why you expect it to help."
+            )
+        return
+
+    if not isinstance(hypothesis, dict):
+        raise HypothesisValidationError(
+            f"hypothesis must be a dict or null, got {type(hypothesis).__name__}"
+        )
+
+    for field in HYPOTHESIS_REQUIRED_TEXT_FIELDS:
+        value = hypothesis.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise HypothesisValidationError(
+                f"hypothesis[{field!r}] must be a non-empty string, got {value!r}"
+            )
+
+    direction = hypothesis.get("expected_direction")
+    if direction is not None and direction not in EXPECTED_DIRECTIONS:
+        raise HypothesisValidationError(
+            f"hypothesis['expected_direction'] must be one of {EXPECTED_DIRECTIONS} "
+            f"or omitted, got {direction!r}"
+        )
+
+    magnitude = hypothesis.get("expected_magnitude")
+    if magnitude is not None and magnitude not in HYPOTHESIS_MAGNITUDES:
+        raise HypothesisValidationError(
+            f"hypothesis['expected_magnitude'] must be one of {HYPOTHESIS_MAGNITUDES} "
+            f"or omitted, got {magnitude!r}"
+        )

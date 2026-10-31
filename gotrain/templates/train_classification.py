@@ -423,6 +423,7 @@ def main() -> None:
     best_checkpoint_path = run_dir / "best_model.pt"
     time_budget_seconds = cfg["time_budget_minutes"] * 60 if cfg["time_budget_minutes"] else None
     training_start = time.time()
+    interrupted_reason = None
 
     for epoch in range(cfg["epochs"]):
         epoch_start = time.time()
@@ -528,6 +529,22 @@ def main() -> None:
             logger.info(f"Time budget of {cfg['time_budget_minutes']} minutes reached — stopping early.")
             break
 
+        # Engineer control plane (gotrain.control): checked once per epoch,
+        # same best-effort pattern as report_progress above -- if the
+        # import/check itself fails for any reason, training is never
+        # blocked by it. On a real pause/takeover/rollback request, stop
+        # now and keep whatever checkpoint is already saved rather than
+        # waiting up to the full run's time budget.
+        try:
+            from gotrain.control import should_stop_training
+
+            interrupted_reason = should_stop_training()
+        except Exception:
+            interrupted_reason = None
+        if interrupted_reason:
+            logger.info(f"Stopping early: {interrupted_reason} (engineer control).")
+            break
+
     total_seconds = time.time() - training_start
     gpu_minutes = total_seconds / 60 if device.type == "cuda" else 0.0
 
@@ -546,17 +563,24 @@ def main() -> None:
         "final_val_metric": final_val_metric,
         "split_used": "validation",
         "total_train_seconds": total_seconds,
+        "interrupted": interrupted_reason is not None,
+        "interrupted_reason": interrupted_reason,
     }
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     logger.info(f"Run finished in {total_seconds:.1f}s. Best val_accuracy={best_val_acc:.4f}")
     logger.info(f"FINAL_VAL_METRIC: {final_val_metric}")
 
+    rationale = f"best val_accuracy={final_val_metric:.4f} at epoch {best_metrics['epoch']} (run_dir={run_dir})"
+    if interrupted_reason:
+        rationale += f" -- stopped early: {interrupted_reason}"
+
     print(json.dumps({
         "val_metric": final_val_metric,
         "gpu_minutes": gpu_minutes,
-        "rationale": f"best val_accuracy={final_val_metric:.4f} at epoch {best_metrics['epoch']} (run_dir={run_dir})",
+        "rationale": rationale,
         "run_dir": str(run_dir),
         "checkpoint_path": str(best_checkpoint_path),
+        "extra_metrics": {"interrupted": interrupted_reason is not None, "interrupted_reason": interrupted_reason},
     }))
 
 

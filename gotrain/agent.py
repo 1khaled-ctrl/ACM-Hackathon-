@@ -24,10 +24,11 @@ from typing import Any, Optional
 from strands import Agent, tool
 from strands.hooks import AfterToolCallEvent, BeforeToolCallEvent, HookRegistry
 
-from gotrain import config, ledger, status
-from gotrain.config_schema import ConfigValidationError
+from gotrain import config, control, ledger, status
+from gotrain.config_schema import PreflightValidationError
 from gotrain.logging_utils import log_event
 from gotrain.tools import datasets as datasets_tools
+from gotrain.tools import geoguard as geoguard_tools
 from gotrain.tools import s3 as s3_tools
 from gotrain.tools import training as training_tools
 
@@ -71,11 +72,36 @@ def get_dataset_info(dataset: str) -> dict:
 
 
 @tool
+def run_geoguard(dataset: str, task_type: str, max_samples: int = 300) -> dict:
+    """Inspect the TRAIN split's data quality and sensor characteristics
+    before training: per-band pixel statistics (range, saturation,
+    near-constant channels), NaN/Inf counts, class/pixel frequency and
+    imbalance, and whether the dataset mixes sensor modalities (e.g.
+    m-so2sat's SAR + optical bands). Returns findings plus a recommended
+    config (drawn only from the same valid values launch_training accepts)
+    with a rationale for each recommendation.
+
+    Call this once, right after get_dataset_info and before your first
+    launch_training call, so your baseline config reflects what the data
+    actually looks like instead of a generic default.
+
+    Args:
+        dataset: the GEO-Bench dataset name, e.g. "m-eurosat".
+        task_type: "classification" or "segmentation".
+        max_samples: how many TRAIN images to inspect (bounded for speed;
+            does not affect the normalization statistics a training run
+            itself computes, which always use the full train split).
+    """
+    return geoguard_tools.run_geoguard(dataset, task_type, max_samples)
+
+
+@tool
 def launch_training(
     dataset: str,
     task_type: str,
     config: dict,
     parent_id: Optional[str] = None,
+    hypothesis: Optional[dict] = None,
 ) -> dict:
     """Launch one training run and evaluate it on the VALIDATION split only.
 
@@ -93,10 +119,30 @@ def launch_training(
             from the parent run's config.
         parent_id: the run_id this run is derived from, if any. Omit only
             for the very first run on this dataset.
+        hypothesis: REQUIRED whenever parent_id is given (rejected
+            otherwise, at no cost to your run budget). A dict with:
+              - "change": one short sentence naming exactly what you
+                changed vs. the parent run's config.
+              - "why": one short sentence on the mechanism you expect to
+                cause an effect — not "to see what happens".
+              - "expected_direction" (optional but recommended): one of
+                "increase", "decrease", "no_change" for the validation
+                metric.
+              - "evidence" (optional): what prior result motivated this
+                change.
+              - "expected_magnitude" (optional): "small", "moderate", or
+                "large".
+            The returned record's "hypothesis_outcome" field
+            ("supported" / "not_supported" / "inconclusive") is computed
+            from the ACTUAL delta_vs_parent against your
+            "expected_direction" — it is never self-reported, so cite it
+            in record_decision's rationale rather than asserting your own
+            read of whether the hypothesis held.
 
     Returns:
         The ledger record for this run: run_id, val_metric,
-        delta_vs_parent, config_diff, and more.
+        delta_vs_parent, config_diff, hypothesis, hypothesis_outcome, and
+        more.
     """
     raise NotImplementedError  # replaced per-agent in build_agent()
 
@@ -181,6 +227,7 @@ def submit_final_model(dataset: str, run_id: str) -> dict:
     updated = ledger.update_run(run_id, decision="kept", submitted_final=True)
     status.write_status(stage="FINALIZE", action=f"submitted {run_id} as final model", where=dataset)
     log_event("final_model_submitted", dataset=dataset, run_id=run_id)
+    control.transition(control.COMPLETED, reason=f"final model submitted: {run_id}", requested_by="agent")
     return updated
 
 
@@ -214,6 +261,7 @@ def download_from_s3(dataset: str, version: str) -> dict:
 ALL_TOOLS = [
     list_datasets,
     get_dataset_info,
+    run_geoguard,
     launch_training,
     get_run_status,
     get_run_metrics,
@@ -254,8 +302,29 @@ class LimitsAndLoggingHooks:
         registry.add_callback(AfterToolCallEvent, self._on_after)
 
     def _on_before(self, event: BeforeToolCallEvent) -> None:
-        self.tool_call_count += 1
         tool_name = event.tool_use["name"]
+
+        # Engineer control plane (gotrain.control) takes priority over
+        # every other check, including the tool-call/run budgets below: a
+        # paused/manually-controlled/rollback-in-progress agent gets
+        # EVERY tool call cancelled, not just launch_training, and the
+        # cancellation doesn't cost tool-call or run budget (it's not the
+        # agent's doing). The first blocked call while PAUSE_REQUESTED
+        # acknowledges the pause (-> PAUSED_FOR_ENGINEER), which is how
+        # the dashboard knows the agent has actually stopped, not just
+        # that a pause was requested.
+        control_state = control.get_state()
+        if control_state in control.BLOCKING_STATES:
+            if control_state == control.PAUSE_REQUESTED:
+                control.acknowledge_pause()
+            event.cancel_tool = (
+                f"GoTrain is currently {control_state} (engineer-controlled) — no "
+                "tool calls are permitted right now. Do not retry or keep polling: "
+                "stop and wait. You will be told when to resume."
+            )
+            return
+
+        self.tool_call_count += 1
 
         if self.tool_call_count > self.max_tool_calls:
             event.cancel_tool = (
@@ -276,15 +345,15 @@ class LimitsAndLoggingHooks:
         if tool_name == "launch_training":
             # Run counting happens in _on_after, once we know whether the
             # call actually attempted training or was rejected pre-flight
-            # for a bad config value (ConfigValidationError) — a rejected
-            # launch must not cost the agent one of its max_runs.
+            # for a bad config value or hypothesis (PreflightValidationError)
+            # — a rejected launch must not cost the agent one of its max_runs.
             event.tool_use["input"]["timeout_seconds"] = self.run_seconds
 
     def _on_after(self, event: AfterToolCallEvent) -> None:
         tool_name = event.tool_use["name"]
         tool_input = event.tool_use.get("input", {})
 
-        if tool_name == "launch_training" and not isinstance(event.exception, ConfigValidationError):
+        if tool_name == "launch_training" and not isinstance(event.exception, PreflightValidationError):
             self.run_count += 1
 
         result_text = ""
@@ -305,7 +374,7 @@ class LimitsAndLoggingHooks:
             duration_seconds=event.duration,
             exception=str(event.exception) if event.exception else None,
             counted_against_run_budget=(
-                tool_name == "launch_training" and not isinstance(event.exception, ConfigValidationError)
+                tool_name == "launch_training" and not isinstance(event.exception, PreflightValidationError)
             ),
         )
         status.write_status(last_event=f"called {tool_name}")
@@ -349,6 +418,7 @@ def build_agent(
         task_type: str,
         config: dict,
         parent_id: Optional[str] = None,
+        hypothesis: Optional[dict] = None,
         timeout_seconds: Optional[float] = None,
     ) -> dict:
         """Launch one training run and evaluate it on the VALIDATION split only.
@@ -366,12 +436,15 @@ def build_agent(
                 one field from the parent run's config.
             parent_id: the run_id this run is derived from, if any. Omit
                 only for the very first run on this dataset.
+            hypothesis: required whenever parent_id is given — see the
+                launch_training @tool docstring above for its shape.
         """
         return training_tools.launch_training(
             dataset=dataset,
             task_type=task_type,
             config=config,
             parent_id=parent_id,
+            hypothesis=hypothesis,
             timeout_seconds=timeout_seconds,
         )
 

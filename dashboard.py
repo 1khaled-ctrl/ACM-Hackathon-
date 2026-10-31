@@ -30,8 +30,9 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from gotrain import ledger
+from gotrain import approval, control, ledger, registry, rollback
 from gotrain import status as status_mod
+from gotrain.geoguard import report as geoguard_report
 from gotrain.logging_utils import EVENTS_PATH
 
 REFRESH_SECONDS = 4
@@ -175,6 +176,19 @@ def decision_pill(decision: str) -> str:
     return f'<span class="gt-pill {cls}">{esc(decision.capitalize())}</span>'
 
 
+HYPOTHESIS_OUTCOME_PILL = {
+    "supported": "gt-pill-kept",
+    "not_supported": "gt-pill-discarded",
+    "inconclusive": "gt-pill-pending",
+}
+
+
+def hypothesis_outcome_pill(outcome) -> str:
+    cls = HYPOTHESIS_OUTCOME_PILL.get(outcome, "gt-pill-waiting")
+    label = (outcome or "no hypothesis").replace("_", " ").capitalize()
+    return f'<span class="gt-pill {cls}">{esc(label)}</span>'
+
+
 # ---------------------------------------------------------------------------
 # Derived state — inferred from the real event stream, never fabricated.
 # ---------------------------------------------------------------------------
@@ -297,7 +311,7 @@ def render_sidebar(status_data: dict, training_open: bool) -> str:
     with st.sidebar:
         st.markdown('<div class="gt-logo">🛰️&nbsp; GoTrain</div>', unsafe_allow_html=True)
         view = st.radio(
-            "Navigate", ["Dashboard", "Experiments", "Models", "Agent Logs"], label_visibility="collapsed"
+            "Navigate", ["Dashboard", "Experiments", "Models", "Control", "Agent Logs"], label_visibility="collapsed"
         )
         st.markdown("<hr class='gt-sidebar-hr'/>", unsafe_allow_html=True)
 
@@ -379,6 +393,158 @@ def render_test_lock_banner() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+CONTROL_STATE_INFO = {
+    control.RUNNING_AUTONOMOUSLY: ("Running Autonomously", "green", "The agent is driving. Pause it or take manual control below."),
+    control.PAUSE_REQUESTED: ("Pause Requested", "blue", "Waiting for the agent to acknowledge — its next tool call will be blocked."),
+    control.PAUSED_FOR_ENGINEER: ("Paused", "blue", "The agent has stopped taking any action. Resume autonomous execution or take manual control below."),
+    control.MANUAL_CONTROL: ("Manual Control", "blue", "The engineer is driving. The agent cannot take any action until resumed."),
+    control.ROLLBACK_REQUESTED: ("Rollback Requested", "blue", "Preparing to verify a rollback target."),
+    control.ROLLBACK_VERIFYING: ("Verifying Rollback", "blue", "Checking checkpoint integrity and running an inference sanity check — no training is permitted meanwhile."),
+    control.FAILED_SAFE: ("Failed Safe", "red", "A verification step failed. Acknowledge below to move to Paused, then investigate before resuming."),
+    control.COMPLETED: ("Completed", "green", "A final model has been submitted for this dataset."),
+}
+
+
+def render_control_panel() -> None:
+    """The real control plane: every button here writes to gotrain.control
+    (or gotrain.approval / gotrain.rollback), which gotrain/agent.py's hook
+    and gotrain/tools/training.py both read before allowing any agent
+    action — these are not decorative buttons.
+    """
+    state = control.get_state()
+    label, color_key, description = CONTROL_STATE_INFO.get(state, (state, "muted", ""))
+    color = COLOR.get(color_key, COLOR["muted"])
+
+    st.markdown(
+        f"""
+        <div class="gt-card" style="border-left: 4px solid {color};">
+          <div class="gt-card-title">Engineer Control</div>
+          <div style="font-size:1.15rem;font-weight:700;color:{color};">{esc(label)}</div>
+          <div style="color:var(--text-2);font-size:0.86rem;margin-top:4px;">{esc(description)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns(3)
+    if state == control.RUNNING_AUTONOMOUSLY:
+        if cols[0].button("⏸ Pause", key="ctl_pause", use_container_width=True):
+            control.transition(control.PAUSE_REQUESTED, reason="engineer clicked pause", requested_by="engineer")
+            st.rerun()
+        if cols[1].button("🖐 Take Manual Control", key="ctl_manual", use_container_width=True):
+            control.transition(control.MANUAL_CONTROL, reason="engineer took manual control", requested_by="engineer")
+            st.rerun()
+    elif state == control.PAUSE_REQUESTED:
+        if cols[0].button("Cancel pause request", key="ctl_cancel_pause", use_container_width=True):
+            control.transition(control.RUNNING_AUTONOMOUSLY, reason="engineer cancelled pause request", requested_by="engineer")
+            st.rerun()
+    elif state == control.PAUSED_FOR_ENGINEER:
+        if cols[0].button("▶ Resume Autonomous", key="ctl_resume", use_container_width=True):
+            control.transition(control.RESUME_REQUESTED, reason="engineer clicked resume", requested_by="engineer")
+            st.rerun()
+        if cols[1].button("🖐 Take Manual Control", key="ctl_manual2", use_container_width=True):
+            control.transition(control.MANUAL_CONTROL, reason="engineer took manual control", requested_by="engineer")
+            st.rerun()
+    elif state == control.MANUAL_CONTROL:
+        if cols[0].button("▶ Resume Autonomous", key="ctl_resume2", use_container_width=True):
+            control.transition(control.RESUME_REQUESTED, reason="engineer resumed from manual control", requested_by="engineer")
+            st.rerun()
+    elif state == control.FAILED_SAFE:
+        if cols[0].button("Acknowledge failure → Pause", key="ctl_ack_fail", use_container_width=True):
+            control.transition(control.PAUSED_FOR_ENGINEER, reason="engineer acknowledged failure", requested_by="engineer")
+            st.rerun()
+    elif state in (control.ROLLBACK_REQUESTED, control.ROLLBACK_VERIFYING):
+        cols[0].info("Rollback in progress…")
+    elif state == control.COMPLETED:
+        cols[0].success("Nothing left to control — the final model was submitted.")
+
+
+def render_approvals_panel() -> None:
+    pending = approval.list_proposals(status=approval.PENDING)
+    blocks = []
+    if not pending:
+        blocks.append(empty("No pending approval requests"))
+    for p in pending:
+        blocks.append(
+            f"<div style='margin-bottom:4px;'><b>{esc(p['dataset'])}</b> &mdash; "
+            f"<code>{esc(p['field'])} = {esc(p['value'])}</code><br>"
+            f"<span style='color:var(--muted);font-size:0.8rem'>{esc(p['reason'])}"
+            f" · requested {esc(p['requested_at'][:19])}</span></div>"
+        )
+    st.markdown(card("Pending Approvals", "".join(blocks)), unsafe_allow_html=True)
+
+    for p in pending:
+        reason = st.text_input(
+            "Decision reason", key=f"reason_{p['key']}", label_visibility="collapsed",
+            placeholder=f"Reason for approving/rejecting {p['field']}={p['value']} (optional)",
+        )
+        c1, c2 = st.columns(2)
+        if c1.button(f"✅ Approve {p['field']}={p['value']}", key=f"approve_{p['key']}", use_container_width=True):
+            approval.decide(p["key"], approve=True, decided_by="engineer", decision_reason=reason or None)
+            st.rerun()
+        if c2.button(f"❌ Reject {p['field']}={p['value']}", key=f"reject_{p['key']}", use_container_width=True):
+            approval.decide(p["key"], approve=False, decided_by="engineer", decision_reason=reason or None)
+            st.rerun()
+
+    decided = approval.list_proposals(status=approval.APPROVED) + approval.list_proposals(status=approval.REJECTED)
+    if decided:
+        rows = []
+        for p in sorted(decided, key=lambda x: x["decided_at"] or ""):
+            pill = decision_pill("kept" if p["status"] == approval.APPROVED else "discarded")
+            rows.append(
+                f"<div style='padding:3px 0;'>{pill} <b>{esc(p['dataset'])}</b> "
+                f"<code>{esc(p['field'])}={esc(p['value'])}</code> — {esc(p.get('decision_reason') or 'no reason given')}</div>"
+            )
+        st.markdown(card("Approval Decision History", "".join(rows)), unsafe_allow_html=True)
+
+
+def render_rollback_panel(dataset: str, task_type: str) -> None:
+    active = rollback.get_active_version(dataset)
+    st.markdown(card("Rollback", kv_row("Active version", esc(active or "none set"))), unsafe_allow_html=True)
+
+    versions = registry.list_versions(dataset)
+    if not versions:
+        st.markdown(empty(f"No registered model versions for {dataset} yet"), unsafe_allow_html=True)
+        return
+
+    target = st.selectbox("Roll back to version", versions, index=len(versions) - 1, key=f"rollback_target_{dataset}")
+    if st.button(f"⏮ Roll back {dataset} to {target}", key=f"rollback_btn_{dataset}"):
+        try:
+            rollback.execute_rollback(dataset, target, task_type, requested_by="engineer")
+            st.success(f"Rolled back {dataset} to {target} and verified. System is now PAUSED — resume when ready.")
+        except rollback.RollbackConflictError as e:
+            st.error(str(e))
+        except rollback.RollbackVerificationError as e:
+            st.error(f"Rollback verification FAILED — active version left unchanged. {e}")
+        st.rerun()
+
+
+def render_geoguard_panel(dataset: str) -> None:
+    rep = geoguard_report.read_report(dataset)
+    if not rep:
+        st.markdown(card("GeoGuard — Data Intelligence", empty("No GeoGuard report yet for this dataset")), unsafe_allow_html=True)
+        return
+
+    findings = rep.get("findings") or []
+    findings_html = "".join(
+        f"<div style='padding:2px 0;color:var(--text-2);font-size:0.85rem;'>• {esc(f)}</div>" for f in findings
+    ) or empty("No notable findings")
+
+    recommended = rep.get("recommended_config") or {}
+    config_html = (
+        f"<div style='margin-top:4px;font-family:monospace;font-size:0.8rem;color:var(--text-2);word-break:break-word;'>{esc(json.dumps(recommended))}</div>"
+        if recommended else empty("No config changes recommended")
+    )
+
+    inner = (
+        kv_row("Sensor", esc(rep.get("sensor", "—")))
+        + kv_row("Samples inspected", esc(rep.get("n_samples_inspected", "—")))
+        + f'<div class="gt-decision-block"><div class="gt-decision-label">Findings</div>{findings_html}</div>'
+        + f'<div class="gt-decision-block"><div class="gt-decision-label">Recommended config</div>{config_html}</div>'
+    )
+    st.markdown(card("GeoGuard — Data Intelligence", inner), unsafe_allow_html=True)
 
 
 def render_current_experiment(live_run: dict, ds_history: list, dataset: str) -> None:
@@ -536,6 +702,7 @@ def render_agent_decision(ds_history: list, live_run: dict, events: list) -> Non
 
     decision = last.get("decision") or "pending"
     reason = last.get("rationale") or "No rationale was recorded for this run."
+    hypothesis = last.get("hypothesis")
 
     if live_run:
         next_action = f"Running experiment #{len(ds_history) + 1:03d} — training {esc(live_run.get('model', 'a new model'))}."
@@ -547,16 +714,28 @@ def render_agent_decision(ds_history: list, live_run: dict, events: list) -> Non
                 next_action = formatted[1]
                 break
 
-    inner = "".join(
-        [
-            kv_row("Previous experiment", f"{esc(model_name(last))} — {pct(last.get('val_metric'))}"),
-            f'<div class="gt-decision-block"><div class="gt-decision-label">Observation</div><div>{esc(observation)}</div></div>',
-            f'<div class="gt-decision-block"><div class="gt-decision-label">Decision</div><div>{decision_pill(decision)}</div></div>',
-            f'<div class="gt-decision-block"><div class="gt-decision-label">Reason</div><div>{esc(reason)}</div></div>',
-            f'<div class="gt-decision-block"><div class="gt-decision-label">Next action</div><div>{next_action}</div></div>',
-        ]
-    )
-    st.markdown(card("Agent Decision", inner), unsafe_allow_html=True)
+    blocks = [
+        kv_row("Previous experiment", f"{esc(model_name(last))} — {pct(last.get('val_metric'))}"),
+        f'<div class="gt-decision-block"><div class="gt-decision-label">Observation</div><div>{esc(observation)}</div></div>',
+    ]
+    if hypothesis:
+        direction = hypothesis.get("expected_direction")
+        expected_text = f" (expected: {esc(direction)})" if direction else ""
+        hypothesis_text = f"{esc(hypothesis.get('change', '—'))} — {esc(hypothesis.get('why', ''))}{expected_text}"
+        blocks.append(
+            f'<div class="gt-decision-block"><div class="gt-decision-label">Hypothesis</div>'
+            f'<div>{hypothesis_text}</div></div>'
+        )
+        blocks.append(
+            f'<div class="gt-decision-block"><div class="gt-decision-label">Hypothesis outcome</div>'
+            f'<div>{hypothesis_outcome_pill(last.get("hypothesis_outcome"))}</div></div>'
+        )
+    blocks += [
+        f'<div class="gt-decision-block"><div class="gt-decision-label">Decision</div><div>{decision_pill(decision)}</div></div>',
+        f'<div class="gt-decision-block"><div class="gt-decision-label">Reason</div><div>{esc(reason)}</div></div>',
+        f'<div class="gt-decision-block"><div class="gt-decision-label">Next action</div><div>{next_action}</div></div>',
+    ]
+    st.markdown(card("Agent Decision", "".join(blocks)), unsafe_allow_html=True)
 
 
 def render_lineage(best_run_id) -> None:
@@ -832,6 +1011,7 @@ def main() -> None:
     render_header(status_data, live_dataset, live_task_type, agent_status, max_runs)
     render_workflow_stepper(infer_step_index(events, training_open))
     render_test_lock_banner()
+    render_control_panel()
 
     dataset_names = [d["name"] for d in DATASETS]
     default_index = dataset_names.index(live_dataset) if live_dataset in dataset_names else 0
@@ -860,12 +1040,21 @@ def main() -> None:
     if view in ("Dashboard", "Models"):
         with left:
             render_lineage(best_run_id)
+        with right:
+            render_geoguard_panel(selected_dataset)
 
     if view in ("Dashboard", "Experiments"):
         render_history_table(ds_history, best_run_id, live_run, selected_dataset)
 
     if view in ("Dashboard", "Models"):
         render_datasets_overview(all_history, live_dataset)
+
+    if view == "Control":
+        ctl_left, ctl_right = st.columns(2, gap="large")
+        with ctl_left:
+            render_approvals_panel()
+        with ctl_right:
+            render_rollback_panel(selected_dataset, selected_task_type)
 
     if view in ("Dashboard", "Agent Logs"):
         feed_limit = 40 if view == "Agent Logs" else 20

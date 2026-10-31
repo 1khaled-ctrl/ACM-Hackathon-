@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO_ROOT))
 os.environ.setdefault("GEO_BENCH_DIR", str(REPO_ROOT / "data" / "geobench"))
 
 from gotrain import agent as agent_mod
-from gotrain import ledger, logging_utils, status
+from gotrain import control, ledger, logging_utils, status
 from gotrain.tools import final_eval
 
 
@@ -33,6 +33,7 @@ def isolated_logs(tmp_path, monkeypatch):
     monkeypatch.setattr(ledger, "LOGS_DIR", logs_dir)
     monkeypatch.setattr(ledger, "LEDGER_PATH", logs_dir / "ledger.jsonl")
     monkeypatch.setattr(final_eval, "LOGS_DIR", logs_dir)
+    monkeypatch.setattr(control, "CONTROL_PATH", logs_dir / "control.json")
 
     return logs_dir
 
@@ -46,7 +47,7 @@ def test_agent_tool_list_excludes_final_test_eval(isolated_logs):
     assert "final_test_eval" not in agent.tool_names
     # sanity: the rest of the expected tools ARE present
     for name in [
-        "list_datasets", "get_dataset_info", "launch_training", "get_run_status",
+        "list_datasets", "get_dataset_info", "run_geoguard", "launch_training", "get_run_status",
         "get_run_metrics", "query_history", "compare_runs", "record_decision",
         "submit_final_model", "upload_to_s3", "download_from_s3",
     ]:
@@ -196,6 +197,98 @@ def test_bad_config_rejection_does_not_count_against_max_runs(isolated_logs):
     # exactly one ledger record should exist (the rejected call never ran)
     history = agent.tool.query_history(dataset="m-eurosat")
     assert len(json.loads(_tool_result_text(history))) == 1
+
+
+def test_missing_hypothesis_rejection_does_not_count_against_max_runs(isolated_logs):
+    """A launch_training call with a parent_id but no hypothesis must be
+    rejected before any subprocess runs, and — like a bad config value —
+    must not consume one of the agent's max_runs.
+    """
+    agent = agent_mod.build_agent("m-eurosat", max_runs=1, run_minutes=5, max_tool_calls=40)
+
+    first = agent.tool.launch_training(dataset="m-eurosat", task_type="fake", config={"lr": 0.01})
+    run_id = json.loads(_tool_result_text(first))["run_id"]
+
+    rejected = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="fake", config={"lr": 0.001}, parent_id=run_id
+    )
+    assert rejected["status"] == "error"
+    assert "hypothesis" in _tool_result_text(rejected).lower()
+
+    # max_runs=1 was already spent by the first (real) run -- the budget
+    # message should fire for a THIRD call, proving the rejected second
+    # call above didn't silently consume the budget itself.
+    third = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="fake", config={"lr": 0.002}, parent_id=run_id,
+        hypothesis={"change": "lowered lr again", "why": "testing", "expected_direction": "increase"},
+    )
+    assert third["status"] == "error"
+    assert "run budget exhausted" in _tool_result_text(third).lower()
+
+    history = agent.tool.query_history(dataset="m-eurosat")
+    assert len(json.loads(_tool_result_text(history))) == 1
+
+
+def test_control_plane_blocks_every_tool_call_while_paused(isolated_logs):
+    """Pausing (gotrain.control) must cancel EVERY tool call, not just
+    launch_training -- a paused agent should not be able to do anything
+    at all, including read-only exploration. The cancellation must not
+    cost tool-call budget either (it isn't the agent's doing).
+    """
+    agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=2)
+    control.transition(control.PAUSE_REQUESTED, requested_by="engineer")
+
+    blocked = agent.tool.list_datasets()
+    assert blocked["status"] == "error"
+    assert "engineer-controlled" in _tool_result_text(blocked).lower()
+
+    # The agent should have acknowledged the pause the moment its first
+    # call was blocked.
+    assert control.get_state() == control.PAUSED_FOR_ENGINEER
+
+    # Being blocked must not have consumed any of the tiny max_tool_calls=2
+    # budget -- a second and third blocked call must behave identically,
+    # not suddenly report budget exhaustion instead.
+    for _ in range(3):
+        blocked_again = agent.tool.list_datasets()
+        assert blocked_again["status"] == "error"
+        assert "engineer-controlled" in _tool_result_text(blocked_again).lower()
+
+
+def test_control_plane_resumes_and_tool_calls_work_again(isolated_logs):
+    agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=40)
+    control.transition(control.PAUSE_REQUESTED, requested_by="engineer")
+    agent.tool.list_datasets()  # acknowledges the pause
+    assert control.get_state() == control.PAUSED_FOR_ENGINEER
+
+    control.transition(control.RESUME_REQUESTED, requested_by="engineer")
+    control.transition(control.RUNNING_AUTONOMOUSLY, requested_by="engineer")
+
+    result = agent.tool.list_datasets()
+    assert result["status"] == "success"
+
+
+def test_manual_control_also_blocks_tool_calls(isolated_logs):
+    agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=40)
+    control.transition(control.MANUAL_CONTROL, requested_by="engineer")
+
+    blocked = agent.tool.launch_training(dataset="m-eurosat", task_type="fake", config={})
+    assert blocked["status"] == "error"
+    assert "manual_control" in _tool_result_text(blocked).lower()
+
+
+def test_submit_final_model_transitions_control_to_completed(isolated_logs):
+    agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=40)
+
+    launch_result = agent.tool.launch_training(dataset="m-eurosat", task_type="fake", config={"lr": 0.01})
+    run_id = json.loads(_tool_result_text(launch_result))["run_id"]
+
+    agent.tool.submit_final_model(dataset="m-eurosat", run_id=run_id)
+    assert control.get_state() == control.COMPLETED
+
+    # Nothing further should be permitted once completed.
+    blocked = agent.tool.list_datasets()
+    assert blocked["status"] == "error"
 
 
 def test_final_test_eval_lock_is_independent_per_dataset(isolated_logs):

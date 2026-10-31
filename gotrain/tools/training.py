@@ -13,8 +13,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from gotrain import ledger, registry, status
-from gotrain.config_schema import ConfigValidationError, validate_config
+from gotrain import approval, control, ledger, registry, status
+from gotrain.config_schema import ConfigValidationError, validate_config, validate_hypothesis
 from gotrain.logging_utils import log_event
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -31,6 +31,7 @@ def launch_training(
     config: dict,
     parent_id: Optional[str] = None,
     timeout_seconds: Optional[float] = None,
+    hypothesis: Optional[dict] = None,
 ) -> dict:
     """Run a training template synchronously and record the result in the ledger.
 
@@ -41,15 +42,29 @@ def launch_training(
 
     `timeout_seconds`, if given, kills the training subprocess once exceeded
     and raises TimeoutError — this is the per-run wall-clock budget.
+
+    `hypothesis` (see gotrain.config_schema.validate_hypothesis) is required
+    whenever `parent_id` is given — every non-baseline run must state what
+    changed and why before it's allowed to start.
+
+    Also refuses to run while the engineer control plane
+    (gotrain.control) is in a blocking state (paused, manual takeover,
+    rollback in progress), and refuses a config that changes a gated
+    field (backbone/architecture/encoder) to a value that hasn't been
+    engineer-approved yet (gotrain.approval).
     """
     if task_type not in TEMPLATES:
         raise ValueError(f"task_type must be one of {list(TEMPLATES)}, got {task_type!r}")
 
-    # Validate before spawning anything or touching the run budget — a bad
-    # config value (e.g. an unsupported optimizer name) must be rejected
-    # here, not discovered after a subprocess has already been counted
-    # against max_runs by the agent's limit hook.
+    # Every check below runs before spawning anything or touching the run
+    # budget — a bad config value, a missing/malformed hypothesis, an
+    # un-approved gated value, or the control plane being paused must all
+    # be rejected here, not discovered after a subprocess has already
+    # been counted against max_runs by the agent's limit hook.
+    control.raise_if_blocking()
     validate_config(task_type, config)
+    validate_hypothesis(hypothesis, has_parent=parent_id is not None)
+    approval.check_gate(dataset, task_type, config)
 
     template_path = TEMPLATES[task_type]
     status.set_action("training", from_=parent_id or "agent", where=dataset)
@@ -127,6 +142,7 @@ def launch_training(
         version_id=version_id,
         run_id=ledger_run_id,
         extra_metrics=result.get("extra_metrics"),
+        hypothesis=hypothesis,
     )
 
     best = ledger.get_best(dataset)

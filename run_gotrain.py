@@ -32,7 +32,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_dry(dataset: str, max_runs: int, run_minutes: float, max_tool_calls: int) -> None:
+    from gotrain import control
     from gotrain.agent import build_agent, load_system_prompt
+
+    control.reset()  # a stale paused/manual-control state from a previous session must not block this demo
 
     print("=" * 70)
     print("DRY RUN — Bedrock is never called in this mode.")
@@ -56,8 +59,27 @@ def run_dry(dataset: str, max_runs: int, run_minutes: float, max_tool_calls: int
 
 
 def run_live(dataset: str, max_runs: int, run_minutes: float, max_tool_calls: int) -> None:
+    """Run the agent, with real pause/resume across turns via the engineer
+    control plane (gotrain.control): a dashboard click sets control.json
+    to PAUSE_REQUESTED/MANUAL_CONTROL; the agent's hook
+    (gotrain/agent.py::LimitsAndLoggingHooks) then cancels its very next
+    tool call and acknowledges the pause, which makes agent(prompt)
+    return (the LLM has nothing left to do but respond in text). This
+    loop then blocks on control.wait_for_resume() and, once an engineer
+    resumes, calls agent(...) again on the SAME Agent instance to
+    continue the same conversation.
+
+    Caveat: this relies on strands.Agent.__call__ preserving conversation
+    history across repeated calls on one instance, which could not be
+    exercised against a live Bedrock call in this repo's test suite (no
+    AWS access in this environment) -- the state-machine/polling logic
+    itself (gotrain.control) is unit-tested; this specific multi-call
+    integration needs a real run on the SageMaker lab to confirm.
+    """
+    from gotrain import control
     from gotrain.agent import build_agent
 
+    control.reset()
     agent = build_agent(dataset, max_runs=max_runs, run_minutes=run_minutes, max_tool_calls=max_tool_calls)
 
     prompt = (
@@ -65,7 +87,28 @@ def run_live(dataset: str, max_runs: int, run_minutes: float, max_tool_calls: in
         f"You have a budget of {max_runs} training runs, {run_minutes} minutes per run, "
         f"and {max_tool_calls} total tool calls. Follow the workflow in your system prompt."
     )
-    agent(prompt)
+
+    while True:
+        agent(prompt)
+
+        if control.get_state() == control.COMPLETED:
+            break
+        if not control.is_blocking():
+            # The agent stopped on its own (gave up, hit a hard limit, or
+            # decided it was done) without submitting a final model, and
+            # nobody paused it -- nothing left for this loop to drive.
+            break
+
+        print(f"\n[GoTrain] Paused ({control.get_state()}). Waiting for the engineer to resume via the dashboard...")
+        control.wait_for_resume()
+        print("[GoTrain] Resumed. Continuing...")
+        prompt = (
+            "You have been resumed by the engineer after a pause or manual-control "
+            "interval. Continue your workflow from where you left off -- call "
+            "query_history first to see everything already tried, including "
+            "anything the engineer may have done directly. Do not repeat a run "
+            "that's already recorded."
+        )
 
 
 def main() -> None:

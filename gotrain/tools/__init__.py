@@ -9,6 +9,7 @@ from gotrain.tools.training import (
 )
 from gotrain.tools.final_eval import final_test_eval, TestAlreadyEvaluatedError
 from gotrain.tools.s3 import upload_to_s3, download_from_s3
+from gotrain.tools.geoguard import run_geoguard
 
 __all__ = [
     "list_datasets",
@@ -23,4 +24,5 @@ __all__ = [
     "TestAlreadyEvaluatedError",
     "upload_to_s3",
     "download_from_s3",
+    "run_geoguard",
 ]

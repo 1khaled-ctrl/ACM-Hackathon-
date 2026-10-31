@@ -59,7 +59,7 @@ python run_gotrain.py --dataset m-eurosat --max-runs 6 --run-minutes 5
 # After the agent submits a model, a human runs the one-time final evaluation:
 python run_final_eval.py --dataset m-eurosat
 
-# Dashboard — read-only view over status/ledger/events:
+# Dashboard — view + engineer control (pause/resume/manual-takeover/approvals/rollback):
 streamlit run dashboard.py
 
 # Tests:
@@ -72,14 +72,20 @@ pytest tests/ -v
 streamlit run dashboard.py
 ```
 
-A single-page, read-only, dark-themed view of what the agent is doing, built
-around one goal: understand it within 5 seconds. Shows live status, the
-workflow stage (analyze/train/validate/compare/decide), the current
-experiment's live per-epoch progress, the best model so far, a validation-score
-chart across runs, the agent's last logged decision/rationale, run history,
-model lineage, and a live activity feed. Never launches training, changes a
-config, or triggers the final test evaluation — it only reads
-`logs/status.json`, `logs/ledger.jsonl`, and `logs/events.jsonl`.
+A single-page, dark-themed view of what the agent is doing, built around one
+goal: understand it within 5 seconds. Shows live status, the workflow stage
+(analyze/train/validate/compare/decide), the current experiment's live
+per-epoch progress, the best model so far, a validation-score chart across
+runs, the agent's last logged decision/rationale (including its structured
+hypothesis and the code-computed `hypothesis_outcome`), GeoGuard's findings,
+run history, model lineage, and a live activity feed.
+
+It also has real write access to the backend, via the **Control** tab and
+the always-visible Engineer Control card (see "Engineer control plane"
+below): Pause / Resume / Take Manual Control, approve/reject pending
+config-approval requests, and roll back to a previous model version. It
+still never touches the test split and never calls `final_test_eval` — that
+stays exclusively in `run_final_eval.py`, run by a human.
 
 On Windows, `launch_dashboard.bat` (not tracked by git) sets up a `.venv` and
 runs the above for you — a desktop shortcut can point straight at it.
@@ -92,6 +98,33 @@ own browser through Jupyter's proxy (`<notebook-url>/proxy/8501/`, with
 yours by any means (shared drive, `scp`, manual copy) — point at a different
 local folder than this repo's own `logs/` with the `GOTRAIN_LOGS_DIR`
 environment variable if needed (same pattern as `GEO_BENCH_DIR`).
+
+## GeoGuard — data-aware preprocessing diagnostics
+
+Before its first `launch_training` call, the agent calls `run_geoguard`,
+which inspects a bounded sample (default 300 images) of the dataset's
+**train split only** and reports:
+
+- per-band pixel statistics (min/max/mean/std, possible saturation/clipping,
+  near-constant bands), and NaN/Inf counts;
+- whether the dataset mixes sensor modalities (e.g. m-so2sat's 8 SAR + 10
+  optical bands), detected by band name;
+- class/pixel frequency, rare classes, and (for binary segmentation)
+  background dominance;
+- a **recommended config** — drawn only from the same values
+  `launch_training` already accepts (`gotrain/config_schema.py`) — with a
+  one-line rationale per recommendation, so the reasoning is auditable, not
+  just the output.
+
+GeoGuard never fits or returns anything applied to validation/test data,
+and never executes model-authored code: `gotrain/geoguard/decision.py` is a
+plain deterministic function, and every config it proposes is re-validated
+against `config_schema.validate_config` before being returned. The report
+is written to `logs/geoguard/<dataset>.json` (see `gotrain/geoguard/`).
+
+Post-preprocessing QA checks (`gotrain/geoguard/qa.py`) validate an
+already-normalized batch — shape, channel count, NaN/Inf, label/mask
+alignment and range — independent of GeoGuard's dataset-level diagnostics.
 
 ## The safety rail
 
@@ -106,6 +139,62 @@ environment variable if needed (same pattern as `GEO_BENCH_DIR`).
   config value doesn't cost the agent one of its max runs.
 - Every tool call is logged with its arguments, result, and duration.
 
+## Engineer control plane
+
+The dashboard is no longer read-only: it's a real control surface backed by
+an authoritative state machine (`gotrain/control.py`, `logs/control.json`),
+checked both by the agent's hook (`gotrain/agent.py`) and, redundantly,
+inside `launch_training` itself (`gotrain/tools/training.py`) — so it holds
+even for a direct/script-level call that bypasses the agent entirely.
+
+**States:** `RUNNING_AUTONOMOUSLY` (default) → `PAUSE_REQUESTED` →
+`PAUSED_FOR_ENGINEER` → `RESUME_REQUESTED` → back to
+`RUNNING_AUTONOMOUSLY`; or `MANUAL_CONTROL` (engineer takes over directly);
+or `ROLLBACK_REQUESTED` → `ROLLBACK_VERIFYING` → `PAUSED_FOR_ENGINEER`
+(success) / `FAILED_SAFE` (verification failed); or terminal `COMPLETED`
+once a final model is submitted. Only the transitions listed in
+`control.VALID_TRANSITIONS` are allowed — an illegal one raises rather than
+silently no-op-ing — and every transition is logged to `events.jsonl`.
+
+**Pause/manual control**: clicking Pause or Take Manual Control in the
+dashboard sets `control.json`; the agent's hook then cancels its *very next*
+tool call (any tool, not just `launch_training`) with a clear message, and
+that cancellation doesn't cost run or tool-call budget. If training is
+actively running, the training templates (`gotrain/templates/train_*.py`)
+also check `control.should_stop_training()` once per epoch, so a pause
+takes effect within one epoch rather than waiting for the full run's time
+budget — the run still completes normally otherwise, just tagged
+`"interrupted": true` with a reason in its metrics. `run_gotrain.py`'s main
+loop then blocks on `control.wait_for_resume()` and, once an engineer
+resumes, continues the **same** agent conversation rather than starting
+over. (This specific multi-turn resume path needs a live SageMaker/Bedrock
+run to fully confirm — see the module's docstring for the exact caveat;
+the state machine and polling logic it depends on are unit-tested.)
+
+**Approval gate** (`gotrain/approval.py`): `backbone` (classification) and
+`architecture`/`encoder` (segmentation) are gated — the training templates'
+own defaults (`resnet18`; `unet` + `resnet34`) always run immediately, but
+any other value requires engineer approval the first time it's proposed.
+Gate state is keyed by `(dataset, field, value)`, never by call identity —
+so a rejected value cannot be let through by resubmitting it under a
+different config or rationale (see
+`tests/test_approval.py::test_rejected_value_cannot_be_bypassed_by_resubmission`
+for the exact "ResNet-50 rejected for GPU limits" scenario from the design
+brief). Decisions are only ever made from the dashboard's **Control** tab —
+there is no agent tool to approve/reject/pause/resume/rollback anything;
+giving the agent that tool would defeat the entire point.
+
+**Verified rollback** (`gotrain/rollback.py`): rolling back to a model
+version checks (in order) that no training run is currently in progress,
+that the target checkpoint file is non-empty and its config/metrics exist,
+and — not yet exercised against real weights in this environment, since it
+needs torch — that the checkpoint actually loads into the architecture its
+own `config.json` describes and produces correctly-shaped output on a
+synthetic input. Only if every check passes does it atomically rewrite
+`models/<dataset>/active_version.json`; a failed check never touches that
+pointer, and a successful rollback always leaves the system
+`PAUSED_FOR_ENGINEER` (never auto-resumes).
+
 ## Logs, models, and runs
 
 - `logs/events.jsonl` — every tool call the agent made (name, arguments, truncated
@@ -114,6 +203,15 @@ environment variable if needed (same pattern as `GEO_BENCH_DIR`).
   lineage (`parent_id`/`config_diff`), decision, and `version_id`.
 - `logs/status.json` — the agent's current stage/action, for the dashboard or a
   quick check of what's happening right now.
+- `logs/geoguard/<dataset>.json` — the GeoGuard diagnostic report for a
+  dataset (see above), written by `run_geoguard`.
+- `logs/control.json` — the authoritative engineer-control state (see
+  above), written by `gotrain/control.py`.
+- `logs/approvals_state.json` / `logs/approvals.jsonl` — current status and
+  full audit trail of every gated-config approval request/decision (see
+  above), written by `gotrain/approval.py`.
+- `models/<dataset>/active_version.json` — the dataset's currently active
+  model version after a verified rollback, written by `gotrain/rollback.py`.
 - `runs/<dataset>/<run_id>/` — scratch output from one training process
   (`config.json`, `metrics.json`, `train.log`, checkpoint). Not tracked by git.
 - `models/<dataset>/<version>/` — the durable model registry: a run's config,

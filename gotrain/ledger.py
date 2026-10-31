@@ -56,6 +56,40 @@ def _write_all(records: list) -> None:
         raise
 
 
+HYPOTHESIS_OUTCOME_EPSILON = 0.001  # below this, a delta is noise, not signal
+
+
+def _evaluate_hypothesis(hypothesis: Optional[dict], delta_vs_parent: Optional[float]) -> Optional[str]:
+    """Deterministically grade a hypothesis against what actually happened
+    -- "supported" / "not_supported" / "inconclusive" -- never left to the
+    model to self-report (see prompts/system_prompt.md: "do not present
+    hypotheses as confirmed explanations"). Returns None when there's
+    nothing to grade against (no hypothesis, no parent, or no
+    expected_direction stated).
+
+    A delta smaller than HYPOTHESIS_OUTCOME_EPSILON is "inconclusive" for
+    increase/decrease hypotheses (too small to read as real signal vs.
+    noise) but can still "support" a no_change hypothesis, since a small
+    delta is exactly what that hypothesis predicted.
+    """
+    if not hypothesis or delta_vs_parent is None:
+        return None
+    direction = hypothesis.get("expected_direction")
+    if direction is None:
+        return None
+
+    is_small = abs(delta_vs_parent) < HYPOTHESIS_OUTCOME_EPSILON
+    if direction == "no_change":
+        return "supported" if is_small else "not_supported"
+    if is_small:
+        return "inconclusive"
+    if direction == "increase":
+        return "supported" if delta_vs_parent > 0 else "not_supported"
+    if direction == "decrease":
+        return "supported" if delta_vs_parent < 0 else "not_supported"
+    return None
+
+
 def _diff_config(config: dict, parent_config: Optional[dict]) -> dict:
     if not parent_config:
         return {}
@@ -82,6 +116,7 @@ def add_run(
     task_type: Optional[str] = None,
     version_id: Optional[str] = None,
     extra_metrics: Optional[dict] = None,
+    hypothesis: Optional[dict] = None,
 ) -> dict:
     """Append a new run record to the ledger and return it.
 
@@ -92,7 +127,10 @@ def add_run(
     to, if any. `extra_metrics` is an opaque passthrough for anything a
     template reports beyond val_metric (e.g. segmentation's
     foreground_iou) that a dashboard may want to show but that isn't part
-    of the core comparison logic here.
+    of the core comparison logic here. `hypothesis` (see
+    gotrain.config_schema.validate_hypothesis) is stored as given, plus a
+    `hypothesis_outcome` computed here from the ACTUAL delta_vs_parent --
+    the caller's stated expectation is graded by code, not trusted.
     """
     if decision not in VALID_DECISIONS:
         raise ValueError(f"decision must be one of {VALID_DECISIONS}, got {decision!r}")
@@ -130,6 +168,8 @@ def add_run(
         "rationale": rationale,
         "split_used": split_used,
         "extra_metrics": extra_metrics or {},
+        "hypothesis": hypothesis,
+        "hypothesis_outcome": _evaluate_hypothesis(hypothesis, delta_vs_parent),
         "timestamp": _now(),
     }
     records.append(record)
