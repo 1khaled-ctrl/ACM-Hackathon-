@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -3.10 -m venv .venv_test)",
+      "Bash(grep -v -E \"^torch==|^torchvision==\" requirements.txt)",
+      "Read(//tmp/**)",
+      "Bash(deactivate)",
+      "Bash(rm -rf .venv_test .pytest_cache)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

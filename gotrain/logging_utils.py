@@ -14,6 +14,11 @@ Every evaluation MUST be logged through log_evaluation() with its split name
 ("train" / "validation" / "test"), so it's always visible which split was
 used. The test split is only ever expected to appear here once, at the very
 end of a task.
+
+LOGS_DIR defaults to <repo>/logs but can be overridden with the
+GOTRAIN_LOGS_DIR environment variable (same pattern as GEO_BENCH_DIR) --
+e.g. to point a local dashboard.py at a synced copy of a teammate's logs/
+from a different machine instead of this machine's own training runs.
 """
 
 import json
@@ -23,7 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+DEFAULT_LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+LOGS_DIR = Path(os.environ.get("GOTRAIN_LOGS_DIR", DEFAULT_LOGS_DIR))
 EVENTS_PATH = LOGS_DIR / "events.jsonl"
 STATUS_PATH = LOGS_DIR / "status.json"
 

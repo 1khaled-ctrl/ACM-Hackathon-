@@ -40,28 +40,34 @@ def build_eval_fn(run: dict):
     """Build the no-arg callable final_test_eval() will invoke to produce
     test-split metrics for the submitted run.
 
-    Only the "fake" task_type (used for flow-testing) is wired up today,
-    since gotrain/templates/train_classification.py and
-    train_segmentation.py are still empty templates with no checkpoint-
-    saving logic yet. Fill those in, then extend this function to load
-    the saved checkpoint for `run["run_id"]` and evaluate it on the real
-    test split before using this script for a real submission.
+    "classification" and "segmentation" load the run's saved checkpoint
+    (runs/<dataset>/<run_id>/best_model.pt) and evaluate it on the TEST
+    split via gotrain.tools.final_eval — the only module in this codebase
+    allowed to touch that split. "fake" (used for flow-testing with no
+    GPU/dataset needed) reuses its deterministic pseudo-metric.
     """
     task_type = run.get("task_type")
+    dataset, run_id, config = run["dataset"], run["run_id"], run["config"]
+
     if task_type == "fake":
         from gotrain.templates.fake_train import fake_val_metric
 
         def eval_fn():
-            return {"accuracy": fake_val_metric(run["dataset"], run["config"])}
+            return {"accuracy": fake_val_metric(dataset, config)}
 
         return eval_fn
 
-    raise NotImplementedError(
-        f"No test-eval path wired up yet for task_type={task_type!r}. "
-        "Real classification/segmentation training templates don't save "
-        "checkpoints yet — implement that, then extend build_eval_fn() here "
-        "to load the checkpoint for this run_id and evaluate it on the test split."
-    )
+    if task_type == "classification":
+        from gotrain.tools.final_eval import build_classification_test_eval_fn
+
+        return lambda: build_classification_test_eval_fn(dataset, run_id, config)
+
+    if task_type == "segmentation":
+        from gotrain.tools.final_eval import build_segmentation_test_eval_fn
+
+        return lambda: build_segmentation_test_eval_fn(dataset, run_id, config)
+
+    raise NotImplementedError(f"No test-eval path wired up for task_type={task_type!r}.")
 
 
 def main() -> None:

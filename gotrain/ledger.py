@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-LOGS_DIR = Path(__file__).resolve().parent.parent / "logs"
+from gotrain.logging_utils import LOGS_DIR
+
 LEDGER_PATH = LOGS_DIR / "ledger.jsonl"
 
 VALID_DECISIONS = {"kept", "discarded", "pending"}
@@ -79,12 +80,16 @@ def add_run(
     split_used: str = "validation",
     run_id: Optional[str] = None,
     task_type: Optional[str] = None,
+    extra_metrics: Optional[dict] = None,
 ) -> dict:
     """Append a new run record to the ledger and return it.
 
     `config_diff` is computed automatically against the parent run's config,
     when a parent is given. `delta_vs_parent` is computed against the
-    parent's val_metric when both are numeric.
+    parent's val_metric when both are numeric. `extra_metrics` is an opaque
+    passthrough for anything a template reports beyond val_metric (e.g.
+    segmentation's foreground_iou) that a dashboard may want to show but
+    that isn't part of the core comparison logic here.
     """
     if decision not in VALID_DECISIONS:
         raise ValueError(f"decision must be one of {VALID_DECISIONS}, got {decision!r}")
@@ -120,6 +125,7 @@ def add_run(
         "decision": decision,
         "rationale": rationale,
         "split_used": split_used,
+        "extra_metrics": extra_metrics or {},
         "timestamp": _now(),
     }
     records.append(record)

@@ -31,6 +31,25 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 os.environ.setdefault("GEO_BENCH_DIR", str(REPO_ROOT / "data" / "geobench"))
+if str(REPO_ROOT) not in sys.path:
+    # Needed to `import gotrain.status` below -- this script runs as a
+    # subprocess (sys.executable + this file's path, not `-m`), so Python
+    # only puts this file's own directory on sys.path by default.
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def report_progress(**fields) -> None:
+    """Best-effort live per-epoch status update for the dashboard. Never
+    allowed to fail a training run -- if gotrain.status can't be imported
+    or the write fails for any reason, training continues unaffected.
+    """
+    try:
+        from gotrain.status import set_current_run
+
+        set_current_run(fields)
+    except Exception:
+        pass
+
 
 DEFAULTS = {
     "backbone": "resnet18",
@@ -474,6 +493,23 @@ def main() -> None:
             f"Epoch {epoch + 1}/{cfg['epochs']} — train_loss={avg_train_loss:.4f} "
             f"val_accuracy={accuracy:.4f} per_class_accuracy={per_class_accuracy} "
             f"time={epoch_seconds:.1f}s (split=validation)"
+        )
+
+        report_progress(
+            run_id=run_id,
+            dataset=dataset,
+            task_type="classification",
+            model=cfg["backbone"],
+            optimizer=cfg["optimizer"],
+            lr=cfg["lr"],
+            scheduler=cfg["scheduler"],
+            epoch=epoch + 1,
+            epochs=cfg["epochs"],
+            train_loss=avg_train_loss,
+            val_metric=accuracy,
+            metric_name="val_accuracy",
+            best_val_metric=max(best_val_acc, accuracy),
+            elapsed_seconds=time.time() - training_start,
         )
 
         if accuracy > best_val_acc:
