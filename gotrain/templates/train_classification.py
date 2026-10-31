@@ -72,6 +72,8 @@ DEFAULTS = {
     "max_train_samples": None,
     "max_val_samples": None,
     "tta": False,
+    "fine_tuning_strategy": "full",
+    "manifest_id": None,
 }
 
 BENCHMARK_DIRS = ["classification_v1.0", "segmentation_v1.0"]
@@ -112,13 +114,27 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger):
+def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None):
     """Load every sample of `split` into memory as (N, H, W, C) float32 images
     and (N,) int64 labels. GEO-Bench classification tasks here are small
     enough (a few thousand small patches) that this is simpler than writing
     a lazy on-disk Dataset, and makes computing TRAIN-only normalization
     stats a single pass instead of two.
+
+    `excluded_ids` (a DataIQ manifest's excluded_sample_ids, see
+    gotrain/dataiq/manifest.py) skips those indices entirely -- never
+    reads, never counts them. Passing a non-empty `excluded_ids` for any
+    split other than "train" is refused outright: a manifest must never
+    be able to touch validation, by construction, not just by convention
+    of which call site happens to pass one.
     """
+    if excluded_ids and split != "train":
+        raise ValueError(
+            f"excluded_ids was given for split={split!r} -- DataIQ manifests may only "
+            "ever filter the TRAIN split."
+        )
+    excluded_ids = excluded_ids or set()
+
     geobench_split = {"train": "train", "validation": "valid"}[split]
     ds = task_specs.get_dataset(split=geobench_split)
 
@@ -128,7 +144,11 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
 
     images = []
     labels = []
+    n_excluded_in_range = 0
     for i in range(n):
+        if i in excluded_ids:
+            n_excluded_in_range += 1
+            continue
         sample = ds[i]
         arr, _ = sample.pack_to_3d(band_names=band_names)
         images.append(arr.astype(np.float32))
@@ -136,7 +156,11 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
 
     images = np.stack(images, axis=0)
     labels = np.array(labels, dtype=np.int64)
-    logger.info(f"Loaded {split} split: {images.shape[0]} samples, images {images.shape}, labels {labels.shape}")
+    exclusion_note = f", {n_excluded_in_range} excluded by manifest" if n_excluded_in_range else ""
+    logger.info(
+        f"Loaded {split} split: {images.shape[0]} samples, images {images.shape}, "
+        f"labels {labels.shape}{exclusion_note}"
+    )
     return images, labels
 
 
@@ -374,8 +398,15 @@ def main() -> None:
             "bands (bands=null) instead."
         )
 
+    excluded_ids = set()
+    if cfg["manifest_id"]:
+        from gotrain.dataiq.manifest import get_excluded_ids
+
+        excluded_ids = get_excluded_ids(dataset, cfg["manifest_id"])
+        logger.info(f"DataIQ manifest {cfg['manifest_id']!r}: excluding {len(excluded_ids)} TRAIN sample(s)")
+
     train_images, train_labels = build_dataset_arrays(
-        task_specs, "train", band_names, cfg["max_train_samples"], logger
+        task_specs, "train", band_names, cfg["max_train_samples"], logger, excluded_ids=excluded_ids
     )
     val_images, val_labels = build_dataset_arrays(
         task_specs, "validation", band_names, cfg["max_val_samples"], logger
@@ -397,8 +428,16 @@ def main() -> None:
     train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
 
+    fine_tuning_strategy = cfg["fine_tuning_strategy"]
+    # "from_scratch" means exactly that -- no pretrained weights at all --
+    # regardless of what cfg["pretrained"] says; every other strategy
+    # respects cfg["pretrained"] as given (validate_fine_tuning_strategy
+    # in gotrain/config_schema.py already refused linear_probe/partial
+    # with pretrained=False before this subprocess was ever spawned).
+    effective_pretrained = cfg["pretrained"] and fine_tuning_strategy != "from_scratch"
+
     try:
-        model = build_model(cfg["backbone"], cfg["pretrained"], n_bands, n_classes)
+        model = build_model(cfg["backbone"], effective_pretrained, n_bands, n_classes)
         model = model.to(device)
     except (torch.OutOfMemoryError, RuntimeError) as e:
         if not is_oom_error(e):
@@ -410,11 +449,19 @@ def main() -> None:
         )
         sys.exit(1)
 
-    n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model: {cfg['backbone']} (pretrained={cfg['pretrained']}), {n_params:,} parameters")
+    from gotrain.finetuning import apply_fine_tuning_strategy, trainable_parameters
+
+    fine_tuning_summary = apply_fine_tuning_strategy(model, "timm", fine_tuning_strategy)
+    n_params = fine_tuning_summary["total_parameters"]
+    logger.info(
+        f"Model: {cfg['backbone']} (pretrained={effective_pretrained}), {n_params:,} parameters, "
+        f"fine_tuning_strategy={fine_tuning_strategy!r} -- "
+        f"{fine_tuning_summary['trainable_parameters']:,} trainable / "
+        f"{fine_tuning_summary['frozen_parameters']:,} frozen"
+    )
 
     loss_fn = build_loss(n_classes, class_weights, cfg["label_smoothing"], device)
-    optimizer = build_optimizer(cfg["optimizer"], model.parameters(), cfg["lr"], cfg["weight_decay"])
+    optimizer = build_optimizer(cfg["optimizer"], trainable_parameters(model), cfg["lr"], cfg["weight_decay"])
     scheduler = build_scheduler(cfg["scheduler"], optimizer, cfg["epochs"], cfg["warmup_epochs"])
     scaler = GradScaler(device="cuda", enabled=amp_enabled)
 
@@ -565,6 +612,9 @@ def main() -> None:
         "total_train_seconds": total_seconds,
         "interrupted": interrupted_reason is not None,
         "interrupted_reason": interrupted_reason,
+        "fine_tuning": fine_tuning_summary,
+        "manifest_id": cfg["manifest_id"],
+        "n_excluded_by_manifest": len(excluded_ids),
     }
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     logger.info(f"Run finished in {total_seconds:.1f}s. Best val_accuracy={best_val_acc:.4f}")
@@ -580,7 +630,15 @@ def main() -> None:
         "rationale": rationale,
         "run_dir": str(run_dir),
         "checkpoint_path": str(best_checkpoint_path),
-        "extra_metrics": {"interrupted": interrupted_reason is not None, "interrupted_reason": interrupted_reason},
+        "extra_metrics": {
+            "interrupted": interrupted_reason is not None,
+            "interrupted_reason": interrupted_reason,
+            "fine_tuning_strategy": fine_tuning_summary["fine_tuning_strategy"],
+            "trainable_parameters": fine_tuning_summary["trainable_parameters"],
+            "frozen_parameters": fine_tuning_summary["frozen_parameters"],
+            "manifest_id": cfg["manifest_id"],
+            "n_excluded_by_manifest": len(excluded_ids),
+        },
     }))
 
 

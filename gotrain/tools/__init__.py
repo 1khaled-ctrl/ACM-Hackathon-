@@ -10,6 +10,18 @@ from gotrain.tools.training import (
 from gotrain.tools.final_eval import final_test_eval, TestAlreadyEvaluatedError
 from gotrain.tools.s3 import upload_to_s3, download_from_s3
 from gotrain.tools.geoguard import run_geoguard
+from gotrain.tools.dataiq import (
+    run_dataiq_structural_scan,
+    run_dataiq_loss_scan,
+    create_data_manifest,
+    list_data_proposals,
+)
+from gotrain.tools.pretrained import (
+    list_compatible_models,
+    estimate_model_resources,
+    validate_model_compatibility,
+)
+from gotrain.tools.experiment_planner import get_training_diagnostics, recommend_experiments
 
 __all__ = [
     "list_datasets",
@@ -25,4 +37,13 @@ __all__ = [
     "upload_to_s3",
     "download_from_s3",
     "run_geoguard",
+    "run_dataiq_structural_scan",
+    "run_dataiq_loss_scan",
+    "create_data_manifest",
+    "list_data_proposals",
+    "list_compatible_models",
+    "estimate_model_resources",
+    "validate_model_compatibility",
+    "get_training_diagnostics",
+    "recommend_experiments",
 ]

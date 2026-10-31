@@ -103,8 +103,19 @@ def _append_audit(event: str, **fields) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-def list_proposals(status: Optional[str] = None) -> list:
+def list_proposals(status: Optional[str] = None, kind: Optional[str] = None) -> list:
+    """List review-queue entries. `kind` filters to "config_gate" (this
+    module's own backbone/architecture/encoder proposals -- the default
+    when a record predates the "kind" field, since every entry created
+    before gotrain.dataiq existed was a config gate) or "data_action"
+    (gotrain.dataiq.decision's sample-level proposals, sharing this same
+    queue/audit trail per the design brief's instruction to extend
+    approvals to data modifications rather than building a parallel
+    system). Omit `kind` to see everything.
+    """
     proposals = list(_read_state().values())
+    if kind is not None:
+        proposals = [p for p in proposals if p.get("kind", "config_gate") == kind]
     if status is not None:
         proposals = [p for p in proposals if p["status"] == status]
     return sorted(proposals, key=lambda p: p["requested_at"])
@@ -121,7 +132,7 @@ def request_approval(dataset: str, task_type: str, field: str, value, reason: st
     if key in state:
         return state[key]
     record = {
-        "key": key, "dataset": dataset, "task_type": task_type, "field": field,
+        "key": key, "kind": "config_gate", "dataset": dataset, "task_type": task_type, "field": field,
         "value": value, "status": PENDING, "reason": reason,
         "requested_at": _now(), "decided_at": None, "decided_by": None, "decision_reason": None,
     }

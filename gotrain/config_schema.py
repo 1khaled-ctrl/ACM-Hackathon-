@@ -17,11 +17,18 @@ from typing import Optional
 
 TASK_TYPES = ["classification", "segmentation", "fake"]
 
+# Fine-tuning strategy (see gotrain/finetuning.py): which parameters of a
+# pretrained backbone actually get gradients. "full" (everything trainable)
+# is the default -- it matches every config written before this field
+# existed, so old configs/examples keep behaving exactly as before.
+FINE_TUNING_STRATEGIES = ["from_scratch", "linear_probe", "partial", "full"]
+
 CLASSIFICATION_VALID_VALUES = {
     "optimizer": ["adam", "sgd", "adamw"],
     "scheduler": ["none", "cosine"],
     "augmentation": ["none", "basic", "strong"],
     "backbone": ["resnet18", "resnet50", "efficientnet_b0", "convnext_tiny"],
+    "fine_tuning_strategy": FINE_TUNING_STRATEGIES,
 }
 
 SEGMENTATION_VALID_VALUES = {
@@ -31,6 +38,7 @@ SEGMENTATION_VALID_VALUES = {
     "loss": ["ce", "dice", "ce+dice", "focal", "ce+focal"],
     "augmentation": ["none", "basic", "strong"],
     "encoder": ["resnet34", "resnet50", "efficientnet-b3"],
+    "fine_tuning_strategy": FINE_TUNING_STRATEGIES,
 }
 
 VALID_VALUES_BY_TASK_TYPE = {
@@ -82,6 +90,24 @@ def validate_config(task_type: str, config: dict) -> None:
     for field, allowed in valid_values.items():
         if field in config and config[field] is not None and config[field] not in allowed:
             raise ConfigValidationError(task_type, field, config[field], allowed)
+
+
+def validate_fine_tuning_strategy(task_type: str, config: dict) -> None:
+    """linear_probe/partial only make sense with a pretrained backbone --
+    freezing most or all of a randomly-initialized backbone produces a
+    model that cannot learn useful features no matter how long the head
+    trains. Rejected here, before any subprocess runs, rather than
+    discovered after a run's GPU budget was spent on a config that was
+    never going to work.
+    """
+    strategy = config.get("fine_tuning_strategy") or "full"
+    pretrained = config.get("pretrained", True)
+    if strategy in ("linear_probe", "partial") and not pretrained:
+        raise ConfigValidationError(
+            task_type, "fine_tuning_strategy", strategy,
+            [f"{strategy!r} requires pretrained=true -- freezing a randomly-initialized "
+             "backbone cannot learn useful features"],
+        )
 
 
 # ---------------------------------------------------------------------------

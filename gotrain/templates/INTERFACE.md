@@ -110,9 +110,28 @@ are never registered.
   "time_budget_minutes": null,     // soft wall-clock budget; stops early if hit
   "seed": 0,
   "max_train_samples": null,       // for smoke tests: cap on train set size
-  "max_val_samples": null
+  "max_val_samples": null,
+  "fine_tuning_strategy": "full",  // "from_scratch" | "linear_probe" | "partial" | "full" (gotrain/finetuning.py)
+  "manifest_id": null              // null/"base" (= no exclusions) or a DataIQ manifest id (gotrain/dataiq/manifest.py)
 }
 ```
+
+**fine_tuning_strategy**: which parameters actually get gradients (see
+`gotrain/finetuning.py`). `"from_scratch"` forces `pretrained=false`
+regardless of the `pretrained` key; `"linear_probe"`/`"partial"` require
+`pretrained=true` (rejected pre-flight otherwise, by
+`gotrain/config_schema.py::validate_fine_tuning_strategy`) since freezing
+most/all of a randomly-initialized backbone cannot learn. Recorded in
+`metrics.json`'s `"fine_tuning"` block (total/trainable/frozen parameter
+counts) and in the ledger's `extra_metrics`.
+
+**manifest_id**: excludes a DataIQ manifest's `excluded_sample_ids` (TRAIN
+split only -- see `gotrain/dataiq/manifest.py`) before computing TRAIN
+band stats or building the training `Dataset`. Rejected pre-flight if the
+manifest doesn't exist (`gotrain.dataiq.manifest.validate_manifest_exists`,
+called from `gotrain/tools/training.py`). Never applied to the validation
+split -- `build_dataset_arrays` refuses a non-empty `excluded_ids` for any
+split other than `"train"`.
 
 **m-eurosat band warning**: geo-bench-1.0 stores incorrect band names for
 most of m-eurosat's channels (pixel data is unaffected; selecting bands
@@ -145,9 +164,16 @@ prompt tells the agent not to do this.
   "time_budget_minutes": null,      // soft wall-clock budget; stops early if hit
   "seed": 0,
   "max_train_samples": null,        // for smoke tests: cap on train set size
-  "max_val_samples": null
+  "max_val_samples": null,
+  "fine_tuning_strategy": "full",   // "from_scratch" | "linear_probe" | "partial" | "full" (gotrain/finetuning.py)
+  "manifest_id": null               // null/"base" (= no exclusions) or a DataIQ manifest id (gotrain/dataiq/manifest.py)
 }
 ```
+
+See the classification section above for `fine_tuning_strategy`/
+`manifest_id`'s semantics — identical for segmentation, just applied to
+`segmentation_head.*` instead of `fc.*`/`classifier.*`/`head.*` as the
+backbone-vs-head split (`gotrain/finetuning.py`'s `"smp"` family).
 
 Any key not given falls back to the default shown above — every key
 added since the first version of this file is optional, so a config
