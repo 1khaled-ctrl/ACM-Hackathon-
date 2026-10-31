@@ -89,6 +89,18 @@ def is_oom_error(exc: BaseException) -> bool:
     return "out of memory" in message or "not enough memory" in message
 
 
+def safe_to_drop_last(n_samples: int, batch_size: int) -> bool:
+    """True if DataLoader(..., drop_last=True) is safe for TRAIN: dropping
+    a trailing partial batch is only safe when at least one full batch
+    remains. Without this, a training set smaller than batch_size would
+    have drop_last silently skip every batch -- zero gradient updates per
+    epoch, no error, no training -- which is worse than the
+    batch-of-exactly-1 BatchNorm crash drop_last is meant to prevent. Pure
+    arithmetic, no torch, unit-testable without the ML stack installed.
+    """
+    return n_samples >= batch_size
+
+
 def find_task_dir(dataset: str):
     import geobench
 
@@ -458,7 +470,19 @@ def main() -> None:
     )
     val_dataset = SegmentationArrayDataset(val_images, val_masks, mean, std, "none", cfg["seed"])
 
-    train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0)
+    # drop_last=True on TRAIN only: if the sample count leaves a last
+    # batch of exactly 1, BatchNorm raises "Expected more than 1 value
+    # per channel when training" -- a real, previously-unguarded crash.
+    # Guarded to never drop the ONLY batch an epoch would otherwise have
+    # (a training set smaller than batch_size) -- that would silently
+    # train on nothing every epoch instead of crashing, which is worse.
+    # Never applied to validation (below): every held-out sample must
+    # still be scored, and model.eval()'s BatchNorm uses running stats,
+    # so a batch of 1 there is harmless anyway.
+    drop_last_train = safe_to_drop_last(len(train_dataset), cfg["batch_size"])
+    train_loader = DataLoader(
+        train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0, drop_last=drop_last_train
+    )
     val_loader = DataLoader(val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
 
     fine_tuning_strategy = cfg["fine_tuning_strategy"]
@@ -484,6 +508,21 @@ def main() -> None:
         f"{fine_tuning_summary['trainable_parameters']:,} trainable / "
         f"{fine_tuning_summary['frozen_parameters']:,} frozen"
     )
+
+    # Defense in depth: gotrain/tools/training.py already rejects a
+    # class_weights/n_classes length mismatch pre-flight when it can
+    # resolve n_classes cheaply; this catches the case where it couldn't
+    # (or this template was invoked directly, bypassing launch_training)
+    # with a clear, logged message and a clean exit instead of a bare
+    # RuntimeError surfacing from inside CrossEntropyLoss.
+    from gotrain.config_schema import ConfigValidationError, validate_class_weights
+
+    try:
+        validate_class_weights("segmentation", class_weights, n_classes)
+    except ConfigValidationError as e:
+        logger.error(str(e))
+        print(f"INVALID CONFIG: {e}", file=sys.stderr)
+        sys.exit(1)
 
     loss_fn = build_loss(cfg["loss"], n_classes, class_weights, cfg["focal_alpha"], cfg["focal_gamma"], device)
     optimizer = build_optimizer(cfg["optimizer"], trainable_parameters(model), cfg["lr"], cfg["weight_decay"])

@@ -16,12 +16,14 @@ from typing import Any, Optional
 from gotrain import approval, control, ledger, registry, status
 from gotrain.config_schema import (
     ConfigValidationError,
+    validate_class_weights,
     validate_config,
     validate_fine_tuning_strategy,
     validate_hypothesis,
 )
 from gotrain.dataiq import manifest as dataiq_manifest
 from gotrain.logging_utils import log_event
+from gotrain.tools import datasets as datasets_tools
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 TEMPLATES = {
@@ -77,6 +79,24 @@ def launch_training(
     validate_hypothesis(hypothesis, has_parent=parent_id is not None)
     approval.check_gate(dataset, task_type, config)
     dataiq_manifest.validate_manifest_exists(dataset, config.get("manifest_id"))
+
+    # class_weights has no enum to check in validate_config (it's a
+    # free-form list[float]) -- its one real invariant, length ==
+    # n_classes, was never checked anywhere, and a mismatch previously
+    # reached CrossEntropyLoss uncaught inside the subprocess (see
+    # validate_class_weights's docstring). Resolved cheaply here via the
+    # same dataset-metadata lookup get_dataset_info already does -- no
+    # torch, no subprocess. If n_classes can't be resolved this way (e.g.
+    # the dataset's data isn't downloaded yet), skip rather than block on
+    # an unrelated failure; the template's own defense-in-depth check
+    # still catches a real mismatch, just not for free.
+    class_weights = config.get("class_weights")
+    if class_weights is not None and task_type in ("classification", "segmentation"):
+        try:
+            n_classes = datasets_tools.get_dataset_info(dataset)["label_info"].get("n_classes")
+        except Exception:
+            n_classes = None
+        validate_class_weights(task_type, class_weights, n_classes)
 
     template_path = TEMPLATES[task_type]
     status.set_action("training", from_=parent_id or "agent", where=dataset)
