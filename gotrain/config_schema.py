@@ -16,9 +16,10 @@ keep working after this registry grows.
 TASK_TYPES = ["classification", "segmentation", "fake"]
 
 CLASSIFICATION_VALID_VALUES = {
-    "optimizer": ["adam", "sgd"],
+    "optimizer": ["adam", "sgd", "adamw"],
+    "scheduler": ["none", "cosine"],
     "augmentation": ["none", "basic", "strong"],
-    "backbone": ["resnet18"],
+    "backbone": ["resnet18", "resnet50", "efficientnet_b0", "convnext_tiny"],
 }
 
 SEGMENTATION_VALID_VALUES = {

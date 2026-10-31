@@ -40,6 +40,10 @@ DEFAULTS = {
     "epochs": 2,
     "optimizer": "adam",
     "weight_decay": 0.0,
+    "scheduler": "none",
+    "warmup_epochs": 0,
+    "label_smoothing": 0.0,
+    "image_size": None,
     "class_weights": None,
     "augmentation": "none",
     "bands": None,
@@ -48,6 +52,7 @@ DEFAULTS = {
     "seed": 0,
     "max_train_samples": None,
     "max_val_samples": None,
+    "tta": False,
 }
 
 BENCHMARK_DIRS = ["classification_v1.0", "segmentation_v1.0"]
@@ -143,13 +148,14 @@ def compute_class_frequencies(labels: np.ndarray, n_classes: int, logger):
 class ClassificationArrayDataset:
     """Thin torch Dataset over in-memory (N,H,W,C) images / (N,) labels."""
 
-    def __init__(self, images, labels, mean, std, augment: str, seed: int):
+    def __init__(self, images, labels, mean, std, augment: str, seed: int, image_size=None):
         self.images = images
         self.labels = labels
         self.mean = mean.astype(np.float32)
         self.std = std.astype(np.float32)
         self.augment = augment
         self.rng = random.Random(seed)
+        self.image_size = image_size
 
     def __len__(self):
         return len(self.images)
@@ -165,10 +171,20 @@ class ClassificationArrayDataset:
             k = self.rng.choice([0, 1, 2, 3])
             if k:
                 image = np.ascontiguousarray(np.rot90(image, k, axes=(0, 1)))
+            # Light Gaussian noise, scaled to each band's own std so it
+            # stays proportionate whether the band is int16 reflectance
+            # (m-eurosat) or already-small float32 SAR/optical (m-so2sat).
+            # Drawn from self.rng (not the numpy global RNG) so augmentation
+            # stays reproducible for a given seed.
+            noise = np.array(
+                [self.rng.gauss(0.0, 0.02) for _ in range(image.shape[-1])], dtype=np.float32
+            )
+            image = image + noise * self.std
         return image
 
     def __getitem__(self, idx):
         import torch
+        import torch.nn.functional as F
 
         image = self.images[idx]
         label = self.labels[idx]
@@ -176,8 +192,15 @@ class ClassificationArrayDataset:
 
         image = (image - self.mean) / self.std
         image = np.transpose(image, (2, 0, 1))  # HWC -> CHW
+        tensor = torch.from_numpy(image.copy()).float()
 
-        return torch.from_numpy(image.copy()).float(), torch.tensor(label, dtype=torch.long)
+        if self.image_size is not None:
+            tensor = F.interpolate(
+                tensor.unsqueeze(0), size=(self.image_size, self.image_size),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
+
+        return tensor, torch.tensor(label, dtype=torch.long)
 
 
 def build_model(backbone: str, pretrained: bool, in_chans: int, n_classes: int):
@@ -186,13 +209,13 @@ def build_model(backbone: str, pretrained: bool, in_chans: int, n_classes: int):
     return timm.create_model(backbone, pretrained=pretrained, in_chans=in_chans, num_classes=n_classes)
 
 
-def build_loss(n_classes: int, class_weights, device):
+def build_loss(n_classes: int, class_weights, label_smoothing: float, device):
     import torch
 
     weight_tensor = None
     if class_weights is not None:
         weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
-    return torch.nn.CrossEntropyLoss(weight=weight_tensor)
+    return torch.nn.CrossEntropyLoss(weight=weight_tensor, label_smoothing=label_smoothing)
 
 
 def build_optimizer(name: str, params, lr: float, weight_decay: float):
@@ -200,9 +223,59 @@ def build_optimizer(name: str, params, lr: float, weight_decay: float):
 
     if name == "adam":
         return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
     if name == "sgd":
         return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=0.9)
-    raise ValueError(f"optimizer must be 'adam' or 'sgd', got {name!r}")
+    raise ValueError(f"optimizer must be 'adam', 'adamw', or 'sgd', got {name!r}")
+
+
+def build_scheduler(name: str, optimizer, epochs: int, warmup_epochs: int):
+    """Returns None for "none", else a per-epoch scheduler (call .step()
+    once per epoch, after the epoch's training+validation).
+
+    "cosine" ramps the LR linearly from 10% to 100% over `warmup_epochs`,
+    then cosine-decays to ~0 over the remaining epochs. warmup_epochs=0
+    skips straight to cosine decay from epoch 0.
+    """
+    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+    if name == "none":
+        return None
+    if name != "cosine":
+        raise ValueError(f"scheduler must be 'none' or 'cosine', got {name!r}")
+
+    warmup_epochs = min(warmup_epochs, max(epochs - 1, 0))
+    if warmup_epochs <= 0:
+        return CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
+
+    warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+    cosine = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
+    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
+
+
+def predict_with_tta(model, images, device, amp_enabled, autocast):
+    """Average softmax probabilities over the identity image plus 3 flip/
+    rotation variants, then undo nothing (predictions are per-image class
+    scores, orientation-invariant by construction) and return the averaged
+    probabilities. Only used at validation (and only when cfg["tta"] is
+    true) — never changes what the model is trained on.
+    """
+    import torch
+
+    variants = [
+        images,
+        torch.flip(images, dims=[-1]),
+        torch.rot90(images, k=1, dims=[-2, -1]),
+        torch.rot90(images, k=2, dims=[-2, -1]),
+    ]
+    probs_sum = None
+    for variant in variants:
+        with autocast(device_type=device.type, enabled=amp_enabled):
+            logits = model(variant)
+        probs = torch.softmax(logits.float(), dim=1)
+        probs_sum = probs if probs_sum is None else probs_sum + probs
+    return probs_sum / len(variants)
 
 
 def compute_accuracy_metrics(pred: "np.ndarray", target: "np.ndarray", n_classes: int):
@@ -273,6 +346,15 @@ def main() -> None:
     logger.info(f"Bands ({n_bands}/{len(all_band_names)} used): {band_names}")
     logger.info(f"Image size: {task_specs.patch_size}, classes: {n_classes} ({task_specs.label_type.class_names})")
 
+    if dataset == "m-eurosat" and cfg["bands"]:
+        logger.warning(
+            "m-eurosat: geo-bench-1.0 stores incorrect band names/wavelengths for most "
+            "channels (pixel data is unaffected, but selecting by name returns the wrong "
+            "channel — see https://github.com/ServiceNow/geo-bench/issues/28). "
+            "A non-default `bands` config was given for m-eurosat; consider using all "
+            "bands (bands=null) instead."
+        )
+
     train_images, train_labels = build_dataset_arrays(
         task_specs, "train", band_names, cfg["max_train_samples"], logger
     )
@@ -287,9 +369,11 @@ def main() -> None:
     logger.info(f"Class weights used: {class_weights}")
 
     train_dataset = ClassificationArrayDataset(
-        train_images, train_labels, mean, std, cfg["augmentation"], cfg["seed"]
+        train_images, train_labels, mean, std, cfg["augmentation"], cfg["seed"], cfg["image_size"]
     )
-    val_dataset = ClassificationArrayDataset(val_images, val_labels, mean, std, "none", cfg["seed"])
+    val_dataset = ClassificationArrayDataset(
+        val_images, val_labels, mean, std, "none", cfg["seed"], cfg["image_size"]
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
@@ -310,8 +394,9 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: {cfg['backbone']} (pretrained={cfg['pretrained']}), {n_params:,} parameters")
 
-    loss_fn = build_loss(n_classes, class_weights, device)
+    loss_fn = build_loss(n_classes, class_weights, cfg["label_smoothing"], device)
     optimizer = build_optimizer(cfg["optimizer"], model.parameters(), cfg["lr"], cfg["weight_decay"])
+    scheduler = build_scheduler(cfg["scheduler"], optimizer, cfg["epochs"], cfg["warmup_epochs"])
     scaler = GradScaler(device="cuda", enabled=amp_enabled)
 
     best_val_acc = -1.0
@@ -357,8 +442,13 @@ def main() -> None:
             for images, labels in val_loader:
                 images = images.to(device)
                 try:
-                    with autocast(device_type=device.type, enabled=amp_enabled):
-                        logits = model(images)
+                    if cfg["tta"]:
+                        probs = predict_with_tta(model, images, device, amp_enabled, autocast)
+                        preds = probs.argmax(dim=1).cpu().numpy()
+                    else:
+                        with autocast(device_type=device.type, enabled=amp_enabled):
+                            logits = model(images)
+                        preds = logits.argmax(dim=1).cpu().numpy()
                 except (torch.OutOfMemoryError, RuntimeError) as e:
                     if not is_oom_error(e):
                         raise
@@ -369,13 +459,15 @@ def main() -> None:
                         file=sys.stderr,
                     )
                     sys.exit(1)
-                preds = logits.argmax(dim=1).cpu().numpy()
                 all_preds.append(preds)
                 all_targets.append(labels.numpy())
 
         all_preds = np.concatenate(all_preds, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
         accuracy, per_class_accuracy = compute_accuracy_metrics(all_preds, all_targets, n_classes)
+
+        if scheduler is not None:
+            scheduler.step()
 
         epoch_seconds = time.time() - epoch_start
         logger.info(

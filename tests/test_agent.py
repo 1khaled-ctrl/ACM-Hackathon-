@@ -141,18 +141,18 @@ def test_submit_final_model_rejects_mismatched_dataset(isolated_logs):
 
 
 def test_bad_config_rejection_does_not_count_against_max_runs(isolated_logs):
-    """A launch rejected for an unsupported config value (e.g. an optimizer
-    name the current trainer doesn't support) must not consume one of the
+    """A launch rejected for an unsupported config value (a nonsense
+    optimizer name the trainer doesn't support) must not consume one of the
     agent's max_runs — only a launch that actually attempts training should.
     """
     agent = agent_mod.build_agent("m-eurosat", max_runs=1, run_minutes=5, max_tool_calls=40)
 
     rejected = agent.tool.launch_training(
-        dataset="m-eurosat", task_type="classification", config={"optimizer": "adamw"}
+        dataset="m-eurosat", task_type="classification", config={"optimizer": "not-a-real-optimizer"}
     )
     assert rejected["status"] == "error"
     rejected_text = _tool_result_text(rejected)
-    assert "adamw" in rejected_text
+    assert "not-a-real-optimizer" in rejected_text
     # the error must name the valid values, not just say "invalid"
     assert "adam" in rejected_text and "sgd" in rejected_text
 
