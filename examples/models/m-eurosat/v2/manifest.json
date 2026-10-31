@@ -1,0 +1,6 @@
+{
+  "dataset": "m-eurosat",
+  "run_id": "281e4fce-9af2-4214-a16a-2d73a351fdbb",
+  "version": "v2",
+  "checkpoint": "model.pt"
+}

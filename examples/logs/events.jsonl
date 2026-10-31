@@ -1,0 +1,6 @@
+{"timestamp": "2026-10-31T11:57:07.767763+00:00", "event": "training_started", "dataset": "m-eurosat", "task_type": "classification", "config": {"epochs": 2, "max_train_samples": 100, "max_val_samples": 50, "batch_size": 16}}
+{"timestamp": "2026-10-31T11:57:26.131381+00:00", "event": "training_finished", "dataset": "m-eurosat", "run_id": "e70d2f1b-667a-4fee-ae6b-5813a206f7db", "val_metric": 0.34}
+{"timestamp": "2026-10-31T11:57:26.152406+00:00", "event": "training_started", "dataset": "m-eurosat", "task_type": "classification", "config": {"epochs": 2, "max_train_samples": 100, "max_val_samples": 50, "batch_size": 16, "optimizer": "adamw"}}
+{"timestamp": "2026-10-31T11:57:44.658454+00:00", "event": "training_finished", "dataset": "m-eurosat", "run_id": "281e4fce-9af2-4214-a16a-2d73a351fdbb", "val_metric": 0.34}
+{"timestamp": "2026-10-31T11:57:44.663595+00:00", "event": "decision_recorded", "run_id": "e70d2f1b-667a-4fee-ae6b-5813a206f7db", "decision": "kept", "rationale": "baseline run, reasonable starting accuracy"}
+{"timestamp": "2026-10-31T11:57:44.684186+00:00", "event": "decision_recorded", "run_id": "281e4fce-9af2-4214-a16a-2d73a351fdbb", "decision": "kept", "rationale": "switched to adamw"}

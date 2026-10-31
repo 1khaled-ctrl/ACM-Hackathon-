@@ -11,19 +11,19 @@ __pycache__/
 *.pth
 *.ckpt
 *.safetensors
-checkpoints/
-runs/
-models/
+/checkpoints/
+/runs/
+/models/
 
 # Data (downloaded, not tracked) — summary markdown is tracked deliberately
-data/*
-!data/dataset_summary.md
+/data/*
+!/data/dataset_summary.md
 
 # Runtime outputs (final logs are committed deliberately at the end)
-logs/status.json
-logs/ledger.jsonl
-logs/events.jsonl
-logs/test_lock_*.json
+/logs/status.json
+/logs/ledger.jsonl
+/logs/events.jsonl
+/logs/test_lock_*.json
 
 # Secrets
 .env

@@ -1,0 +1,27 @@
+2026-10-31 13:57:26,431 INFO Starting classification training run 7ab3c639-e5f4-4aa4-8822-485c01a44dc7 for dataset='m-eurosat'
+2026-10-31 13:57:26,432 INFO Config: {"backbone": "resnet18", "pretrained": true, "lr": 0.001, "batch_size": 16, "epochs": 2, "optimizer": "adamw", "weight_decay": 0.0, "scheduler": "none", "warmup_epochs": 0, "label_smoothing": 0.0, "image_size": null, "class_weights": null, "augmentation": "none", "bands": null, "amp": true, "time_budget_minutes": null, "seed": 0, "max_train_samples": 100, "max_val_samples": 50, "tta": false}
+2026-10-31 13:57:28,410 INFO AMP requested but no CUDA device is available — running in full precision.
+2026-10-31 13:57:28,410 INFO Device: cpu, AMP enabled: False
+2026-10-31 13:57:29,253 INFO Bands (13/13 used): ['01 - Coastal aerosol', '02 - Blue', '03 - Green', '04 - Red', '05 - Vegetation Red Edge', '06 - Vegetation Red Edge', '07 - Vegetation Red Edge', '08 - NIR', '08A - Vegetation Red Edge', '09 - Water vapour', '10 - SWIR - Cirrus', '11 - SWIR', '12 - SWIR']
+2026-10-31 13:57:29,253 INFO Image size: (64, 64), classes: 10 (['Industrial Buildings', 'Residential Buildings', 'Annual Crop', 'Permanent Crop', 'River', 'Sea and Lake', 'Herbaceous Vegetation', 'Highway', 'Pasture', 'Forest'])
+2026-10-31 13:57:29,538 INFO Loaded train split: 100 samples, images (100, 64, 64, 13), labels (100,)
+2026-10-31 13:57:29,850 INFO Loaded validation split: 50 samples, images (50, 64, 64, 13), labels (50,)
+2026-10-31 13:57:29,967 INFO TRAIN band stats — mean: [1316.0370581054688, 1077.8922119140625, 1019.51732421875, 892.2474389648437, 1183.0310766601563, 2101.93890625, 2508.02427734375, 2439.748557128906, 798.0826806640625, 12.0669677734375, 1813.4922534179686, 1086.1858056640624, 2751.9973950195313], std: [235.11378688711793, 306.6293183640914, 357.3989904663495, 556.4413848664319, 514.6706932768698, 860.8338340707872, 1105.2109970980753, 1136.2302916037622, 419.8628895373416, 4.3483549876474274, 925.9826376178005, 717.1723516290285, 1241.4723079304194]
+2026-10-31 13:57:29,971 INFO TRAIN class 0 frequency: 0.100000 (10 samples)
+2026-10-31 13:57:29,972 INFO TRAIN class 1 frequency: 0.120000 (12 samples)
+2026-10-31 13:57:29,972 INFO TRAIN class 2 frequency: 0.090000 (9 samples)
+2026-10-31 13:57:29,972 INFO TRAIN class 3 frequency: 0.090000 (9 samples)
+2026-10-31 13:57:29,972 INFO TRAIN class 4 frequency: 0.080000 (8 samples)
+2026-10-31 13:57:29,972 INFO TRAIN class 5 frequency: 0.130000 (13 samples)
+2026-10-31 13:57:29,973 INFO TRAIN class 6 frequency: 0.080000 (8 samples)
+2026-10-31 13:57:29,973 INFO TRAIN class 7 frequency: 0.100000 (10 samples)
+2026-10-31 13:57:29,973 INFO TRAIN class 8 frequency: 0.120000 (12 samples)
+2026-10-31 13:57:29,973 INFO TRAIN class 9 frequency: 0.090000 (9 samples)
+2026-10-31 13:57:29,973 INFO Class weights used: None
+2026-10-31 13:57:37,106 INFO Model: resnet18 (pretrained=True), 11,213,002 parameters
+2026-10-31 13:57:40,239 INFO Epoch 1/2 — train_loss=2.3446 val_accuracy=0.2400 per_class_accuracy=[0.16666666666666666, 0.5, 0.0, 0.0, 0.14285714285714285, 0.6666666666666666, 0.125, 0.5714285714285714, 0.5, 0.0] time=3.1s (split=validation)
+2026-10-31 13:57:40,320 INFO New best val_accuracy=0.2400 — checkpoint saved to C:\Users\User\Desktop\ACM - Hackathon\runs\m-eurosat\7ab3c639-e5f4-4aa4-8822-485c01a44dc7\best_model.pt
+2026-10-31 13:57:43,448 INFO Epoch 2/2 — train_loss=1.9829 val_accuracy=0.3400 per_class_accuracy=[0.3333333333333333, 0.25, 0.0, 0.0, 0.7142857142857143, 0.6666666666666666, 0.0, 0.2857142857142857, 0.5, 1.0] time=3.1s (split=validation)
+2026-10-31 13:57:43,523 INFO New best val_accuracy=0.3400 — checkpoint saved to C:\Users\User\Desktop\ACM - Hackathon\runs\m-eurosat\7ab3c639-e5f4-4aa4-8822-485c01a44dc7\best_model.pt
+2026-10-31 13:57:43,524 INFO Run finished in 6.4s. Best val_accuracy=0.3400
+2026-10-31 13:57:43,524 INFO FINAL_VAL_METRIC: 0.34

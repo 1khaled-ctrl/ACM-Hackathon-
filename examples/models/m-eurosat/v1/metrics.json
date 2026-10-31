@@ -1,0 +1,56 @@
+{
+  "run_id": "552f21b6-48bd-4769-8ea1-a00f649cbfa1",
+  "dataset": "m-eurosat",
+  "device": "cpu",
+  "amp_enabled": false,
+  "n_params": 11213002,
+  "n_bands": 13,
+  "band_names": [
+    "01 - Coastal aerosol",
+    "02 - Blue",
+    "03 - Green",
+    "04 - Red",
+    "05 - Vegetation Red Edge",
+    "06 - Vegetation Red Edge",
+    "07 - Vegetation Red Edge",
+    "08 - NIR",
+    "08A - Vegetation Red Edge",
+    "09 - Water vapour",
+    "10 - SWIR - Cirrus",
+    "11 - SWIR",
+    "12 - SWIR"
+  ],
+  "n_classes": 10,
+  "class_frequencies": [
+    0.1,
+    0.12,
+    0.09,
+    0.09,
+    0.08,
+    0.13,
+    0.08,
+    0.1,
+    0.12,
+    0.09
+  ],
+  "best": {
+    "epoch": 2,
+    "val_accuracy": 0.34,
+    "val_per_class_accuracy": [
+      0.3333333333333333,
+      0.25,
+      0.0,
+      0.0,
+      0.7142857142857143,
+      0.6666666666666666,
+      0.0,
+      0.2857142857142857,
+      0.5,
+      1.0
+    ],
+    "train_loss": 1.9828673771449499
+  },
+  "final_val_metric": 0.34,
+  "split_used": "validation",
+  "total_train_seconds": 6.040432929992676
+}

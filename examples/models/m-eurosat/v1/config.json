@@ -1,0 +1,22 @@
+{
+  "backbone": "resnet18",
+  "pretrained": true,
+  "lr": 0.001,
+  "batch_size": 16,
+  "epochs": 2,
+  "optimizer": "adam",
+  "weight_decay": 0.0,
+  "scheduler": "none",
+  "warmup_epochs": 0,
+  "label_smoothing": 0.0,
+  "image_size": null,
+  "class_weights": null,
+  "augmentation": "none",
+  "bands": null,
+  "amp": true,
+  "time_budget_minutes": null,
+  "seed": 0,
+  "max_train_samples": 100,
+  "max_val_samples": 50,
+  "tta": false
+}

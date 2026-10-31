@@ -1,0 +1,12 @@
+{
+  "action": "training",
+  "from": "e70d2f1b-667a-4fee-ae6b-5813a206f7db",
+  "where": "m-eurosat",
+  "updated_at": "2026-10-31T11:57:44.654695+00:00",
+  "best_so_far": {
+    "run_id": "e70d2f1b-667a-4fee-ae6b-5813a206f7db",
+    "dataset": "m-eurosat",
+    "val_metric": 0.34
+  },
+  "last_event": "training finished for m-eurosat: run 281e4fce-9af2-4214-a16a-2d73a351fdbb"
+}
