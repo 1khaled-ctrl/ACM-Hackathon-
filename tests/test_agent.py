@@ -57,6 +57,34 @@ def test_all_tools_module_excludes_final_test_eval():
     assert "final_test_eval" not in [t.tool_name for t in agent_mod.ALL_TOOLS]
 
 
+def test_system_prompt_is_cp1252_safe():
+    """run_gotrain.py --dry-run prints the system prompt via plain print(),
+    which on Windows defaults to the cp1252 console codepage — a character
+    outside that codepage (e.g. a Unicode arrow) crashes with
+    UnicodeEncodeError instead of printing. Caught this exact bug once
+    already (an arrow in the "suggested strategy" section); this guards
+    against it coming back.
+    """
+    prompt = agent_mod.load_system_prompt()
+    try:
+        prompt.encode("cp1252")
+    except UnicodeEncodeError as e:
+        raise AssertionError(
+            f"system_prompt.md contains a character not safe for Windows' "
+            f"default console codepage (cp1252): {e}"
+        )
+
+
+def test_system_prompt_mentions_dataset_search_space():
+    """Block 4: the prompt must name the valid config values and the
+    maximize-validation-score goal for the agent to plan with."""
+    prompt = agent_mod.load_system_prompt()
+    assert "maximize" in prompt.lower()
+    for dataset in ["m-eurosat", "m-so2sat", "m-pv4ger-seg", "m-nz-cattle"]:
+        assert dataset in prompt
+    assert "do not select bands by name on m-eurosat" in prompt.lower()
+
+
 def test_max_tool_calls_enforced(isolated_logs):
     agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=2)
 
