@@ -110,6 +110,33 @@ def validate_fine_tuning_strategy(task_type: str, config: dict) -> None:
         )
 
 
+def validate_class_weights(task_type: str, class_weights: Optional[list], n_classes: Optional[int]) -> None:
+    """`class_weights` has no enum to check against validate_config (it's a
+    free-form list[float]), so its one real invariant -- length must equal
+    the dataset's actual class count -- was never checked anywhere before
+    this. A length mismatch previously reached
+    torch.nn.CrossEntropyLoss(weight=...) uncaught (build_loss isn't
+    wrapped in either template's OOM try/except), surfacing as a bare,
+    confusing RuntimeError deep in a training subprocess that had already
+    spent run budget getting there. Rejected here instead, before any
+    subprocess is spawned.
+
+    `n_classes=None` (the dataset's class count genuinely couldn't be
+    resolved pre-flight) is allowed through un-checked -- there's nothing
+    to validate against, and the template's own defense-in-depth check
+    will still catch a real mismatch with a clear message instead of a
+    cryptic one.
+    """
+    if class_weights is None or n_classes is None:
+        return
+    if len(class_weights) != n_classes:
+        raise ConfigValidationError(
+            task_type, "class_weights", class_weights,
+            [f"must have exactly {n_classes} entries (one per class) for this dataset, "
+             f"got {len(class_weights)}"],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Structured experiment hypotheses (see the system prompt's workflow step 3
 # and gotrain/ledger.py's hypothesis_outcome computation). Every

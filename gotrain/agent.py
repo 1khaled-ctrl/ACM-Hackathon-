@@ -27,6 +27,7 @@ from strands.hooks import AfterToolCallEvent, BeforeToolCallEvent, HookRegistry
 from gotrain import config, control, ledger, status
 from gotrain.config_schema import PreflightValidationError
 from gotrain.logging_utils import log_event
+from gotrain.tools import adaptation as adaptation_tools
 from gotrain.tools import dataiq as dataiq_tools
 from gotrain.tools import datasets as datasets_tools
 from gotrain.tools import experiment_planner as experiment_planner_tools
@@ -373,6 +374,36 @@ def record_decision(run_id: str, decision: str, rationale: str) -> dict:
 
 
 @tool
+def record_adaptation(dataset: str, rejected_proposal: str, new_plan: str, rationale: str) -> dict:
+    """Call this immediately whenever a proposal of yours gets rejected or
+    blocked -- an approval-gated backbone/architecture/encoder value that
+    came back pending/rejected, or a data-quality exclusion with no
+    approved decision yet. State clearly what was rejected, what you're
+    trying instead, and why, BEFORE you actually try the alternative. This
+    is not optional bookkeeping: it is what makes "autonomous but
+    accountable" visible rather than just claimed -- without it, a
+    rejection just silently turns into a different launch_training call
+    and nobody watching can tell the two are connected.
+
+    Do not call this for an ordinary single-variable experiment that
+    simply didn't improve on its parent -- that's what `record_decision`
+    is for. This is specifically for the moment a proposal was blocked by
+    governance (approval gate, unapproved manifest), not for a run that
+    completed but scored worse.
+
+    Args:
+        dataset: the dataset this adaptation applies to.
+        rejected_proposal: one sentence naming exactly what was
+            rejected/blocked (e.g. "backbone=resnet50, rejected for GPU
+            budget limits").
+        new_plan: one sentence naming what you're doing instead.
+        rationale: why this alternative is a reasonable substitute, not
+            just "trying something else."
+    """
+    return adaptation_tools.record_adaptation(dataset, rejected_proposal, new_plan, rationale)
+
+
+@tool
 def submit_final_model(dataset: str, run_id: str) -> dict:
     """Submit your final chosen model for this dataset. This only RECORDS
     your choice in the ledger — it does not evaluate anything and does not
@@ -457,6 +488,7 @@ ALL_TOOLS = [
     query_history,
     compare_runs,
     record_decision,
+    record_adaptation,
     submit_final_model,
     upload_to_s3,
     download_from_s3,

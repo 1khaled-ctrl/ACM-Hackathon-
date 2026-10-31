@@ -108,6 +108,13 @@ def is_oom_error(exc: BaseException) -> bool:
     return "out of memory" in message or "not enough memory" in message
 
 
+def safe_to_drop_last(n_samples: int, batch_size: int) -> bool:
+    """True if DataLoader(..., drop_last=True) is safe for TRAIN -- see
+    train_segmentation.py's identical helper for the full rationale.
+    """
+    return n_samples >= batch_size
+
+
 def find_task_dir(dataset: str):
     import geobench
 
@@ -440,7 +447,14 @@ def main() -> None:
         val_images, val_labels, mean, std, "none", cfg["seed"], cfg["image_size"]
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0)
+    # drop_last=True on TRAIN only -- see train_segmentation.py's
+    # identical guard for the full rationale (an unguarded last batch of
+    # exactly 1 sample crashes BatchNorm; dropping it is only safe when
+    # it isn't the epoch's only batch).
+    drop_last_train = safe_to_drop_last(len(train_dataset), cfg["batch_size"])
+    train_loader = DataLoader(
+        train_dataset, batch_size=cfg["batch_size"], shuffle=True, num_workers=0, drop_last=drop_last_train
+    )
     val_loader = DataLoader(val_dataset, batch_size=cfg["batch_size"], shuffle=False, num_workers=0)
 
     fine_tuning_strategy = cfg["fine_tuning_strategy"]
@@ -474,6 +488,20 @@ def main() -> None:
         f"{fine_tuning_summary['trainable_parameters']:,} trainable / "
         f"{fine_tuning_summary['frozen_parameters']:,} frozen"
     )
+
+    # Defense in depth -- see train_segmentation.py's identical check for
+    # the full rationale (gotrain/tools/training.py already rejects this
+    # pre-flight when it can; this catches direct template invocation or
+    # an unresolvable n_classes with a clear message instead of a bare
+    # RuntimeError inside CrossEntropyLoss).
+    from gotrain.config_schema import ConfigValidationError, validate_class_weights
+
+    try:
+        validate_class_weights("classification", class_weights, n_classes)
+    except ConfigValidationError as e:
+        logger.error(str(e))
+        print(f"INVALID CONFIG: {e}", file=sys.stderr)
+        sys.exit(1)
 
     loss_fn = build_loss(n_classes, class_weights, cfg["label_smoothing"], device)
     optimizer = build_optimizer(cfg["optimizer"], trainable_parameters(model), cfg["lr"], cfg["weight_decay"])

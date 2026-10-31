@@ -22,6 +22,7 @@ from gotrain.tools.pretrained import (
     validate_model_compatibility,
 )
 from gotrain.tools.experiment_planner import get_training_diagnostics, recommend_experiments
+from gotrain.tools.adaptation import record_adaptation
 
 __all__ = [
     "list_datasets",
@@ -46,4 +47,5 @@ __all__ = [
     "validate_model_compatibility",
     "get_training_diagnostics",
     "recommend_experiments",
+    "record_adaptation",
 ]
