@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
-  AlertTriangle, Check, Hand, Pause, Play, RotateCcw, Square, Undo2, X,
+  AlertTriangle, Check, Hand, OctagonX, Pause, Play, RotateCcw, Undo2, X,
 } from 'lucide-react'
 import { Badge, Button, Panel, PanelTitle, cn } from './ui'
 
@@ -152,7 +152,7 @@ export function MissionControl({ snap, post, notify, datasets }) {
               />
             ) : (
               <Button variant="danger" disabled={busy} onClick={() => setConfirmStop(true)}>
-                <Square className="h-4 w-4" /> Stop Mission
+                <OctagonX className="h-4 w-4" /> Stop Mission
               </Button>
             )}
           </div>

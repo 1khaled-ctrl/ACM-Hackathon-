@@ -50,6 +50,12 @@ AGENT_LOG_PATH = LOGS_DIR / "agent.log"
 app = FastAPI(title="GoTrain NEXUS")
 
 
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Log readers. Every number the UI shows originates here.
 # ---------------------------------------------------------------------------
@@ -319,6 +325,29 @@ def api_agent_start(req: StartRequest) -> dict:
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
     AGENT_PID_PATH.write_text(str(proc.pid), encoding="utf-8")
+
+    # Mark the moment this launch was requested. run_gotrain.py's own
+    # startup (import Strands, build the Bedrock model, first tool call)
+    # takes several seconds -- during that window events.jsonl's most
+    # recent entries are still whatever the PREVIOUS session left behind
+    # (which can include "final_model_submitted" if it completed). Without
+    # this marker the UI has no way to tell "stale tail of an old session"
+    # apart from "the new session already did something", which reads as
+    # the agent finishing instantly. The frontend greys out/labels events
+    # older than launched_at as "before this launch".
+    from gotrain.logging_utils import write_status
+
+    # Also clear current_run here, not just rely on gotrain/tools/training.py
+    # clearing it when a launch_training subprocess exits -- if the agent
+    # itself dies before ever reaching launch_training (e.g. it can't
+    # construct the Bedrock model), that clearing code never runs, and a
+    # NEW session would otherwise inherit a PREVIOUS session's leftover
+    # "epoch 7/10" numbers with nothing to say they're stale.
+    write_status(
+        launch={"dataset": req.dataset, "pid": proc.pid, "launched_at": _now_iso()},
+        current_run=None,
+    )
+
     return {"ok": True, "pid": proc.pid, "dataset": req.dataset, "cmd": cmd}
 
 

@@ -112,6 +112,17 @@ export default function App() {
 
   const epochPct = run.epochs ? (run.epoch || 0) / run.epochs : 0
 
+  // Set by POST /api/agent/start the instant a launch is requested --
+  // before the new subprocess has done anything. Used to tell "stale tail
+  // of the previous session" apart from events the agent just produced,
+  // and to show a clear "launching" state instead of looking frozen or
+  // (worse) looking like it finished instantly on leftover data.
+  const launch = snap?.status?.launch
+  const newestEventTimestamp = snap?.events?.[0]?.timestamp
+  const launchPendingFirstEvent =
+    snap?.agent_running && launch?.launched_at &&
+    (!newestEventTimestamp || newestEventTimestamp < launch.launched_at)
+
   return (
     <div className="min-h-screen font-sans text-slate-200">
       <Backdrop />
@@ -149,11 +160,17 @@ export default function App() {
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
           <Panel className="lg:col-span-8">
             <PanelTitle
-              right={run.run_id ? <Badge tone="green" pulse>training</Badge> : <Badge>idle</Badge>}
+              right={
+                launchPendingFirstEvent
+                  ? <Badge tone="sky" pulse>launching</Badge>
+                  : run.run_id ? <Badge tone="green" pulse>training</Badge> : <Badge>idle</Badge>
+              }
             >
               Current Run
             </PanelTitle>
-            {run.run_id ? (
+            {launchPendingFirstEvent ? (
+              <LaunchingNotice dataset={launch?.dataset} />
+            ) : run.run_id ? (
               <div className="grid grid-cols-2 divide-x divide-y divide-edge/50 sm:grid-cols-3 lg:grid-cols-4">
                 <Stat label="Dataset" value={run.dataset || '--'} sub={run.task_type} />
                 <Stat label="Model" value={run.model || '--'} sub={run.optimizer} />
@@ -242,25 +259,46 @@ export default function App() {
               Agent Decision Feed
             </PanelTitle>
             <div className="max-h-[22rem] divide-y divide-edge/40 overflow-y-auto">
+              {launchPendingFirstEvent && (
+                <div className="flex items-center gap-2 bg-sky-500/10 px-4 py-2.5">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
+                  <span className="font-mono text-[0.68rem] text-sky-200">
+                    Launching mission on {launch.dataset} — waiting for the agent's first action…
+                  </span>
+                </div>
+              )}
               <AnimatePresence initial={false}>
-                {(snap?.events || []).map((ev, i) => (
-                  <motion.div
-                    key={`${ev.timestamp}-${i}`}
-                    initial={{ opacity: 0, x: -8 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    className="px-4 py-2"
-                  >
-                    <div className="flex items-baseline justify-between gap-2">
-                      <span className="font-mono text-[0.68rem] font-semibold text-emerald-300">
-                        {ev.event}
-                      </span>
-                      <span className="shrink-0 font-mono text-[0.58rem] text-slate-600">
-                        {(ev.timestamp || '').slice(11, 19)}
-                      </span>
-                    </div>
-                    <EventDetail ev={ev} />
-                  </motion.div>
-                ))}
+                {(snap?.events || []).map((ev, i) => {
+                  // An event older than the most recent launch is left
+                  // over from a PREVIOUS session -- dim it and label it,
+                  // rather than letting it read as something the agent
+                  // just did (e.g. a stale "final_model_submitted" sitting
+                  // at the top while the new session is still starting up).
+                  const isStale = launch?.launched_at && ev.timestamp < launch.launched_at
+                  return (
+                    <motion.div
+                      key={`${ev.timestamp}-${i}`}
+                      initial={{ opacity: 0, x: -8 }}
+                      animate={{ opacity: isStale ? 0.45 : 1, x: 0 }}
+                      className="px-4 py-2"
+                    >
+                      <div className="flex items-baseline justify-between gap-2">
+                        <span className="font-mono text-[0.68rem] font-semibold text-emerald-300">
+                          {ev.event}
+                          {isStale && (
+                            <span className="ml-2 font-mono text-[0.56rem] font-normal uppercase tracking-wider text-slate-500">
+                              before this launch
+                            </span>
+                          )}
+                        </span>
+                        <span className="shrink-0 font-mono text-[0.58rem] text-slate-600">
+                          {(ev.timestamp || '').slice(11, 19)}
+                        </span>
+                      </div>
+                      <EventDetail ev={ev} />
+                    </motion.div>
+                  )
+                })}
               </AnimatePresence>
               {!snap?.events?.length && <Empty>no events logged yet</Empty>}
             </div>
@@ -346,6 +384,26 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+    </div>
+  )
+}
+
+/** Shown in the gap between clicking Start and the new subprocess's first
+ *  real action -- without this, this panel would otherwise show whichever
+ *  comes first: leftover numbers from the previous session's last run, or
+ *  a premature "no mission running" (IdleNotice) even though agent_running
+ *  just flipped true. Several seconds genuinely pass here (import Strands,
+ *  build the Bedrock model, first tool call) -- this is not an error state. */
+function LaunchingNotice({ dataset }) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-2 px-4 py-10 text-center">
+      <Satellite className="h-6 w-6 animate-pulse text-sky-400" />
+      <div className="font-mono text-xs uppercase tracking-[0.15em] text-sky-300">
+        Launching on {dataset || 'dataset'}…
+      </div>
+      <div className="font-mono text-[0.62rem] text-slate-600">
+        starting the agent process — this takes a few seconds, not an error
+      </div>
     </div>
   )
 }
