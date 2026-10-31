@@ -40,6 +40,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from gotrain import control, ledger
+from gotrain import history as history_mod
 from gotrain.logging_utils import EVENTS_PATH, LIVE_METRICS_PATH, LOGS_DIR
 from gotrain.status import get_status
 
@@ -128,7 +129,41 @@ def agent_process_alive() -> bool:
         return False
 
 
+def reconcile_open_session() -> None:
+    """Close out a mission-history session whose process is gone.
+
+    Nothing watches for the agent subprocess exiting -- run_gotrain.py
+    can't reliably close its own record (it may be killed outright), and
+    there is no supervisor. build_snapshot() already runs about once a
+    second for the WebSocket, so this piggybacks on that as the place
+    where "the process that owned this session is no longer alive" is
+    noticed. Best-effort: history bookkeeping must never be able to
+    break the live snapshot the dashboard depends on.
+    """
+    try:
+        if agent_process_alive():
+            return
+        session = history_mod.get_open_session()
+        if not session:
+            return
+        # Infer how it ended from the control plane: COMPLETED means the
+        # agent submitted a final model; FAILED_SAFE means a verification
+        # step failed; anything else means the process went away without
+        # finishing (killed via Stop, crashed on startup, etc.).
+        state = control.get_state()
+        if state == control.COMPLETED:
+            status = history_mod.COMPLETED
+        elif state == control.FAILED_SAFE:
+            status = history_mod.FAILED
+        else:
+            status = history_mod.STOPPED
+        history_mod.finish_session(session["session_id"], status=status, ended_in_state=state)
+    except Exception:
+        pass
+
+
 def build_snapshot() -> dict:
+    reconcile_open_session()
     status_data = get_status()
     current_run = status_data.get("current_run") or {}
     try:
@@ -343,8 +378,25 @@ def api_agent_start(req: StartRequest) -> dict:
     # construct the Bedrock model), that clearing code never runs, and a
     # NEW session would otherwise inherit a PREVIOUS session's leftover
     # "epoch 7/10" numbers with nothing to say they're stale.
+    # Open a mission-history record for this launch (gotrain/history.py).
+    # Written here rather than inside run_gotrain.py so that a subprocess
+    # which dies during startup still leaves a visible record of having
+    # been attempted, instead of vanishing with no trace in the UI.
+    session = history_mod.start_session(
+        dataset=req.dataset,
+        max_runs=req.max_runs,
+        run_minutes=req.run_minutes,
+        max_tool_calls=req.max_tool_calls,
+        pid=proc.pid,
+    )
+
     write_status(
-        launch={"dataset": req.dataset, "pid": proc.pid, "launched_at": _now_iso()},
+        launch={
+            "dataset": req.dataset,
+            "pid": proc.pid,
+            "launched_at": _now_iso(),
+            "session_id": session["session_id"],
+        },
         current_run=None,
     )
 
@@ -381,6 +433,25 @@ def api_agent_stop() -> dict:
     except OSError:
         pass
     return {"ok": True, "stopped_pid": pid}
+
+
+@app.get("/api/history")
+def api_history(limit: int = 50) -> dict:
+    """Every mission launched from the dashboard, newest first, with
+    summary metrics derived from the ledger (see gotrain/history.py).
+    """
+    return {"sessions": history_mod.list_sessions(limit=limit)}
+
+
+@app.get("/api/history/{session_id}")
+def api_history_detail(session_id: str) -> dict:
+    """One mission in full: summary plus the runs, per-epoch curves and
+    events that fall inside its time window.
+    """
+    record = history_mod.load_session(session_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"no session {session_id!r}")
+    return record
 
 
 @app.get("/api/agent/log")

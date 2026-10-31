@@ -28,6 +28,7 @@ __pycache__/
 /logs/live_metrics.jsonl
 /logs/approvals_state.json
 /logs/approvals.jsonl
+/logs/history/
 
 # Secrets
 .env

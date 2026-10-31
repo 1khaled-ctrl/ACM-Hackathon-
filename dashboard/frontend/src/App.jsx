@@ -9,6 +9,7 @@ import {
 } from 'recharts'
 
 import { Wordmark } from './components/Logo'
+import { HistoryButton, HistoryOverlay } from './components/History'
 import { Launcher } from './components/Launcher'
 import { MissionControl } from './components/MissionControl'
 import { Pipeline } from './components/Pipeline'
@@ -50,6 +51,7 @@ export default function App() {
   // 'stats' = the per-epoch numbers; 'curves' = both live charts in the
   // same panel, so they're reachable above the fold without scrolling.
   const [runView, setRunView] = useState('stats')
+  const [historyOpen, setHistoryOpen] = useState(false)
   const wsRef = useRef(null)
 
   // Live socket, with auto-reconnect so a server restart heals itself.
@@ -143,9 +145,12 @@ export default function App() {
             <Badge tone={snap?.agent_running ? 'sky' : 'slate'}>
               agent {snap?.agent_running ? 'up' : 'down'}
             </Badge>
+            <HistoryButton onClick={() => setHistoryOpen(true)} />
           </div>
         </div>
       </header>
+
+      <HistoryOverlay open={historyOpen} onClose={() => setHistoryOpen(false)} />
 
       <main className="mx-auto max-w-[1600px] space-y-4 px-6 pb-3 pt-5">
         <Pipeline snapshot={snap} />
