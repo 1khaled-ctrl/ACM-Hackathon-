@@ -28,6 +28,7 @@ from gotrain import config, ledger, status
 from gotrain.config_schema import ConfigValidationError
 from gotrain.logging_utils import log_event
 from gotrain.tools import datasets as datasets_tools
+from gotrain.tools import s3 as s3_tools
 from gotrain.tools import training as training_tools
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -183,6 +184,33 @@ def submit_final_model(dataset: str, run_id: str) -> dict:
     return updated
 
 
+@tool
+def upload_to_s3(dataset: str, version: str) -> dict:
+    """Upload a registered model version's files to S3, if an S3 bucket is
+    configured for this environment. Returns {"status": "skipped", ...} if
+    no bucket is configured (e.g. running locally without AWS access) —
+    this is not an error, just means there's nowhere to upload to right now.
+
+    Args:
+        dataset: the dataset the model version belongs to.
+        version: the version id (e.g. "v1") from a run's ledger record.
+    """
+    return s3_tools.upload_to_s3(dataset, version)
+
+
+@tool
+def download_from_s3(dataset: str, version: str) -> dict:
+    """Download a model version's files from S3 into the local model
+    registry, if an S3 bucket is configured. Returns {"status": "skipped",
+    ...} if no bucket is configured.
+
+    Args:
+        dataset: the dataset the model version belongs to.
+        version: the version id (e.g. "v1") to download.
+    """
+    return s3_tools.download_from_s3(dataset, version)
+
+
 ALL_TOOLS = [
     list_datasets,
     get_dataset_info,
@@ -193,6 +221,8 @@ ALL_TOOLS = [
     compare_runs,
     record_decision,
     submit_final_model,
+    upload_to_s3,
+    download_from_s3,
 ]
 
 

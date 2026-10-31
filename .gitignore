@@ -13,6 +13,7 @@ __pycache__/
 *.safetensors
 checkpoints/
 runs/
+models/
 
 # Data (downloaded, not tracked) — summary markdown is tracked deliberately
 data/*

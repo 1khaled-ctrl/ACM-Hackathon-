@@ -79,6 +79,7 @@ def add_run(
     split_used: str = "validation",
     run_id: Optional[str] = None,
     task_type: Optional[str] = None,
+    version_id: Optional[str] = None,
 ) -> dict:
     """Append a new run record to the ledger and return it.
 
@@ -112,6 +113,7 @@ def add_run(
         "parent_id": parent_id,
         "dataset": dataset,
         "task_type": task_type,
+        "version_id": version_id,
         "config": config,
         "config_diff": _diff_config(config, parent["config"] if parent else None),
         "val_metric": val_metric,

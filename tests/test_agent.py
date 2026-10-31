@@ -48,7 +48,7 @@ def test_agent_tool_list_excludes_final_test_eval(isolated_logs):
     for name in [
         "list_datasets", "get_dataset_info", "launch_training", "get_run_status",
         "get_run_metrics", "query_history", "compare_runs", "record_decision",
-        "submit_final_model",
+        "submit_final_model", "upload_to_s3", "download_from_s3",
     ]:
         assert name in agent.tool_names
 

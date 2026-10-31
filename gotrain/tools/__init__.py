@@ -8,6 +8,7 @@ from gotrain.tools.training import (
     record_decision,
 )
 from gotrain.tools.final_eval import final_test_eval, TestAlreadyEvaluatedError
+from gotrain.tools.s3 import upload_to_s3, download_from_s3
 
 __all__ = [
     "list_datasets",
@@ -20,4 +21,6 @@ __all__ = [
     "record_decision",
     "final_test_eval",
     "TestAlreadyEvaluatedError",
+    "upload_to_s3",
+    "download_from_s3",
 ]

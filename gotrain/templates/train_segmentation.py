@@ -513,6 +513,8 @@ def main() -> None:
         "val_metric": final_val_metric,
         "gpu_minutes": gpu_minutes,
         "rationale": f"best val_mean_iou={final_val_metric:.4f} at epoch {best_metrics['epoch']} (run_dir={run_dir})",
+        "run_dir": str(run_dir),
+        "checkpoint_path": str(best_checkpoint_path),
     }))
 
 

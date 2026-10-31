@@ -9,10 +9,11 @@ the one exception, gated by a lock file.
 
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from gotrain import ledger, status
+from gotrain import ledger, registry, status
 from gotrain.config_schema import ConfigValidationError, validate_config
 from gotrain.logging_utils import log_event
 
@@ -86,6 +87,25 @@ def launch_training(
     result = json.loads(proc.stdout.strip().splitlines()[-1])
     val_metric = result["val_metric"]
 
+    # The ledger's run_id is generated here (rather than inside
+    # ledger.add_run) so the same id can be stamped into the registry
+    # manifest below, before the ledger record itself exists.
+    ledger_run_id = str(uuid.uuid4())
+
+    # Promote the run's config/metrics/checkpoint into the versioned model
+    # registry (models/<dataset>/<version>/) when the template reported a
+    # run_dir — fake_train.py doesn't produce real artifacts, so there's
+    # nothing to register for task_type="fake".
+    version_id = None
+    run_dir = result.get("run_dir")
+    if run_dir is not None:
+        version_id = registry.register_run(
+            dataset=dataset,
+            run_id=ledger_run_id,
+            run_dir=run_dir,
+            checkpoint_path=result.get("checkpoint_path"),
+        )
+
     record = ledger.add_run(
         dataset=dataset,
         config=config,
@@ -96,6 +116,8 @@ def launch_training(
         rationale=result.get("rationale"),
         split_used="validation",
         task_type=task_type,
+        version_id=version_id,
+        run_id=ledger_run_id,
     )
 
     best = ledger.get_best(dataset)
