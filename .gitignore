@@ -23,6 +23,7 @@ __pycache__/
 /logs/status.json
 /logs/ledger.jsonl
 /logs/events.jsonl
+/logs/control.json
 /logs/test_lock_*.json
 
 # Secrets

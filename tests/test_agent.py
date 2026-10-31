@@ -204,7 +204,16 @@ def test_missing_hypothesis_rejection_does_not_count_against_max_runs(isolated_l
     rejected before any subprocess runs, and — like a bad config value —
     must not consume one of the agent's max_runs.
     """
-    agent = agent_mod.build_agent("m-eurosat", max_runs=1, run_minutes=5, max_tool_calls=40)
+    # max_runs=2: one slot for the real baseline run, one for the real
+    # follow-up run at the end. If the hypothesis-less call in between
+    # consumed a slot, the run budget would already read 2 before that
+    # follow-up and the test below would hit "run budget exhausted"
+    # instead of "run budget exhausted" against a HIGHER-than-expected
+    # count — max_runs=1 can't distinguish "blocked by missing hypothesis"
+    # from "blocked by the run budget already spent by the first call",
+    # since the budget check in the hook fires before launch_training's
+    # body (where hypothesis validation lives) ever runs.
+    agent = agent_mod.build_agent("m-eurosat", max_runs=2, run_minutes=5, max_tool_calls=40)
 
     first = agent.tool.launch_training(dataset="m-eurosat", task_type="fake", config={"lr": 0.01})
     run_id = json.loads(_tool_result_text(first))["run_id"]
@@ -215,18 +224,25 @@ def test_missing_hypothesis_rejection_does_not_count_against_max_runs(isolated_l
     assert rejected["status"] == "error"
     assert "hypothesis" in _tool_result_text(rejected).lower()
 
-    # max_runs=1 was already spent by the first (real) run -- the budget
-    # message should fire for a THIRD call, proving the rejected second
-    # call above didn't silently consume the budget itself.
-    third = agent.tool.launch_training(
+    # The rejected call above must not have consumed a run slot: this
+    # second REAL run should still succeed (max_runs=2, only 1 spent so far).
+    second = agent.tool.launch_training(
         dataset="m-eurosat", task_type="fake", config={"lr": 0.002}, parent_id=run_id,
+        hypothesis={"change": "lowered lr again", "why": "testing", "expected_direction": "increase"},
+    )
+    assert second["status"] == "success"
+
+    # Now the run budget (2) is genuinely spent -- a third real attempt
+    # must be blocked by the budget, not by the hypothesis check.
+    third = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="fake", config={"lr": 0.003}, parent_id=run_id,
         hypothesis={"change": "lowered lr again", "why": "testing", "expected_direction": "increase"},
     )
     assert third["status"] == "error"
     assert "run budget exhausted" in _tool_result_text(third).lower()
 
     history = agent.tool.query_history(dataset="m-eurosat")
-    assert len(json.loads(_tool_result_text(history))) == 1
+    assert len(json.loads(_tool_result_text(history))) == 2
 
 
 def test_control_plane_blocks_every_tool_call_while_paused(isolated_logs):
