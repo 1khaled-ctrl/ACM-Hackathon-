@@ -28,6 +28,7 @@ def launch_training(
     task_type: str,
     config: dict,
     parent_id: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> dict:
     """Run a training template synchronously and record the result in the ledger.
 
@@ -35,6 +36,9 @@ def launch_training(
     The template is expected to print a single JSON line to stdout with at
     least a "val_metric" key (and anything else it wants recorded), having
     trained on the train split and evaluated on the validation split only.
+
+    `timeout_seconds`, if given, kills the training subprocess once exceeded
+    and raises TimeoutError — this is the per-run wall-clock budget.
     """
     if task_type not in TEMPLATES:
         raise ValueError(f"task_type must be one of {list(TEMPLATES)}, got {task_type!r}")
@@ -45,11 +49,23 @@ def launch_training(
 
     import json
 
-    proc = subprocess.run(
-        [sys.executable, str(template_path), "--dataset", dataset, "--config", json.dumps(config)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(template_path), "--dataset", dataset, "--config", json.dumps(config)],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        log_event(
+            "training_timed_out",
+            dataset=dataset,
+            task_type=task_type,
+            timeout_seconds=timeout_seconds,
+        )
+        raise TimeoutError(
+            f"Training for {dataset!r} exceeded its {timeout_seconds}s time budget and was killed."
+        )
 
     if proc.returncode != 0:
         log_event(
