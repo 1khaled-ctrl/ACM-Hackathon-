@@ -14,8 +14,9 @@ __pycache__/
 checkpoints/
 runs/
 
-# Data (downloaded, not tracked)
-data/
+# Data (downloaded, not tracked) — summary markdown is tracked deliberately
+data/*
+!data/dataset_summary.md
 
 # Runtime outputs (final logs are committed deliberately at the end)
 logs/status.json
