@@ -1,2 +1,36 @@
 *.zip
 *.bat
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# ML artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+checkpoints/
+runs/
+
+# Data (downloaded, not tracked)
+data/
+
+# Runtime outputs (final logs are committed deliberately at the end)
+logs/status.json
+logs/ledger.jsonl
+logs/events.jsonl
+logs/test_lock_*.json
+
+# Secrets
+.env
+*.pem
+*.key
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor / OS
+.vscode/
+.DS_Store
