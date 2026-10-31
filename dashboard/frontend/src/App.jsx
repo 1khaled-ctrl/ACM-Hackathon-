@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
-  Activity, AlertTriangle, Cpu, Database, GitBranch, Radio, Satellite, Zap,
+  Activity, AlertTriangle, Cpu, Database, GitBranch, LayoutGrid,
+  LineChart as LineChartIcon, Radio, Satellite, Zap,
 } from 'lucide-react'
 import {
   CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -46,6 +47,9 @@ export default function App() {
   const [connected, setConnected] = useState(false)
   const [datasets, setDatasets] = useState([])
   const [toast, setToast] = useState(null)
+  // 'stats' = the per-epoch numbers; 'curves' = both live charts in the
+  // same panel, so they're reachable above the fold without scrolling.
+  const [runView, setRunView] = useState('stats')
   const wsRef = useRef(null)
 
   // Live socket, with auto-reconnect so a server restart heals itself.
@@ -161,14 +165,33 @@ export default function App() {
           <Panel className="lg:col-span-8">
             <PanelTitle
               right={
-                launchPendingFirstEvent
-                  ? <Badge tone="sky" pulse>launching</Badge>
-                  : run.run_id ? <Badge tone="green" pulse>training</Badge> : <Badge>idle</Badge>
+                <div className="flex items-center gap-2.5">
+                  <ViewSwitch value={runView} onChange={setRunView} />
+                  {launchPendingFirstEvent
+                    ? <Badge tone="sky" pulse>launching</Badge>
+                    : run.run_id ? <Badge tone="green" pulse>training</Badge> : <Badge>idle</Badge>}
+                </div>
               }
             >
               Current Run
             </PanelTitle>
-            {launchPendingFirstEvent ? (
+            {runView === 'curves' ? (
+              <div className="grid grid-cols-1 gap-px bg-edge/50 sm:grid-cols-2">
+                <MiniChart
+                  title="Training loss"
+                  data={chart}
+                  dataKey="loss"
+                  color="#fbbf24"
+                />
+                <MiniChart
+                  title={run.metric_name || 'Validation metric'}
+                  data={chart}
+                  dataKey="val"
+                  color="#22c55e"
+                  domain={[0, 1]}
+                />
+              </div>
+            ) : launchPendingFirstEvent ? (
               <LaunchingNotice dataset={launch?.dataset} />
             ) : run.run_id ? (
               <div className="grid grid-cols-2 divide-x divide-y divide-edge/50 sm:grid-cols-3 lg:grid-cols-4">
@@ -422,6 +445,72 @@ function IdleNotice({ agentRunning }) {
         {agentRunning
           ? 'the agent is between runs -- planning, evaluating, or deciding next steps'
           : 'use Launch below to start a Quick Test or a full Mission'}
+      </div>
+    </div>
+  )
+}
+
+/** Segmented toggle in the Current Run header: flip the panel body
+ *  between the per-epoch stat grid and both live curves, so the graphs
+ *  are one click away instead of requiring a scroll past the fold. */
+function ViewSwitch({ value, onChange }) {
+  const opts = [
+    { key: 'stats', label: 'Stats', Icon: LayoutGrid },
+    { key: 'curves', label: 'Curves', Icon: LineChartIcon },
+  ]
+  return (
+    <div className="flex overflow-hidden rounded-md border border-edge">
+      {opts.map(({ key, label, Icon }) => (
+        <button
+          key={key}
+          onClick={() => onChange(key)}
+          title={`Show ${label.toLowerCase()}`}
+          className={cn(
+            'flex items-center gap-1 px-2 py-1 font-mono text-[0.6rem] uppercase tracking-wider transition-colors',
+            value === key
+              ? 'bg-emerald-500/15 text-emerald-200'
+              : 'text-slate-500 hover:bg-slate-800/60 hover:text-slate-300',
+          )}
+        >
+          <Icon className="h-3 w-3" /> {label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** Compact chart for the Current Run panel's "Curves" view. Same data as
+ *  the full-width ChartPanels lower down, sized to sit two-up inside one
+ *  panel body. */
+function MiniChart({ title, data, dataKey, color, domain }) {
+  const has = data.some((d) => typeof d[dataKey] === 'number')
+  return (
+    <div className="bg-panel px-3 py-3">
+      <div className="mb-1 font-mono text-[0.6rem] uppercase tracking-[0.18em]" style={{ color }}>
+        {title}
+      </div>
+      <div className="h-40">
+        {has ? (
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} margin={{ top: 6, right: 10, bottom: 0, left: -22 }}>
+              <CartesianGrid stroke="#1c2c44" strokeDasharray="3 3" />
+              <XAxis dataKey="epoch" stroke="#475569" fontSize={9} tickLine={false} />
+              <YAxis stroke="#475569" fontSize={9} tickLine={false} domain={domain || ['auto', 'auto']} />
+              <Tooltip
+                contentStyle={{
+                  background: '#0d1829', border: '1px solid #1c2c44',
+                  borderRadius: 8, fontSize: 11, fontFamily: 'monospace',
+                }}
+              />
+              <Line
+                type="monotone" dataKey={dataKey} stroke={color} strokeWidth={2}
+                dot={{ r: 2, fill: color }} activeDot={{ r: 3.5 }} isAnimationActive={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        ) : (
+          <Empty>awaiting per-epoch telemetry</Empty>
+        )}
       </div>
     </div>
   )

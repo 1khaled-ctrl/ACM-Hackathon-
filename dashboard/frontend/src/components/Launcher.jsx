@@ -11,9 +11,20 @@ import { Button, Panel, PanelTitle, cn } from './ui'
  * Both are still just the same /api/agent/start call with different
  * numbers; nothing about run_gotrain.py or the control plane changes.
  */
+// run_minutes becomes a HARD subprocess kill in
+// gotrain/tools/training.py (timeout_seconds) -- training that hasn't
+// finished by then is killed and logs training_timed_out, producing no
+// ledger entry at all. 1 min is below what a real GEO-Bench run needs,
+// so Quick Test is labelled as a wiring check, not a cheap experiment.
 const PRESETS = {
-  quick: { label: 'Quick Test', icon: FlaskConical, maxRuns: 1, runMinutes: 1, hint: '1 run · 1 min — smoke test only' },
-  mission: { label: 'Mission', icon: Rocket, maxRuns: 3, runMinutes: 5, hint: '3 runs · 5 min/run — a real attempt' },
+  quick: {
+    label: 'Quick Test', icon: FlaskConical, maxRuns: 1, runMinutes: 1,
+    hint: '1 run · 1 min — wiring check; training will likely time out',
+  },
+  mission: {
+    label: 'Mission', icon: Rocket, maxRuns: 3, runMinutes: 5,
+    hint: '3 runs · 5 min/run — a real attempt',
+  },
 }
 
 export function Launcher({ datasets, snap, post, notify }) {
@@ -50,7 +61,14 @@ export function Launcher({ datasets, snap, post, notify }) {
     setStarting(false)
   }
 
-  if (agentRunning) {
+  // COMPLETED wins over agent_running. The agent's OS process routinely
+  // lingers for a few seconds after it submits a final model (boto3 /
+  // Strands teardown), so agent_running is still true while the control
+  // state is already COMPLETED. Checking agentRunning first meant that
+  // window rendered "mission in progress" with NO start button at all --
+  // the mission was over, but there was no way to begin a new one.
+  // COMPLETED is terminal in gotrain/control.py, so it is the truth here.
+  if (agentRunning && !justCompleted) {
     return (
       <div className="flex items-center gap-2 font-mono text-xs text-slate-500">
         <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
