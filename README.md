@@ -66,6 +66,33 @@ streamlit run dashboard.py
 pytest tests/ -v
 ```
 
+## Dashboard
+
+```bash
+streamlit run dashboard.py
+```
+
+A single-page, read-only, dark-themed view of what the agent is doing, built
+around one goal: understand it within 5 seconds. Shows live status, the
+workflow stage (analyze/train/validate/compare/decide), the current
+experiment's live per-epoch progress, the best model so far, a validation-score
+chart across runs, the agent's last logged decision/rationale, run history,
+model lineage, and a live activity feed. Never launches training, changes a
+config, or triggers the final test evaluation — it only reads
+`logs/status.json`, `logs/ledger.jsonl`, and `logs/events.jsonl`.
+
+On Windows, `launch_dashboard.bat` (not tracked by git) sets up a `.venv` and
+runs the above for you — a desktop shortcut can point straight at it.
+
+**Viewing a teammate's training from a different machine:** the dashboard has
+no networking built in — it only reads local files. Either (a) run it on the
+same machine that's training (e.g. the SageMaker lab) and view it from your
+own browser through Jupyter's proxy (`<notebook-url>/proxy/8501/`, with
+`--server.address 0.0.0.0`), or (b) mirror that machine's 3 log files onto
+yours by any means (shared drive, `scp`, manual copy) — point at a different
+local folder than this repo's own `logs/` with the `GOTRAIN_LOGS_DIR`
+environment variable if needed (same pattern as `GEO_BENCH_DIR`).
+
 ## The safety rail
 
 - The agent trains on the **train** split and tunes/compares on the **validation**

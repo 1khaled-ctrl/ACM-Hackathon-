@@ -11,6 +11,10 @@ ledger.jsonl (per-run records). Fields tracked here:
   iteration     - which iteration of the train/eval loop this is
   best_so_far   - {"run_id", "dataset", "val_metric"} for the best run so far
   last_event    - short description of the most recently logged event
+  current_run   - live per-epoch progress for whichever run is actively
+                   training right now (written by the training templates
+                   themselves, one full snapshot per epoch), or None
+                   between runs. See set_current_run.
 """
 
 from typing import Any, Optional
@@ -54,6 +58,18 @@ def set_best_so_far(run_id: str, dataset: str, val_metric: Any) -> dict:
 
 def set_last_event(description: str) -> dict:
     return write_status(last_event=description)
+
+
+def set_current_run(fields: Optional[dict]) -> dict:
+    """Overwrite the live "current_run" snapshot (or clear it with None).
+
+    Called by the training templates once per epoch (best-effort — a
+    template must never let this fail its actual training run) and
+    cleared by gotrain/tools/training.py once the subprocess exits, win
+    or lose, so a dashboard never shows a stale "epoch 7/10" after a run
+    has already finished or crashed.
+    """
+    return write_status(current_run=fields)
 
 
 def get_status() -> dict:

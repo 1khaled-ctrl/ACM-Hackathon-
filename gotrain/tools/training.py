@@ -71,9 +71,17 @@ def launch_training(
             task_type=task_type,
             timeout_seconds=timeout_seconds,
         )
+        status.set_current_run(None)
         raise TimeoutError(
             f"Training for {dataset!r} exceeded its {timeout_seconds}s time budget and was killed."
         )
+
+    # The subprocess has exited (success or failure) — whatever live
+    # per-epoch progress it was reporting via status.set_current_run is now
+    # stale, win or lose. Clear it before raising on a bad exit code so a
+    # dashboard never shows a frozen "epoch 7/10" for a run that's actually
+    # over.
+    status.set_current_run(None)
 
     if proc.returncode != 0:
         log_event(
@@ -118,6 +126,7 @@ def launch_training(
         task_type=task_type,
         version_id=version_id,
         run_id=ledger_run_id,
+        extra_metrics=result.get("extra_metrics"),
     )
 
     best = ledger.get_best(dataset)

@@ -24,6 +24,26 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 os.environ.setdefault("GEO_BENCH_DIR", str(REPO_ROOT / "data" / "geobench"))
+if str(REPO_ROOT) not in sys.path:
+    # Needed to `import gotrain.status` below -- this script runs as a
+    # subprocess (sys.executable + this file's path, not `-m`), so Python
+    # only puts this file's own directory on sys.path by default.
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def report_progress(**fields) -> None:
+    """Best-effort live per-epoch status update for the dashboard. Never
+    allowed to fail a training run -- if gotrain.status can't be imported
+    or the write fails for any reason, training continues unaffected.
+    Mirrors gotrain/templates/train_classification.py's report_progress.
+    """
+    try:
+        from gotrain.status import set_current_run
+
+        set_current_run(fields)
+    except Exception:
+        pass
+
 
 DEFAULTS = {
     "encoder": "resnet34",
@@ -469,6 +489,24 @@ def main() -> None:
             f"foreground_iou={foreground_iou} time={epoch_seconds:.1f}s (split=validation)"
         )
 
+        report_progress(
+            run_id=run_id,
+            dataset=dataset,
+            task_type="segmentation",
+            model=f"{cfg['architecture']}/{cfg['encoder']}",
+            optimizer=cfg["optimizer"],
+            lr=cfg["lr"],
+            scheduler=None,
+            epoch=epoch + 1,
+            epochs=cfg["epochs"],
+            train_loss=avg_train_loss,
+            val_metric=mean_iou,
+            metric_name="val_mean_iou",
+            foreground_iou=foreground_iou,
+            best_val_metric=max(best_val_iou, mean_iou),
+            elapsed_seconds=time.time() - training_start,
+        )
+
         if mean_iou > best_val_iou:
             best_val_iou = mean_iou
             best_metrics = {
@@ -515,6 +553,7 @@ def main() -> None:
         "rationale": f"best val_mean_iou={final_val_metric:.4f} at epoch {best_metrics['epoch']} (run_dir={run_dir})",
         "run_dir": str(run_dir),
         "checkpoint_path": str(best_checkpoint_path),
+        "extra_metrics": {"foreground_iou": best_metrics.get("val_foreground_iou")},
     }))
 
 
