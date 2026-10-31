@@ -14,6 +14,14 @@ example can look identical to a mislabeled one by this metric alone --
 every flagged sample becomes a PENDING data-quality proposal
 (gotrain.dataiq.decision), never auto-approved, for exactly this reason.
 
+The classification scan also reports an Expected Calibration Error check
+(gotrain.calibration) over the same confidence values -- a model can be
+90% confident and wrong half the time, which the "high confidence wrong
+prediction" flag above treats as a per-sample signal but never
+summarizes model-wide. Computed on TRAIN (what this function already has
+loaded), not VALIDATION -- a weaker but free signal; see the inline note
+at its call site.
+
 NEEDS TORCH (and geobench + the real downloaded dataset) to run -- not
 executable in this project's local/CI environment. Mirrors
 gotrain/tools/final_eval.py's proven pattern for rebuilding a run's model
@@ -29,7 +37,7 @@ from typing import Optional
 
 import numpy as np
 
-from gotrain import ledger
+from gotrain import calibration, ledger
 from gotrain.dataiq import decision as dataiq_decision
 from gotrain.logging_utils import LOGS_DIR, log_event
 
@@ -63,10 +71,13 @@ def _get_run_record(dataset: str, run_id: str) -> dict:
     return record
 
 
-def _record_and_flag(dataset: str, run_id: str, task_type: str, rows: list) -> dict:
+def _record_and_flag(dataset: str, run_id: str, task_type: str, rows: list, extra_summary: Optional[dict] = None) -> dict:
     """Shared tail end for both scan functions below: write the full
     per-sample report to disk and raise a PENDING DataIQ proposal for
-    every flagged row.
+    every flagged row. `extra_summary` is merged into the written/
+    returned summary as-is -- currently only scan_classification_run
+    uses it, to attach a calibration check; segmentation's summary is
+    unaffected either way.
     """
     flagged = [r for r in rows if r["possible_issue"] is not None]
 
@@ -75,6 +86,7 @@ def _record_and_flag(dataset: str, run_id: str, task_type: str, rows: list) -> d
     summary = {
         "dataset": dataset, "run_id": run_id, "task_type": task_type,
         "n_samples": len(rows), "n_flagged": len(flagged),
+        **(extra_summary or {}),
     }
     (report_dir / f"{run_id}.json").write_text(
         json.dumps({"summary": summary, "samples": rows}, indent=2), encoding="utf-8"
@@ -92,7 +104,12 @@ def _record_and_flag(dataset: str, run_id: str, task_type: str, rows: list) -> d
             reason=f"possible_issue={row['possible_issue']!r} from run {run_id} (model-assisted signal, not proof)",
         )
 
-    log_event("dataiq_loss_scan_finished", dataset=dataset, run_id=run_id, task_type=task_type, **summary)
+    # summary already carries dataset/run_id/task_type -- passing them
+    # again as explicit kwargs here previously raised
+    # "got multiple values for keyword argument" on every real call
+    # (never caught: this function needs torch, never executed in this
+    # environment). **summary alone is both correct and sufficient.
+    log_event("dataiq_loss_scan_finished", **summary)
     return summary
 
 
@@ -171,7 +188,23 @@ def scan_classification_run(dataset: str, run_id: str, max_samples: Optional[int
             "possible_issue": possible_issue,
         })
 
-    return _record_and_flag(dataset, run_id, "classification", rows)
+    # Calibration check (gotrain.calibration): is this model's reported
+    # confidence actually trustworthy, or is it systematically over/
+    # under-confident? Computed from the exact (confidence, correct)
+    # pairs already gathered above -- no new forward pass. Measured on
+    # TRAIN (what this function already has loaded), which is a weaker,
+    # cheaper signal than a true held-out calibration check on
+    # VALIDATION -- a model is routinely more confident on data it was
+    # trained on. Labeled explicitly as such rather than presented as
+    # the real thing; a validation-split version would need its own
+    # forward pass and is deliberately not added here.
+    correct = (preds == train_labels).astype(np.float64)
+    calibration_result = calibration.compute_calibration(confidences, correct)
+
+    return _record_and_flag(
+        dataset, run_id, "classification", rows,
+        extra_summary={"calibration": calibration_result, "calibration_split": "train"},
+    )
 
 
 def scan_segmentation_run(dataset: str, run_id: str, max_samples: Optional[int] = None) -> dict:

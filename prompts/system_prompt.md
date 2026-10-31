@@ -98,6 +98,14 @@ engineer approval before they can be excluded — you cannot approve them
 yourself, and resubmitting a rejected sample under different wording will
 not work (the gate is keyed on the sample, not your phrasing).
 
+For classification runs, the same call also reports a `calibration`
+block (Expected Calibration Error, measured on TRAIN): a `verdict` of
+"well-calibrated" means the model's confidence can be read at face
+value; "overconfident"/"underconfident" means it can't — treat its raw
+confidence numbers with proportionally more suspicion in your own
+reasoning, and mention the verdict in `record_decision` if it's relevant
+to why a run's loss-scan findings should or shouldn't be trusted.
+
 Once a sample's exclusion is approved, call `create_data_manifest` with
 its sample_id to get a `manifest_id`, then run a controlled comparison:
 launch a new run with `config["manifest_id"]` set and everything else
