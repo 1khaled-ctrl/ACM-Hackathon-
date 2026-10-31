@@ -4,8 +4,26 @@
 #
 # Usage:  bash scripts/start_nexus.sh [port]
 #
-# Builds the frontend first if dist/ is missing, so a fresh clone on the
-# SageMaker lab only needs this one command.
+# Rebuilds the frontend on every start whenever the committed frontend
+# source has moved past what dist/ was last built from (see the git-hash
+# check below) -- not just on a fresh clone. Without this, `git pull`
+# alone silently leaves the OLD compiled dist/ running: dist/ is
+# gitignored (it's a build artifact, never committed), so pulling updates
+# the .jsx source but does nothing to the bundle actually being served
+# until something rebuilds it. A stale dist/ looks identical to a
+# successful pull -- same URL, same port, server starts fine -- so this
+# check exists specifically so "I pulled but nothing changed" can't
+# happen silently again.
+#
+# This is a GIT-HASH check, not a file-mtime check, on purpose: mtimes
+# are not a reliable signal here. If dist/ was built from a commit the
+# lab already had, then `git pull` bringing in newer commits does NOT
+# make the .jsx files' mtimes newer than dist/ -- their content is
+# unchanged relative to what was already checked out when that build
+# ran. A mtime comparison would (and, in practice, did) conclude "no
+# rebuild needed" right after a pull that actually changed the UI.
+# Comparing against the commit dist/ was built from is the only signal
+# that's correct independent of wall-clock time.
 
 set -euo pipefail
 
@@ -33,9 +51,31 @@ else
 fi
 echo "Using interpreter: $PY"
 
+# BUILD_MARKER records which commit dist/ was built from, written right
+# after a successful build below. Compared against the commit that last
+# touched frontend source -- not HEAD overall, so an unrelated backend
+# commit landing after a build doesn't trigger a pointless rebuild.
+BUILD_MARKER="dashboard/frontend/dist/.build_commit"
+SOURCE_COMMIT="$(git log -1 --format=%H -- dashboard/frontend/src dashboard/frontend/package.json dashboard/frontend/vite.config.js dashboard/frontend/index.html 2>/dev/null || echo "")"
+
+NEEDS_BUILD=0
 if [ ! -f "dashboard/frontend/dist/index.html" ]; then
-  echo "Frontend not built yet -- building (first run only)..."
+  NEEDS_BUILD=1
+  echo "Frontend not built yet."
+elif [ ! -f "$BUILD_MARKER" ]; then
+  NEEDS_BUILD=1
+  echo "dist/ exists but has no build marker (built before this check existed) -- rebuilding once to establish one."
+elif [ -n "$SOURCE_COMMIT" ] && [ "$(cat "$BUILD_MARKER")" != "$SOURCE_COMMIT" ]; then
+  NEEDS_BUILD=1
+  echo "Frontend source has moved since the last build ($(cat "$BUILD_MARKER" | cut -c1-8) -> ${SOURCE_COMMIT:0:8})."
+fi
+
+if [ "$NEEDS_BUILD" = "1" ]; then
+  echo "Building frontend..."
   ( cd dashboard/frontend && npm install && npm run build )
+  if [ -n "$SOURCE_COMMIT" ]; then
+    echo "$SOURCE_COMMIT" > "$BUILD_MARKER"
+  fi
 fi
 
 echo "Starting GoTrain NEXUS on port $PORT ..."
