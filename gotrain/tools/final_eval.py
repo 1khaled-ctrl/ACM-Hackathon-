@@ -8,6 +8,7 @@ the point of holding it out, so this has to fail loudly, not retry quietly.
 """
 
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -15,6 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from gotrain.logging_utils import LOGS_DIR, log_evaluation
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+RUNS_DIR = REPO_ROOT / "runs"
 
 TEST_LOCK_TEMPLATE = "test_lock_{dataset}.json"
 
@@ -67,3 +71,165 @@ def final_test_eval(dataset: str, run_id: str, eval_fn) -> dict:
     metrics = eval_fn()
     record = log_evaluation(task=dataset, split="test", metrics=metrics, model=run_id)
     return record
+
+
+def _run_dir(dataset: str, run_id: str) -> Path:
+    run_dir = RUNS_DIR / dataset / run_id
+    checkpoint = run_dir / "best_model.pt"
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"No checkpoint found for run {run_id!r} at {checkpoint}. "
+            "Expected runs/<dataset>/<run_id>/best_model.pt, written by "
+            "gotrain/templates/train_classification.py or train_segmentation.py."
+        )
+    return run_dir
+
+
+def _silent_logger(name: str) -> "logging.Logger":
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        logger.addHandler(logging.NullHandler())
+    return logger
+
+
+def build_classification_test_eval_fn(dataset: str, run_id: str, config: dict):
+    """Build the no-arg eval_fn for a real `task_type="classification"` run.
+
+    Loads the saved checkpoint from runs/<dataset>/<run_id>/best_model.pt,
+    recomputes TRAIN-only normalization stats exactly as the training
+    template did (same train split, same deterministic code -> same
+    mean/std, with no need to persist them separately), then loads the
+    TEST split -- the one and only test-split read in this call chain --
+    and reports accuracy. Reuses the training template's model/array
+    helpers (which are themselves test-split-blind) for everything except
+    the final "read the test split" step, which happens only here.
+    """
+    import numpy as np
+    import torch
+    import geobench
+
+    from gotrain.templates import train_classification as tc
+
+    run_dir = _run_dir(dataset, run_id)
+    logger = _silent_logger(f"final_eval.classification.{run_id}")
+
+    task_dir = tc.find_task_dir(dataset)
+    task_specs = geobench.load_task_specs(task_dir)
+    all_band_names = [b.name for b in task_specs.bands_info]
+    band_names = config.get("bands") or all_band_names
+    n_bands = len(band_names)
+    n_classes = task_specs.label_type.n_classes
+
+    train_images, _ = tc.build_dataset_arrays(
+        task_specs, "train", band_names, config.get("max_train_samples"), logger
+    )
+    mean, std = tc.compute_train_band_stats(train_images, logger)
+    del train_images
+
+    test_ds = task_specs.get_dataset(split="test")
+    test_images, test_labels = [], []
+    for i in range(len(test_ds)):
+        sample = test_ds[i]
+        arr, _ = sample.pack_to_3d(band_names=band_names)
+        test_images.append(arr.astype(np.float32))
+        test_labels.append(int(sample.label))
+    test_images = np.stack(test_images, axis=0)
+    test_labels = np.array(test_labels, dtype=np.int64)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = tc.build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes)
+    model.load_state_dict(torch.load(run_dir / "best_model.pt", map_location=device))
+    model = model.to(device)
+    model.eval()
+
+    normalized = (test_images - mean.astype(np.float32)) / std.astype(np.float32)
+    normalized = np.transpose(normalized, (0, 3, 1, 2))  # NHWC -> NCHW
+
+    batch_size = 32
+    all_preds = []
+    with torch.no_grad():
+        for start in range(0, len(normalized), batch_size):
+            batch = torch.from_numpy(normalized[start:start + batch_size]).float().to(device)
+            logits = model(batch)
+            all_preds.append(logits.argmax(dim=1).cpu().numpy())
+    preds = np.concatenate(all_preds, axis=0)
+
+    accuracy, per_class_accuracy = tc.compute_accuracy_metrics(preds, test_labels, n_classes)
+    return {
+        "accuracy": accuracy,
+        "per_class_accuracy": per_class_accuracy,
+        "n_test_samples": int(len(test_labels)),
+        "band_names": band_names,
+    }
+
+
+def build_segmentation_test_eval_fn(dataset: str, run_id: str, config: dict):
+    """Build the no-arg eval_fn for a real `task_type="segmentation"` run.
+
+    Mirrors build_classification_test_eval_fn's approach: recompute TRAIN
+    normalization stats, load the checkpoint, and evaluate on TEST (read
+    only here) using the same mean-IoU computation as the training
+    template's validation loop.
+    """
+    import numpy as np
+    import torch
+    import geobench
+
+    from gotrain.templates import train_segmentation as ts
+
+    run_dir = _run_dir(dataset, run_id)
+    logger = _silent_logger(f"final_eval.segmentation.{run_id}")
+
+    task_dir = ts.find_task_dir(dataset)
+    task_specs = geobench.load_task_specs(task_dir)
+    all_band_names = [b.name for b in task_specs.bands_info]
+    band_names = config.get("bands") or all_band_names
+    n_bands = len(band_names)
+    n_classes = task_specs.label_type.n_classes
+
+    train_images, _ = ts.build_dataset_arrays(
+        task_specs, "train", band_names, config.get("max_train_samples"), logger
+    )
+    mean, std = ts.compute_train_band_stats(train_images, logger)
+    del train_images
+
+    test_ds = task_specs.get_dataset(split="test")
+    test_images, test_masks = [], []
+    for i in range(len(test_ds)):
+        sample = test_ds[i]
+        arr, _ = sample.pack_to_3d(band_names=band_names)
+        test_images.append(arr)
+        test_masks.append(sample.label.data)
+    test_images = np.stack(test_images, axis=0)
+    test_masks = np.stack(test_masks, axis=0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ts.build_model(
+        config.get("architecture", "unet"), config.get("encoder", "resnet34"), False, n_bands, n_classes
+    )
+    model.load_state_dict(torch.load(run_dir / "best_model.pt", map_location=device))
+    model = model.to(device)
+    model.eval()
+
+    normalized = (test_images.astype(np.float64) - mean) / std
+    normalized = np.transpose(normalized, (0, 3, 1, 2)).astype(np.float32)  # NHWC -> NCHW
+
+    batch_size = 8
+    all_preds = []
+    with torch.no_grad():
+        for start in range(0, len(normalized), batch_size):
+            batch = torch.from_numpy(normalized[start:start + batch_size]).float().to(device)
+            logits = model(batch)
+            all_preds.append(logits.argmax(dim=1).cpu().numpy())
+    preds = np.concatenate(all_preds, axis=0)
+
+    mean_iou, per_class_iou = ts.compute_mean_iou(preds, test_masks, n_classes)
+    foreground_iou = per_class_iou[1] if n_classes == 2 and len(per_class_iou) > 1 else None
+    return {
+        "mean_iou": mean_iou,
+        "per_class_iou": per_class_iou,
+        "foreground_iou": foreground_iou,
+        "n_test_samples": int(len(test_masks)),
+        "band_names": band_names,
+    }

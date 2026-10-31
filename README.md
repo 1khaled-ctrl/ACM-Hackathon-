@@ -13,14 +13,31 @@ everything except actually calling the Bedrock model (see `--dry-run` below).
 ## Setup
 
 ```bash
-py -3.13 -m venv .venv
+py -3.13 -m venv .venv       # any Python 3.11+ works if 3.13 isn't installed
+                              # (requirements.txt pins packages that need >=3.11);
+                              # check what's available with `py -0`
 .venv\Scripts\activate       # Windows
 source .venv/bin/activate    # Linux/Mac
 pip install -r requirements.txt
 ```
 
-Or run `setup.sh` on a fresh Linux machine (installs deps + downloads the 4
-GEO-Bench tasks). Set `GEO_BENCH_DIR=./data/geobench` before downloading/loading.
+`torch`/`torchvision` are pinned without a `+cpu`/`+cuXXX` suffix on purpose — those
+local version tags only exist on PyTorch's own wheel index, not on PyPI, so a plain
+`pip install -r requirements.txt` would fail to resolve them otherwise. The plain PyPI
+wheel is CUDA-capable on Linux (SageMaker) and falls back to CPU automatically where
+there's no GPU (a laptop).
+
+Or run `setup.sh` on a fresh Linux machine (installs deps + downloads the 4 GEO-Bench
+tasks used in this project).
+
+## Data
+
+Only 4 GEO-Bench tasks are used (not the full benchmark):
+
+- Classification: `m-eurosat`, `m-so2sat`
+- Segmentation: `m-pv4ger-seg`, `m-nz-cattle`
+
+Set `GEO_BENCH_DIR=./data/geobench` before downloading/loading.
 
 ## How to run
 
