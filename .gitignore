@@ -39,3 +39,10 @@ __pycache__/
 .vscode/
 .claude/
 .DS_Store
+# NEXUS dashboard runtime + build output
+/logs/nexus.pid
+/logs/nexus.log
+/logs/agent.pid
+/logs/agent.log
+/dashboard/frontend/node_modules/
+/dashboard/frontend/dist/

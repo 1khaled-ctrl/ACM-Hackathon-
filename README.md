@@ -59,14 +59,76 @@ python run_gotrain.py --dataset m-eurosat --max-runs 6 --run-minutes 5
 # After the agent submits a model, a human runs the one-time final evaluation:
 python run_final_eval.py --dataset m-eurosat
 
-# Dashboard — view + engineer control (pause/resume/manual-takeover/approvals/rollback):
+# Dashboard — GoTrain NEXUS (React UI + FastAPI, one process on one port):
+bash scripts/start_nexus.sh
+
+# Legacy Streamlit dashboard (fallback):
 streamlit run dashboard.py
 
 # Tests:
 pytest tests/ -v
 ```
 
-## Dashboard
+## GoTrain NEXUS (React dashboard — the one to demo)
+
+The primary dashboard. A custom React/Vite UI served by a FastAPI bridge, so
+it looks nothing like a stock Streamlit page. The Python agent and training
+system are untouched by it — NEXUS only reads the existing log files and
+drives the existing `gotrain.control` state machine.
+
+```
+GoTrain Python agent
+      v   writes logs/{status,control,events,ledger,live_metrics}
+FastAPI bridge (dashboard/api/server.py)
+      v   REST + WebSocket (1 Hz push)
+React + Vite + Tailwind + Framer Motion + Recharts
+```
+
+**One process, one port.** The built frontend is served *by* the API server,
+so there's no separate `npm run dev` to babysit and the SageMaker proxy only
+needs a single port:
+
+```bash
+bash scripts/start_nexus.sh          # defaults to port 8501
+bash scripts/stop_nexus.sh
+```
+
+The start script builds the frontend automatically on first run, writes
+`logs/nexus.pid` / `logs/nexus.log`, and stays up after you close the shell.
+
+- Local: `http://localhost:8501/`
+- SageMaker: `https://<studio-domain>/jupyterlab/default/proxy/8501/`
+  (asset paths are relative, so the proxy prefix works with no rebuild)
+
+What it shows, all from real logs: the animated agent pipeline (the lit stage
+is derived from actual state, not a timer), current dataset/model/epoch,
+train loss, validation metric, elapsed, computed ETA, animated progress
+rings, host CPU/RAM (plus GPU when CUDA is present), live loss and validation
+charts, the agent decision feed, the experiment timeline, and the local
+dataset list — every dataset showing `test: locked`.
+
+Controls are real writes, not decoration: **Pause / Manual / Resume** call
+`gotrain.control.transition()` (the same state machine the agent's hook
+enforces), and only transitions that are legal from the current state are
+offered — an illegal one returns HTTP 409 from the state machine itself.
+**Start GoTrain** launches `run_gotrain.py` as a detached subprocess with the
+chosen dataset and budgets, refusing to start a second agent or an unknown
+dataset. Every transition is audited to `events.jsonl` with
+`requested_by: engineer`.
+
+NEXUS never imports `gotrain.tools.final_eval` and never reads
+`logs/test_lock_*.json` — the test split stays exclusively in
+`run_final_eval.py`, run by a human.
+
+Frontend dev loop (optional, only if you're editing the UI):
+
+```bash
+cd dashboard/frontend && npm run dev   # proxies /api and /ws to :8501
+```
+
+## Streamlit dashboard (legacy)
+
+Kept as a fallback; NEXUS above supersedes it.
 
 ```bash
 streamlit run dashboard.py
