@@ -415,3 +415,263 @@ def test_windowed_events_are_deduplicated(history_env):
     merged = history._windowed_events(start, end)
     matching = [e for e in merged if e.get("event") == "training_started"]
     assert len(matching) == 1
+
+
+# ---------------------------------------------------------------------
+# Training Health card (gotrain/history.py::_training_health). Reuses
+# gotrain/experiment_planner.py::get_training_diagnostics exactly --
+# these tests pin down that the mapping from its real diagnoses
+# (possible_overfitting / possible_underfitting / ...) to the card's
+# HEALTHY/OVERFITTING/UNDERFITTING/UNKNOWN states is correct, and that a
+# missing/unavailable diagnosis degrades to UNKNOWN rather than raising.
+# UNSTABLE is intentionally not exercised here: the backend has no
+# diagnosis that maps to it (see _training_health's own docstring), so
+# there is nothing yet to test beyond "the constant exists".
+# ---------------------------------------------------------------------
+
+@pytest.fixture
+def diagnostics_env(history_env, monkeypatch):
+    """Extends history_env with experiment_planner reloaded against the
+    same temp LOGS_DIR, and its RUNS_DIR redirected into tmp_path -- the
+    same isolation pattern tests/test_experiment_planner.py already uses
+    for this exact module.
+    """
+    history, ledger, logging_utils = history_env
+
+    from gotrain import experiment_planner as planner
+
+    importlib.reload(planner)
+    monkeypatch.setattr(planner, "RUNS_DIR", logging_utils.LOGS_DIR / "runs")
+
+    yield history, ledger, planner
+
+
+def _write_run_metrics(planner, dataset, run_id, train_loss):
+    run_dir = planner.RUNS_DIR / dataset / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "metrics.json").write_text(json.dumps({"best": {"train_loss": train_loss}}), encoding="utf-8")
+
+
+def test_training_health_unknown_with_no_runs(diagnostics_env):
+    history, _, _ = diagnostics_env
+    assert history._training_health("m-eurosat", []) == {"state": "UNKNOWN", "evidence": []}
+
+
+def test_training_health_unknown_with_no_dataset(diagnostics_env):
+    """mission.dataset can be falsy on a half-written session record --
+    must degrade to UNKNOWN, not raise, even with runs present.
+    """
+    history, ledger, _ = diagnostics_env
+    run = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.8,
+                          task_type="classification", decision="kept")
+    assert history._training_health(None, [run]) == {"state": "UNKNOWN", "evidence": []}
+
+
+def test_training_health_healthy_when_no_diagnosis_fires(diagnostics_env):
+    """A run with no metrics.json (train_loss unavailable) and a val_metric
+    that doesn't trigger any threshold: get_training_diagnostics legitimately
+    returns an empty diagnoses list -- that is HEALTHY, not UNKNOWN (the
+    diagnosis ran successfully and found nothing concerning).
+    """
+    history, ledger, _ = diagnostics_env
+    run = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.85,
+                          task_type="classification", decision="kept")
+    result = history._training_health("m-eurosat", [run])
+    assert result["state"] == "HEALTHY"
+    assert result["run_id"] == run["run_id"]
+
+
+def test_training_health_overfitting_maps_from_possible_overfitting(diagnostics_env):
+    """The real overfitting heuristic: train_loss below threshold (0.15)
+    AND val_metric below the classification ceiling (0.90).
+    """
+    history, ledger, planner = diagnostics_env
+    run = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.82,
+                          task_type="classification", decision="pending")
+    _write_run_metrics(planner, "m-eurosat", run["run_id"], train_loss=0.08)
+
+    result = history._training_health("m-eurosat", [run])
+    assert result["state"] == "OVERFITTING"
+    assert len(result["evidence"]) == 1
+    assert "0.080" in result["evidence"][0]
+    assert "0.820" in result["evidence"][0]
+
+
+def test_training_health_underfitting_maps_from_possible_underfitting(diagnostics_env):
+    """The real underfitting heuristic: train_loss above the floor (0.8)
+    AND val_metric below the classification ceiling (0.5).
+    """
+    history, ledger, planner = diagnostics_env
+    run = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.3,
+                          task_type="classification", decision="pending")
+    _write_run_metrics(planner, "m-eurosat", run["run_id"], train_loss=0.95)
+
+    result = history._training_health("m-eurosat", [run])
+    assert result["state"] == "UNDERFITTING"
+    assert len(result["evidence"]) == 1
+
+
+def test_training_health_diagnoses_the_most_recent_run(diagnostics_env):
+    """Two runs in the session: health must reflect the LATEST one, not
+    the first (e.g. an early underfitting run followed by a healthy fix
+    must show HEALTHY, not the stale earlier diagnosis).
+    """
+    history, ledger, planner = diagnostics_env
+    first = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.3,
+                            task_type="classification", decision="discarded")
+    _write_run_metrics(planner, "m-eurosat", first["run_id"], train_loss=0.95)
+
+    second = ledger.add_run(dataset="m-eurosat", config={"backbone": "convnext_tiny"}, val_metric=0.91,
+                             task_type="classification", decision="kept", parent_id=first["run_id"])
+
+    result = history._training_health("m-eurosat", [first, second])
+    assert result["run_id"] == second["run_id"]
+    assert result["state"] == "HEALTHY"
+
+
+def test_training_health_unknown_when_run_id_not_in_ledger(diagnostics_env):
+    """get_training_diagnostics raises ValueError for an unknown run_id
+    (e.g. the run record passed in came from a different dataset's
+    ledger, or was deleted) -- must degrade to UNKNOWN, not propagate.
+    """
+    history, _, _ = diagnostics_env
+    fake_run = {"run_id": "does-not-exist", "timestamp": "2026-01-01T00:00:00+00:00"}
+    result = history._training_health("m-eurosat", [fake_run])
+    assert result == {"state": "UNKNOWN", "evidence": []}
+
+
+def test_training_health_is_present_in_derived_session_summary(diagnostics_env):
+    """End-to-end through the real entry points list_sessions() and
+    load_session() both call (_derive) -- the field this whole feature
+    depends on must actually be attached, not just computable in
+    isolation.
+    """
+    history, ledger, planner = diagnostics_env
+    session = history.start_session(dataset="m-eurosat", max_runs=2, run_minutes=4)
+    run = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.82,
+                          task_type="classification", decision="kept")
+    _write_run_metrics(planner, "m-eurosat", run["run_id"], train_loss=0.08)
+    history.finish_session(session["session_id"], status=history.COMPLETED)
+
+    listed = history.list_sessions()[0]
+    assert listed["training_health"]["state"] == "OVERFITTING"
+
+    loaded = history.load_session(session["session_id"])
+    assert loaded["training_health"]["state"] == "OVERFITTING"
+    assert loaded["training_health"] == listed["training_health"]
+
+
+def test_training_health_states_include_unstable_for_future_use(diagnostics_env):
+    """UNSTABLE is a defined state constant even though nothing currently
+    produces it (see _training_health's docstring) -- this just confirms
+    the constant exists with the expected string value, so the frontend's
+    HEALTH_TONE mapping has something real to key off if/when a backend
+    diagnosis for it is added.
+    """
+    history, _, _ = diagnostics_env
+    assert history.HEALTH_UNSTABLE == "UNSTABLE"
+
+
+# ---------------------------------------------------------------------
+# Statistical Improvement Verification (gotrain/history.py::
+# _attach_statistical_verdicts). Reuses gotrain/statistics.py's
+# estimate_noise_floor + is_improvement_significant exactly -- these
+# tests pin down the VERIFIED/NOT_ABOVE_NOISE/INSUFFICIENT_EVIDENCE
+# mapping from that module's existing significant=True/False/None.
+# ---------------------------------------------------------------------
+
+@pytest.fixture
+def statistics_env(history_env):
+    """gotrain/statistics.py does `from gotrain import ledger` at its own
+    import time -- must be reloaded here too (not just ledger itself) so
+    its bound `ledger` reference points at THIS test's isolated module,
+    not whatever gotrain.statistics last saw in a previous test.
+    """
+    history, ledger, _ = history_env
+
+    from gotrain import statistics
+
+    importlib.reload(statistics)
+
+    yield history, ledger, statistics
+
+
+def test_statistical_verdict_insufficient_evidence_with_no_delta(statistics_env):
+    """A root run (no parent_id, delta_vs_parent is None) can never be
+    judged -- there is nothing to compare.
+    """
+    history, ledger, _ = statistics_env
+    root = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.8,
+                           task_type="classification", decision="kept")
+    out = history._attach_statistical_verdicts("m-eurosat", [root])
+    assert out[0]["statistical_verdict"]["state"] == history.STAT_INSUFFICIENT_EVIDENCE
+
+
+def test_statistical_verdict_insufficient_evidence_with_no_repeated_configs(statistics_env):
+    """A real delta exists, but no two runs share an identical (non-seed)
+    config yet -- no noise floor can be estimated, so even a real-looking
+    delta must not be called VERIFIED.
+    """
+    history, ledger, _ = statistics_env
+    root = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.80,
+                           task_type="classification", decision="kept")
+    child = ledger.add_run(dataset="m-eurosat", config={"backbone": "convnext_tiny"}, val_metric=0.90,
+                            parent_id=root["run_id"], task_type="classification", decision="kept")
+    out = history._attach_statistical_verdicts("m-eurosat", [root, child])
+    verdicts = {n["run_id"]: n["statistical_verdict"]["state"] for n in out}
+    assert verdicts[child["run_id"]] == history.STAT_INSUFFICIENT_EVIDENCE
+
+
+def test_statistical_verdict_verified_when_delta_exceeds_noise_floor(statistics_env):
+    """Two repeated-config runs establish a small noise floor; a third
+    run's delta clearly exceeds it -- that delta must be VERIFIED.
+    """
+    history, ledger, _ = statistics_env
+    r1 = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18", "seed": 1}, val_metric=0.800,
+                         task_type="classification", decision="kept")
+    r2 = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18", "seed": 2}, val_metric=0.802,
+                         task_type="classification", decision="kept")
+    big_improvement = ledger.add_run(dataset="m-eurosat", config={"backbone": "convnext_tiny"}, val_metric=0.95,
+                                      parent_id=r2["run_id"], task_type="classification", decision="kept")
+
+    out = history._attach_statistical_verdicts("m-eurosat", [r1, r2, big_improvement])
+    verdicts = {n["run_id"]: n["statistical_verdict"] for n in out}
+    assert verdicts[big_improvement["run_id"]]["state"] == history.STAT_VERIFIED
+    assert verdicts[big_improvement["run_id"]]["noise_floor"] == pytest.approx(0.002, abs=1e-6)
+
+
+def test_statistical_verdict_not_above_noise_when_delta_is_within_noise_floor(statistics_env):
+    """A repeated-config pair establishes a noise floor; a THIRD run with
+    that same config (so its delta vs. one of the pair is itself part of
+    the measured spread) must not be called a verified improvement.
+    """
+    history, ledger, _ = statistics_env
+    r1 = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18", "seed": 1}, val_metric=0.800,
+                         task_type="classification", decision="kept")
+    r2 = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18", "seed": 2}, val_metric=0.840,
+                         task_type="classification", decision="kept")
+    # Delta vs parent (r1) is 0.01 -- well inside the 0.04 noise floor
+    # established by r1/r2 sharing the identical non-seed config.
+    small_change = ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18", "seed": 3}, val_metric=0.810,
+                                   parent_id=r1["run_id"], task_type="classification", decision="pending")
+
+    out = history._attach_statistical_verdicts("m-eurosat", [r1, r2, small_change])
+    verdicts = {n["run_id"]: n["statistical_verdict"]["state"] for n in out}
+    assert verdicts[small_change["run_id"]] == history.STAT_NOT_ABOVE_NOISE
+
+
+def test_statistical_verdict_is_present_in_mission_runs_end_to_end(statistics_env):
+    """End-to-end through load_session(): every run in mission.runs must
+    carry statistical_verdict, not just when _attach_statistical_verdicts
+    is called directly.
+    """
+    history, ledger, _ = statistics_env
+    session = history.start_session(dataset="m-eurosat", max_runs=1, run_minutes=1)
+    ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.8,
+                    task_type="classification", decision="kept")
+    history.finish_session(session["session_id"], status=history.COMPLETED)
+
+    loaded = history.load_session(session["session_id"])
+    assert len(loaded["runs"]) == 1
+    assert "statistical_verdict" in loaded["runs"][0]
+    assert loaded["runs"][0]["statistical_verdict"]["state"] == history.STAT_INSUFFICIENT_EVIDENCE

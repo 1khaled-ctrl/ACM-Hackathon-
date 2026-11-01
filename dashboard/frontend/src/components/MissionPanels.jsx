@@ -1,8 +1,27 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { Award, Radio, XCircle } from 'lucide-react'
+import {
+  Activity, Award, ClipboardList, GitFork, HeartPulse, Radio, ShieldAlert, XCircle,
+} from 'lucide-react'
 import { Badge, Panel, PanelTitle, cn } from './ui'
 import { buildEventFeed, buildTimeline, finalEpochStatsByRun, isLikelyDiminishingReturns, normalizeLiveRun } from '../lib/mission'
+
+function useJson(url, deps) {
+  const [data, setData] = useState(null)
+  const [loading, setLoading] = useState(true)
+  useEffect(() => {
+    if (!url) { setData(null); setLoading(false); return }
+    let cancelled = false
+    setLoading(true)
+    fetch(new URL(url, window.location.href))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled) { setData(d); setLoading(false) } })
+      .catch(() => { if (!cancelled) { setData(null); setLoading(false) } })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps)
+  return { data, loading }
+}
 
 /**
  * Three panels built on one `mission` object -- the exact shape
@@ -29,6 +48,58 @@ function runIndexLookup(runs) {
   const map = new Map()
   ;(runs || []).forEach((r, i) => map.set(r.run_id, i))
   return map
+}
+
+// ---------------------------------------------------------------------
+// Training Health -- compact card over the SAME diagnoses
+// gotrain/experiment_planner.py's get_training_diagnostics already
+// computes (no new heuristic here). Computed server-side, once, in
+// gotrain/history.py's _derive() (mission.training_health), so this
+// component only renders -- it never re-derives the state itself, and
+// is identical whether `mission` came from the live snapshot or from
+// History Details.
+// ---------------------------------------------------------------------
+
+const HEALTH_TONE = {
+  HEALTHY: 'green',
+  OVERFITTING: 'amber',
+  UNDERFITTING: 'amber',
+  UNSTABLE: 'red',
+  UNKNOWN: 'slate',
+}
+
+export function TrainingHealthCard({ mission }) {
+  const health = mission?.training_health
+  const state = health?.state || 'UNKNOWN'
+  const evidence = health?.evidence || []
+
+  return (
+    <Panel>
+      <PanelTitle right={<Badge tone={HEALTH_TONE[state] || 'slate'}>{state}</Badge>}>
+        <span className="inline-flex items-center gap-1.5">
+          <HeartPulse className="h-3 w-3" /> Training Health
+        </span>
+      </PanelTitle>
+      <div className="px-4 py-2.5">
+        {evidence.length > 0 ? (
+          <ul className="space-y-0.5">
+            {evidence.map((line, i) => (
+              <li key={i} className="flex items-start gap-1.5 font-mono text-[0.64rem] text-slate-400">
+                <Activity className="mt-0.5 h-2.5 w-2.5 shrink-0 text-slate-600" />
+                {line}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="font-mono text-[0.64rem] text-slate-600">
+            {state === 'UNKNOWN'
+              ? 'no completed run to diagnose yet'
+              : 'no concerning signal in the latest completed run'}
+          </div>
+        )}
+      </div>
+    </Panel>
+  )
 }
 
 // ---------------------------------------------------------------------
@@ -258,6 +329,31 @@ export function RunComparison({ mission, currentRun }) {
   )
 }
 
+// Statistical Improvement Verification (gotrain/statistics.py, folded
+// into mission.runs[].statistical_verdict by
+// gotrain/history.py::_attach_statistical_verdicts -- same tri-state
+// is_improvement_significant() output, just named/toned for display).
+const STAT_VERDICT_TONE = {
+  VERIFIED: 'green',
+  NOT_ABOVE_NOISE: 'amber',
+  INSUFFICIENT_EVIDENCE: 'slate',
+}
+const STAT_VERDICT_LABEL = {
+  VERIFIED: 'verified',
+  NOT_ABOVE_NOISE: 'not above noise',
+  INSUFFICIENT_EVIDENCE: 'insufficient evidence',
+}
+
+function StatVerdictBadge({ verdict }) {
+  const state = verdict?.state
+  if (!state) return null
+  return (
+    <div className="mt-0.5" title={verdict.reason || ''}>
+      <Badge tone={STAT_VERDICT_TONE[state] || 'slate'}>{STAT_VERDICT_LABEL[state] || state}</Badge>
+    </div>
+  )
+}
+
 function ComparisonRow({ run, index, trainLoss, durationSeconds, isBest, isSubmitted, isLive }) {
   const changeKeys = run.config_diff ? Object.keys(run.config_diff) : []
   const firstChange = changeKeys.length ? run.config_diff[changeKeys[0]] : null
@@ -294,6 +390,7 @@ function ComparisonRow({ run, index, trainLoss, durationSeconds, isBest, isSubmi
             {run.delta_vs_parent >= 0 ? '+' : ''}{(run.delta_vs_parent * 100).toFixed(2)}pp
           </span>
         ) : '--'}
+        {run.statistical_verdict && <StatVerdictBadge verdict={run.statistical_verdict} />}
       </td>
       <td className="px-3 py-2">
         <div className="flex items-center gap-1.5">
@@ -349,3 +446,274 @@ const Empty = ({ children }) => (
     {children}
   </div>
 )
+
+// Same small stat-tile as History.jsx's own Field (not imported from
+// there -- that component isn't exported, and duplicating this tiny a
+// presentational piece is simpler than exporting it across files).
+function Field({ label, value, sub, tone = 'text-slate-100' }) {
+  return (
+    <div className="bg-panel px-4 py-2.5">
+      <div className="font-mono text-[0.56rem] uppercase tracking-[0.18em] text-slate-500">{label}</div>
+      <div className={cn('mt-0.5 font-display text-sm font-bold tabular-nums', tone)}>{value}</div>
+      {sub && <div className="font-mono text-[0.56rem] text-slate-600">{sub}</div>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------
+// 4. Recursive Self-Improvement -- generation/lineage view.
+// GET /api/lineage/{dataset} (gotrain.ledger.get_lineage_tree, enriched
+// server-side with each run's own metrics.json warm-start record).
+// Spans ALL missions for the dataset on purpose: a later mission can
+// warm-start from an earlier mission's checkpoint, so a single-mission
+// view would silently hide real parent/child edges.
+// ---------------------------------------------------------------------
+
+export function LineageCard({ dataset }) {
+  const { data, loading } = useJson(dataset ? `api/lineage/${encodeURIComponent(dataset)}` : null, [dataset])
+  const runs = data?.runs || []
+
+  return (
+    <Panel>
+      <PanelTitle right={<GitFork className="h-3.5 w-3.5 text-violet-400" />}>
+        Recursive Self-Improvement
+      </PanelTitle>
+      {!dataset || loading ? (
+        <Empty>{loading ? 'loading…' : 'no dataset selected'}</Empty>
+      ) : runs.length === 0 ? (
+        <Empty>no runs yet for this dataset</Empty>
+      ) : (
+        <div className="max-h-80 overflow-y-auto px-4 py-3">
+          <ul className="space-y-2">
+            {runs.map((r) => (
+              <li
+                key={r.run_id}
+                className="rounded-lg border border-edge/60 bg-slate-900/40 px-3 py-2"
+                style={{ marginLeft: `${Math.min(r.generation, 6) * 16}px` }}
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono text-[0.62rem] text-slate-300">
+                    gen {r.generation} · {r.run_id.slice(0, 8)}
+                  </span>
+                  <span className="font-mono text-[0.6rem] text-sky-300">{modelLabel(r.config)}</span>
+                  {r.version_id && <Badge tone="slate">{r.version_id}</Badge>}
+                  {r.warm_started_from ? (
+                    <Badge tone="green">warm-started</Badge>
+                  ) : r.warm_start_requested ? (
+                    <Badge tone="amber">warm-start requested, unconfirmed</Badge>
+                  ) : null}
+                  <span className="ml-auto font-mono text-[0.68rem] font-bold text-emerald-300">
+                    {fmtPct(r.val_metric)}
+                  </span>
+                  {typeof r.delta_vs_parent === 'number' && (
+                    <span className={cn('font-mono text-[0.6rem]', r.delta_vs_parent >= 0 ? 'text-emerald-400' : 'text-rose-400')}>
+                      {r.delta_vs_parent >= 0 ? '+' : ''}{(r.delta_vs_parent * 100).toFixed(2)}pp
+                    </span>
+                  )}
+                </div>
+                {r.warm_started_from?.parent_run_id && (
+                  <div className="mt-1 font-mono text-[0.58rem] text-slate-500">
+                    warm-started from {r.warm_started_from.parent_run_id.slice(0, 8)}
+                    {r.warm_started_from.parent_version ? ` (${r.warm_started_from.parent_version})` : ''}
+                  </div>
+                )}
+                {r.children.length > 0 && (
+                  <div className="mt-1 font-mono text-[0.58rem] text-slate-600">
+                    {r.children.length} child run{r.children.length > 1 ? 's' : ''}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Panel>
+  )
+}
+
+// ---------------------------------------------------------------------
+// 5. StressLab Robustness -- per-run report.
+// GET /api/stresslab/{dataset}/{run_id} (gotrain.stresslab.runner,
+// logs/stresslab/<dataset>/<run_id>.json). "Not run" is the normal case
+// until an engineer/agent calls run_stresslab on a candidate -- shown
+// plainly, never inferred from clean validation accuracy alone.
+// ---------------------------------------------------------------------
+
+const FRAGILITY_TONE = { robust: 'green', fragile: 'amber', severely_fragile: 'red', unknown: 'slate' }
+
+export function StressLabCard({ dataset, runId }) {
+  const { data, loading } = useJson(
+    dataset && runId ? `api/stresslab/${encodeURIComponent(dataset)}/${encodeURIComponent(runId)}` : null,
+    [dataset, runId],
+  )
+
+  return (
+    <Panel>
+      <PanelTitle right={<ShieldAlert className="h-3.5 w-3.5 text-amber-400" />}>
+        StressLab Robustness
+      </PanelTitle>
+      {!dataset || !runId ? (
+        <Empty>no run selected</Empty>
+      ) : loading ? (
+        <Empty>loading…</Empty>
+      ) : !data || data.not_run ? (
+        <Empty>NOT RUN — run_stresslab has not been called for this run</Empty>
+      ) : (
+        <div className="px-4 py-3">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <span className="font-mono text-[0.64rem] text-slate-400">run {runId.slice(0, 8)}</span>
+            <Badge tone={data.summary.n_fragile > 0 ? 'amber' : 'green'}>{data.summary.overall_verdict}</Badge>
+            <span className="ml-auto font-mono text-[0.6rem] text-slate-500">
+              clean metric {fmtPct(data.summary.clean_metric)}
+            </span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-left">
+              <thead>
+                <tr className="border-b border-edge/60 font-mono text-[0.56rem] uppercase tracking-wider text-slate-500">
+                  <th className="px-2 py-1.5">Perturbation</th>
+                  <th className="px-2 py-1.5">Severity</th>
+                  <th className="px-2 py-1.5">Clean</th>
+                  <th className="px-2 py-1.5">Perturbed</th>
+                  <th className="px-2 py-1.5">Drop</th>
+                  <th className="px-2 py-1.5">Fragility</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(data.results || []).map((r, i) => (
+                  <tr key={i} className="border-b border-edge/30 font-mono text-[0.64rem]">
+                    <td className="px-2 py-1.5 text-slate-200">{r.perturbation}</td>
+                    <td className="px-2 py-1.5 text-slate-400">{r.severity}</td>
+                    <td className="px-2 py-1.5 text-slate-400">{fmtPct(r.clean_metric)}</td>
+                    <td className="px-2 py-1.5 text-slate-400">{fmtPct(r.perturbed_metric)}</td>
+                    <td className="px-2 py-1.5 text-amber-300">
+                      {typeof r.relative_drop === 'number' ? `${(r.relative_drop * 100).toFixed(1)}%` : '--'}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <Badge tone={FRAGILITY_TONE[r.fragility] || 'slate'}>{r.fragility}</Badge>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </Panel>
+  )
+}
+
+// ---------------------------------------------------------------------
+// 6. GoAudit -- latest engineering report for the dataset.
+// GET /api/goaudit/{dataset} (gotrain.goaudit, logs/goaudit/<dataset>/).
+// Historical reports are listed and selectable via GET
+// /api/goaudit/{dataset}/{timestamp} -- never generated from the
+// frontend, only ever read back from what generate_goaudit_report (the
+// agent tool) already wrote.
+// ---------------------------------------------------------------------
+
+export function GoAuditCard({ dataset }) {
+  const [selected, setSelected] = useState(null)
+  const { data: latestWrap, loading: loadingLatest } = useJson(
+    dataset ? `api/goaudit/${encodeURIComponent(dataset)}` : null, [dataset],
+  )
+  const { data: historicalReport, loading: loadingHistorical } = useJson(
+    dataset && selected ? `api/goaudit/${encodeURIComponent(dataset)}/${encodeURIComponent(selected)}` : null,
+    [dataset, selected],
+  )
+
+  const report = selected ? historicalReport : latestWrap?.report
+  const loading = selected ? loadingHistorical : loadingLatest
+  const history = latestWrap?.history || []
+
+  return (
+    <Panel>
+      <PanelTitle
+        right={
+          history.length > 1 ? (
+            <select
+              className="rounded-md border border-edge bg-slate-900/70 px-2 py-1 font-mono text-[0.6rem] text-slate-200"
+              value={selected || ''}
+              onChange={(e) => setSelected(e.target.value || null)}
+            >
+              <option value="">latest</option>
+              {history.slice().reverse().map((ts) => (
+                <option key={ts} value={ts}>{ts}</option>
+              ))}
+            </select>
+          ) : (
+            <ClipboardList className="h-3.5 w-3.5 text-sky-400" />
+          )
+        }
+      >
+        GoAudit Report
+      </PanelTitle>
+      {!dataset ? (
+        <Empty>no dataset selected</Empty>
+      ) : loading ? (
+        <Empty>loading…</Empty>
+      ) : !report ? (
+        <Empty>no GoAudit report generated yet for this dataset</Empty>
+      ) : (
+        <div className="space-y-3 px-4 py-3">
+          <div className="grid grid-cols-2 gap-px bg-edge/50 sm:grid-cols-4">
+            <Field label="Runs" value={report.progress.n_runs} />
+            <Field label="Trend" value={report.progress.trend.replaceAll('_', ' ')} tone="text-sky-300" />
+            <Field label="Best val" value={fmtPct(report.progress.best_val_metric)} tone="text-emerald-300" />
+            <Field
+              label="Noise evidence"
+              value={report.statistical_confidence.has_data ? 'available' : 'none yet'}
+              tone={report.statistical_confidence.has_data ? 'text-emerald-300' : 'text-slate-500'}
+            />
+          </div>
+
+          {report.failures.length > 0 && (
+            <div>
+              <div className="mb-1 font-mono text-[0.58rem] uppercase tracking-wider text-rose-400">
+                Failures ({report.failures.length})
+              </div>
+              <ul className="space-y-1">
+                {report.failures.map((f, i) => (
+                  <li key={i} className="font-mono text-[0.62rem] text-rose-300">
+                    <Badge tone={f.severity === 'critical' ? 'red' : 'amber'}>{f.severity}</Badge> {f.message}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div>
+            <div className="mb-1 font-mono text-[0.58rem] uppercase tracking-wider text-slate-500">
+              Recommendations
+            </div>
+            <ul className="space-y-1">
+              {report.recommendations.map((r, i) => (
+                <li key={i} className="font-mono text-[0.62rem] text-slate-300">• {r}</li>
+              ))}
+            </ul>
+          </div>
+
+          {report.decisions.length > 0 && (
+            <div>
+              <div className="mb-1 font-mono text-[0.58rem] uppercase tracking-wider text-slate-500">
+                Decisions ({report.decisions.length})
+              </div>
+              <div className="max-h-40 space-y-1 overflow-y-auto">
+                {report.decisions.map((d, i) => (
+                  <div key={i} className="font-mono text-[0.6rem] text-slate-400">
+                    {d.run_id?.slice(0, 8)} — <span className="text-slate-300">{d.decision}</span>
+                    {typeof d.val_metric === 'number' && ` · ${fmtPct(d.val_metric)}`}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="font-mono text-[0.56rem] text-slate-600">
+            generated {fmtTime(report.generated_at)} · {report.statistical_confidence.note}
+          </div>
+        </div>
+      )}
+    </Panel>
+  )
+}

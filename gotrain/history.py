@@ -68,7 +68,19 @@ def _parse(ts: Optional[str]) -> Optional[datetime]:
 
 
 def new_session_id() -> str:
-    return "session_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    """Pre-existing bug fixed here: millisecond-truncated timestamps alone
+    collide under rapid successive calls (seen in practice once this
+    module's own test suite grew dense enough to trigger it -- two
+    start_session() calls landing in the same millisecond silently
+    overwrote one session's file). A short random suffix makes collision
+    astronomically unlikely without losing the timestamp prefix
+    list_sessions() et al. read for display -- sort order itself always
+    comes from the stored started_at field, never from the id string.
+    """
+    import secrets
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    return f"session_{stamp}_{secrets.token_hex(3)}"
 
 
 def _session_path(session_id: str) -> Path:
@@ -227,6 +239,139 @@ def _windowed_events(start: Optional[datetime], end: Optional[datetime]) -> list
     return deduped
 
 
+# Training Health card states. UNSTABLE is deliberately not produced by
+# _training_health below -- gotrain/experiment_planner.py's
+# diagnose_run_record has no loss-spike/NaN/divergence diagnosis to map
+# from, and the brief is explicit: map existing diagnoses, don't invent a
+# new heuristic. The state stays defined (so the UI has a real place to
+# render it) for whenever a diagnosis that warrants it exists upstream.
+HEALTH_HEALTHY = "HEALTHY"
+HEALTH_OVERFITTING = "OVERFITTING"
+HEALTH_UNDERFITTING = "UNDERFITTING"
+HEALTH_UNSTABLE = "UNSTABLE"
+HEALTH_UNKNOWN = "UNKNOWN"
+
+# gotrain/experiment_planner.py diagnose_run_record()'s real vocabulary
+# (the only diagnoses that module ever produces) mapped to one evidence
+# phrase each -- plain-English renderings of the SAME evidence numbers
+# diagnose_run_record already computed (train_loss, val_metric), not new
+# measurements. "possible_" is dropped from the label; the uncertainty is
+# still real (these are heuristics over recorded numbers, not a
+# re-inference over the model -- see experiment_planner.py's own
+# docstring) but the card has no room for that caveat, so the evidence
+# line names the literal numbers instead of overclaiming confidence.
+_DIAGNOSIS_EVIDENCE = {
+    "possible_overfitting": lambda ev: (
+        f"train loss {ev['train_loss']:.3f} but val metric only {ev['val_metric']:.3f}"
+        if "train_loss" in ev and "val_metric" in ev else "low train loss, validation lagging"
+    ),
+    "possible_underfitting": lambda ev: (
+        f"train loss still {ev['train_loss']:.3f}, val metric {ev['val_metric']:.3f}"
+        if "train_loss" in ev and "val_metric" in ev else "train loss has not dropped enough yet"
+    ),
+}
+
+
+def _training_health(dataset: Optional[str], runs: list) -> dict:
+    """{"state": one of HEALTH_*, "evidence": [<=2 short strings]} for the
+    most recently completed run in this session's window -- reuses
+    gotrain.experiment_planner.get_training_diagnostics exactly as an
+    agent tool call would, rather than re-deriving anything from scratch.
+    UNKNOWN (not an error) whenever there is no completed run yet to
+    diagnose, or the lookup itself fails for any reason -- diagnostics
+    are a courtesy overlay on top of the real run data, never allowed to
+    break session summary building.
+    """
+    if not runs or not dataset:
+        return {"state": HEALTH_UNKNOWN, "evidence": []}
+
+    latest = max(runs, key=lambda r: r.get("timestamp") or "")
+    run_id = latest.get("run_id")
+    if not run_id:
+        return {"state": HEALTH_UNKNOWN, "evidence": []}
+
+    try:
+        from gotrain.experiment_planner import get_training_diagnostics
+
+        diagnostics = get_training_diagnostics(dataset, run_id)
+    except Exception:
+        return {"state": HEALTH_UNKNOWN, "evidence": []}
+
+    diagnoses = diagnostics.get("diagnoses") or []
+    evidence_data = diagnostics.get("evidence") or {}
+
+    if "possible_overfitting" in diagnoses:
+        state = HEALTH_OVERFITTING
+    elif "possible_underfitting" in diagnoses:
+        state = HEALTH_UNDERFITTING
+    else:
+        state = HEALTH_HEALTHY
+
+    evidence = []
+    for name in ("possible_overfitting", "possible_underfitting"):
+        if name in diagnoses:
+            evidence.append(_DIAGNOSIS_EVIDENCE[name](evidence_data))
+    if not evidence and "diminishing_returns" in diagnoses:
+        evidence.append("validation gains have stalled run over run")
+    if len(evidence) < 2 and "class_imbalance_hurting_minority_classes" in diagnoses:
+        gap = evidence_data.get("per_class_metric_gap")
+        evidence.append(f"widening per-class gap ({gap:.2f})" if isinstance(gap, (int, float)) else "widening per-class gap")
+
+    return {"state": state, "evidence": evidence[:2], "run_id": run_id}
+
+
+# Statistical Improvement Verification states, mapped from
+# gotrain/statistics.py::is_improvement_significant's existing tri-state
+# `significant` field (True / False / None) -- no new verdict logic here,
+# just naming the three cases that module already distinguishes.
+STAT_VERIFIED = "VERIFIED"
+STAT_NOT_ABOVE_NOISE = "NOT_ABOVE_NOISE"
+STAT_INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+
+def _attach_statistical_verdicts(dataset: Optional[str], runs: list) -> list:
+    """Attach `statistical_verdict` (VERIFIED/NOT_ABOVE_NOISE/
+    INSUFFICIENT_EVIDENCE + reason + noise_floor) to a copy of each run,
+    reusing gotrain.statistics.is_improvement_significant exactly against
+    one shared estimate_noise_floor call for the whole list -- never a
+    re-derivation, and never one noise-floor scan of the dataset's full
+    ledger per run. Returns `runs` with a None verdict on every entry if
+    the dataset is missing or the statistics call fails; a courtesy
+    field, never allowed to break run comparison itself.
+    """
+    if not dataset:
+        return [{**r, "statistical_verdict": None} for r in runs]
+    try:
+        from gotrain import statistics
+
+        noise_floor = statistics.estimate_noise_floor(dataset)
+    except Exception:
+        return [{**r, "statistical_verdict": None} for r in runs]
+
+    out = []
+    for run in runs:
+        try:
+            verdict = statistics.is_improvement_significant(run.get("delta_vs_parent"), noise_floor)
+        except Exception:
+            out.append({**run, "statistical_verdict": None})
+            continue
+        if verdict["significant"] is True:
+            state = STAT_VERIFIED
+        elif verdict["significant"] is False:
+            state = STAT_NOT_ABOVE_NOISE
+        else:
+            state = STAT_INSUFFICIENT_EVIDENCE
+        out.append({
+            **run,
+            "statistical_verdict": {
+                "state": state,
+                "reason": verdict.get("reason"),
+                "noise_floor": noise_floor.get("noise_floor"),
+            },
+        })
+    return out
+
+
 def _derive(record: dict) -> dict:
     """Attach the metrics this session produced, derived from the ledger
     rather than stored here. See the module docstring for why.
@@ -254,6 +399,8 @@ def _derive(record: dict) -> dict:
         record["best_model"] = config.get("backbone") or config.get("encoder") or config.get("architecture")
     else:
         record["best_model"] = None
+
+    record["training_health"] = _training_health(record.get("dataset"), runs)
 
     events = _windowed_events(start, end)
     record["event_count"] = len(events)
@@ -315,7 +462,8 @@ def load_session(session_id: str) -> Optional[dict]:
     except Exception:
         all_runs = []
 
-    record["runs"] = [r for r in all_runs if _in_window(r.get("timestamp"), start, end)]
+    runs = [r for r in all_runs if _in_window(r.get("timestamp"), start, end)]
+    record["runs"] = _attach_statistical_verdicts(record.get("dataset"), runs)
     record["events"] = _windowed_events(start, end)
     record["live_metrics"] = [
         m for m in _read_jsonl(LIVE_METRICS_PATH) if _in_window(m.get("timestamp"), start, end)

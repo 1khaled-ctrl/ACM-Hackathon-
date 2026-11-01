@@ -523,6 +523,95 @@ def api_history_detail(session_id: str) -> dict:
     return record
 
 
+@app.get("/api/lineage/{dataset}")
+def api_lineage(dataset: str) -> dict:
+    """Recursive self-improvement lineage: every run for `dataset`
+    annotated with its generation, children and (if it warm-started) the
+    parent checkpoint it loaded. gotrain.ledger.get_lineage_tree builds
+    the parent/child forest from the ledger alone; warm-start status is
+    enriched here, per node, by reading each run's own metrics.json
+    (gotrain.experiment_planner.get_run_metrics_file) -- that field is
+    not on the ledger record itself, only in the file the training
+    templates write, so a run can be real (in the ledger) while its
+    warm-start status is unknown (metrics.json missing, e.g. an old run
+    cleaned up manually). Never claims warm-started=true without that
+    file actually recording it.
+    """
+    from gotrain import experiment_planner
+    from gotrain import ledger
+
+    nodes = ledger.get_lineage_tree(dataset)
+    enriched = []
+    for node in nodes:
+        metrics = experiment_planner.get_run_metrics_file(dataset, node["run_id"])
+        warm_started_from = (metrics or {}).get("warm_started_from")
+        enriched.append({
+            "run_id": node["run_id"],
+            "parent_id": node.get("parent_id"),
+            "children": node["children"],
+            "generation": node["generation"],
+            "version_id": node.get("version_id"),
+            "val_metric": node.get("val_metric"),
+            "delta_vs_parent": node.get("delta_vs_parent"),
+            "decision": node.get("decision"),
+            "config": node.get("config"),
+            "timestamp": node.get("timestamp"),
+            # True only when metrics.json actually recorded a successful
+            # warm-start load; False (not just absent) when the run asked
+            # for warm_start_from_parent but metrics.json has no record of
+            # it loading -- that combination means the run's config
+            # requested it, not that it silently didn't happen.
+            "warm_start_requested": bool((node.get("config") or {}).get("warm_start_from_parent")),
+            "warm_started_from": warm_started_from,
+        })
+    return {"dataset": dataset, "runs": enriched}
+
+
+@app.get("/api/stresslab/{dataset}/{run_id}")
+def api_stresslab(dataset: str, run_id: str) -> dict:
+    """StressLab robustness report for one run, or not_run=true if
+    run_stresslab was never called for it -- read-only over
+    logs/stresslab/<dataset>/<run_id>.json (gotrain.stresslab.runner).
+    Never runs the battery itself (that needs torch + the real dataset +
+    a saved checkpoint, and is only ever triggered by the agent tool).
+    """
+    from gotrain.stresslab import runner as stresslab_runner
+
+    report = stresslab_runner.read_report(dataset, run_id)
+    if report is None:
+        return {"dataset": dataset, "run_id": run_id, "not_run": True}
+    return {"dataset": dataset, "run_id": run_id, "not_run": False, **report}
+
+
+@app.get("/api/goaudit/{dataset}")
+def api_goaudit_latest(dataset: str) -> dict:
+    """Most recent GoAudit report for `dataset`, or available=false if
+    generate_goaudit_report has never been called for it (the agent tool
+    in gotrain/agent.py -- this endpoint never generates one itself, only
+    reads what was already written).
+    """
+    from gotrain import goaudit
+
+    timestamps = goaudit.list_reports(dataset)
+    if not timestamps:
+        return {"dataset": dataset, "available": False, "report": None, "history": []}
+    latest = goaudit.read_report(dataset, timestamps[-1])
+    return {"dataset": dataset, "available": True, "report": latest, "history": timestamps}
+
+
+@app.get("/api/goaudit/{dataset}/{generated_at}")
+def api_goaudit_report(dataset: str, generated_at: str) -> dict:
+    """One historical GoAudit report by its timestamp (as returned in
+    the `history` list from /api/goaudit/{dataset}).
+    """
+    from gotrain import goaudit
+
+    report = goaudit.read_report(dataset, generated_at)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"no GoAudit report {generated_at!r} for {dataset!r}")
+    return report
+
+
 @app.get("/api/agent/log")
 def api_agent_log(tail: int = 200) -> dict:
     if not AGENT_LOG_PATH.exists():

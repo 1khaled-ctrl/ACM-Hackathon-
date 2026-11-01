@@ -5,7 +5,9 @@ import {
 } from 'recharts'
 import { ArrowLeft, CheckCircle2, Clock, History as HistoryIcon, OctagonX, TriangleAlert, X } from 'lucide-react'
 import { Badge, Button, Panel, PanelTitle, cn } from './ui'
-import { DecisionTimeline, EventFeed, RunComparison } from './MissionPanels'
+import {
+  DecisionTimeline, EventFeed, GoAuditCard, LineageCard, RunComparison, StressLabCard, TrainingHealthCard,
+} from './MissionPanels'
 
 /**
  * Mission history: every session launched from this dashboard.
@@ -244,14 +246,23 @@ function SessionDetail({ session: s }) {
         </div>
       </Panel>
 
-      {/* Decision Timeline, Run Comparison and Event Feed are the SAME
-          components the live dashboard uses (dashboard/frontend/src/
-          components/MissionPanels.jsx) over the SAME `mission` shape --
-          gotrain/history.py's load_session() output -- so a finished
-          mission's History Details page can never show a different
-          picture than what was visible while it was running. */}
+      {/* Training Health, Decision Timeline, Run Comparison and Event Feed
+          are the SAME components the live dashboard uses
+          (dashboard/frontend/src/components/MissionPanels.jsx) over the
+          SAME `mission` shape -- gotrain/history.py's load_session()
+          output, where training_health was already computed and saved at
+          _derive() time -- so a finished mission's History Details page
+          can never show a different picture than what was visible while
+          it was running. */}
+      <TrainingHealthCard mission={s} />
       <DecisionTimeline mission={s} currentRunId={null} />
       <RunComparison mission={s} currentRun={null} />
+
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <LineageCard dataset={s.dataset} />
+        <GoAuditCard dataset={s.dataset} />
+      </div>
+      <StressLabCard dataset={s.dataset} runId={s.best_run_id} />
 
       {curves.length > 0 && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">

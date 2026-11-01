@@ -12,7 +12,9 @@ import { Wordmark } from './components/Logo'
 import { HistoryButton, HistoryOverlay } from './components/History'
 import { Launcher } from './components/Launcher'
 import { MissionControl } from './components/MissionControl'
-import { DecisionTimeline, EventFeed, RunComparison } from './components/MissionPanels'
+import {
+  DecisionTimeline, EventFeed, GoAuditCard, LineageCard, RunComparison, StressLabCard, TrainingHealthCard,
+} from './components/MissionPanels'
 import { Pipeline } from './components/Pipeline'
 import { Backdrop, Badge, Meter, Panel, PanelTitle, Ring, Stat, cn } from './components/ui'
 
@@ -303,11 +305,23 @@ export default function App() {
           />
         </div>
 
+        {/* ---- training health (compact) ---- */}
+        <TrainingHealthCard mission={snap?.mission} />
+
         {/* ---- decision timeline (full width -- hypothesis -> config -> result -> outcome -> decision) ---- */}
         <DecisionTimeline mission={snap?.mission} currentRunId={liveRunBelongsToMission ? run.run_id : null} />
 
         {/* ---- run comparison (full width table) ---- */}
         <RunComparison mission={snap?.mission} currentRun={liveRunBelongsToMission ? run : null} />
+
+        {/* ---- recursive self-improvement lineage + GoAudit (dataset-wide, span missions) ---- */}
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <LineageCard dataset={snap?.mission?.dataset} />
+          <GoAuditCard dataset={snap?.mission?.dataset} />
+        </div>
+
+        {/* ---- StressLab robustness for the mission's best run so far ---- */}
+        <StressLabCard dataset={snap?.mission?.dataset} runId={snap?.mission?.best_run_id} />
 
         {/* ---- live event feed + datasets ---- */}
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">

@@ -94,6 +94,17 @@ def _read_run_metrics(dataset: str, run_id: str) -> Optional[dict]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def get_run_metrics_file(dataset: str, run_id: str) -> Optional[dict]:
+    """Public read-only accessor for a run's saved metrics.json (the same
+    file _read_run_metrics reads internally) -- exposed for callers
+    outside this module (the FastAPI bridge's lineage endpoint) that need
+    fields this file has but the ledger record doesn't, e.g.
+    warm_started_from. None if the run has no metrics.json (never ran
+    locally, or was cleaned up) -- never raises for a missing file.
+    """
+    return _read_run_metrics(dataset, run_id)
+
+
 def diagnose_run_record(run_record: dict, metrics: Optional[dict], task_type: str) -> dict:
     """Pure core: given an already-loaded ledger record and (optionally)
     its run_dir metrics.json, return {"diagnoses": [...], "evidence": {...}}.

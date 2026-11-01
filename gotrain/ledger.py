@@ -237,3 +237,56 @@ def get_lineage(run_id: str) -> list:
         current = record.get("parent_id")
     chain.reverse()
     return chain
+
+
+def get_lineage_tree(dataset: str) -> list:
+    """Every run for `dataset`, each annotated with `children` (the
+    run_ids whose parent_id points at it) and `generation` (0 for a root
+    run with no parent_id, otherwise its parent's generation + 1) --
+    the whole parent/child forest for a dataset, not just one run's
+    ancestor chain (that's get_lineage above). Recursive self-improvement
+    (gotrain/tools/training.py's warm_start_from_parent) and ordinary
+    single-variable-tweak runs both use parent_id identically, so this
+    reflects BOTH without needing to distinguish them -- the caller (the
+    NEXUS lineage endpoint) enriches with warm-start status separately,
+    read from metrics.json, since that's experiment_planner's concern,
+    not this module's.
+
+    A run whose parent_id points at a run_id that does not exist (should
+    not happen, but ledger.jsonl is hand-editable JSON lines) is treated
+    as its own root rather than raising -- a lineage VIEW must degrade
+    gracefully, unlike get_lineage's strict walk for a single chain.
+    """
+    records = get_history(dataset)
+    by_id = {r["run_id"]: r for r in records}
+
+    generation: dict = {}
+
+    def _generation(run_id: str, seen: Optional[set] = None) -> int:
+        if run_id in generation:
+            return generation[run_id]
+        seen = seen or set()
+        if run_id in seen:
+            return 0  # cycle guard -- treat as a root rather than recursing forever
+        seen.add(run_id)
+        record = by_id.get(run_id)
+        parent_id = record.get("parent_id") if record else None
+        gen = 0 if parent_id is None or parent_id not in by_id else _generation(parent_id, seen) + 1
+        generation[run_id] = gen
+        return gen
+
+    children: dict = {r["run_id"]: [] for r in records}
+    for r in records:
+        parent_id = r.get("parent_id")
+        if parent_id in children:
+            children[parent_id].append(r["run_id"])
+
+    nodes = []
+    for r in records:
+        nodes.append({
+            **r,
+            "children": children.get(r["run_id"], []),
+            "generation": _generation(r["run_id"]),
+        })
+    nodes.sort(key=lambda n: (n["generation"], n.get("timestamp") or ""))
+    return nodes
