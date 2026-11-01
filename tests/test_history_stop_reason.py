@@ -141,3 +141,18 @@ def test_stop_reason_is_persisted_on_the_session_and_visible_in_list_sessions(hi
 
     loaded = history.load_session(rec["session_id"])
     assert loaded["stop_reason"] == reason
+
+
+def test_other_datasets_events_in_the_window_are_not_attributed(history_env):
+    """A timeout or submission for a DIFFERENT dataset inside this session's
+    time window (e.g. a manual run from a notebook) must not be counted as
+    this mission's."""
+    history, _, logging_utils = history_env
+    rec = history.start_session(dataset="m-pv4ger-seg", max_runs=3, run_minutes=5)
+    logging_utils.log_event("training_timed_out", dataset="m-eurosat", timeout_seconds=300)
+    logging_utils.log_event("final_model_submitted", dataset="m-eurosat", run_id="other-run")
+    logging_utils.log_event("training_timed_out", dataset="m-pv4ger-seg", timeout_seconds=300)
+
+    loaded = history.load_session(rec["session_id"])
+    assert loaded["timed_out_runs"] == 1
+    assert loaded["final_model_run_id"] is None

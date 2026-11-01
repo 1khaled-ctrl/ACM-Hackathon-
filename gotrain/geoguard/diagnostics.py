@@ -202,19 +202,25 @@ def load_train_sample(dataset: str, task_type: str, max_samples: int = 300):
 
     task_dir = _find_task_dir(dataset)
     task_specs = geobench.load_task_specs(task_dir)
-    band_names = [b.name for b in task_specs.bands_info]
     is_multi_label = spec_for(dataset, task_specs=task_specs).is_multi_label
 
     ds = task_specs.get_dataset(split="train")
     n = min(len(ds), max_samples)
 
-    images, labels = [], []
+    images, labels, band_names = [], [], None
     for i in range(n):
         sample = ds[i]
-        arr, _ = sample.pack_to_3d(band_names=band_names)
-        images.append(arr.astype(np.float32))
+        arr, mask, names = _inspection_arrays(sample, task_type == "segmentation")
+        if band_names is None:
+            band_names = names
+            # Bound by bytes as well as count: a 13-band 256x256 or
+            # 373-channel sample is far bigger than the 3-band ones.
+            n = min(n, max(1, INSPECTION_MAX_BYTES // max(arr.nbytes, 1)))
+        if i >= n:
+            break
+        images.append(arr)
         if task_type == "segmentation":
-            labels.append(sample.label.data)
+            labels.append(mask)
         elif is_multi_label:
             labels.append(np.asarray(sample.label, dtype=np.float32))
         else:
@@ -226,3 +232,37 @@ def load_train_sample(dataset: str, task_type: str, max_samples: int = 300):
     else:
         labels = np.array(labels, dtype=np.int64)
     return images, labels, band_names, task_specs
+
+
+# Upper bound on the inspection sample (GeoGuard / DataIQ structural scan).
+INSPECTION_MAX_BYTES = 1_500_000_000
+
+
+def _inspection_arrays(sample, is_segmentation: bool):
+    """(image float32 HxWxC, mask or None, per-channel names) for inspection.
+
+    Bands of different native sizes (m-NeonTree: RGB 400x400, Canopy Height
+    and the 369-channel Neon hyperspectral band at 40x40) are brought DOWN
+    to the smallest common size by integer striding, and the mask with them.
+    Upsampling instead (what training does via pack_to_3d(resample=True))
+    costs ~40 s and ~239 MB per NeonTree sample, and mismatched image/mask
+    sizes would make DataIQ flag every sample as invalid. Same-size datasets
+    are unaffected (no striding)."""
+    datas, names = [], []
+    for band in sample.bands:
+        data = band.data if band.data.ndim == 3 else band.data[:, :, None]
+        datas.append(data)
+        expanded = band.band_info.expand_name()
+        names.extend(expanded if len(expanded) == data.shape[2] else [band.band_info.name] * data.shape[2])
+    min_h = min(d.shape[0] for d in datas)
+    min_w = min(d.shape[1] for d in datas)
+
+    def _shrink(array):
+        if array.shape[0] == min_h and array.shape[1] == min_w:
+            return array
+        step_h, step_w = array.shape[0] // min_h, array.shape[1] // min_w
+        return array[: min_h * step_h : step_h, : min_w * step_w : step_w]
+
+    image = np.concatenate([_shrink(d).astype(np.float32) for d in datas], axis=2)
+    mask = _shrink(np.asarray(sample.label.data)) if is_segmentation else None
+    return image, mask, names

@@ -83,15 +83,22 @@ DIAGNOSIS_TO_CANDIDATES = {
 }
 
 
-def _run_metrics_path(dataset: str, run_id: str) -> Path:
-    return RUNS_DIR / dataset / run_id / "metrics.json"
+def _run_metrics_path(dataset: str, run_id: str) -> Optional[Path]:
+    from gotrain import run_artifacts
+
+    return run_artifacts.metrics_path(dataset, run_id, RUNS_DIR)
 
 
 def _read_run_metrics(dataset: str, run_id: str) -> Optional[dict]:
     path = _run_metrics_path(dataset, run_id)
-    if not path.exists():
+    if path is None:
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        # A killed run can leave a half-written metrics.json; treat it as
+        # missing rather than failing every diagnostics/lineage read.
+        return None
 
 
 def get_run_metrics_file(dataset: str, run_id: str) -> Optional[dict]:

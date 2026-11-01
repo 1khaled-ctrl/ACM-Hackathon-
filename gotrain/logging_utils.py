@@ -123,7 +123,12 @@ def read_events(event: Optional[str] = None, dataset: Optional[str] = None) -> l
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a writer killed mid-line (OOM/timeout SIGKILL) leaves a torn line
+            if not isinstance(record, dict):
+                continue
             if event is not None and record.get("event") != event:
                 continue
             if dataset is not None and record.get("dataset") != dataset:

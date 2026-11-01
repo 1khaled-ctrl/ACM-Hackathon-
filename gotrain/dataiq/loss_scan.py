@@ -53,15 +53,21 @@ HIGH_LOSS_PERCENTILE = 95
 HIGH_CONFIDENCE_WRONG_THRESHOLD = 0.9
 
 
-def _run_dir(dataset: str, run_id: str) -> Path:
-    run_dir = RUNS_DIR / dataset / run_id
-    checkpoint = run_dir / "best_model.pt"
-    if not checkpoint.exists():
-        raise FileNotFoundError(
-            f"No checkpoint found for run {run_id!r} at {checkpoint}. Expected "
-            "runs/<dataset>/<run_id>/best_model.pt, written by the training templates."
-        )
-    return run_dir
+def _normalization(dataset: str, run_id: str, train_images, template, logger):
+    """Normalize exactly as the run was trained (its saved stats); fall back
+    to stats of the scanned subset only for older runs without them."""
+    from gotrain import run_artifacts
+
+    saved = run_artifacts.load_normalization(dataset, run_id, RUNS_DIR)
+    if saved is not None:
+        return saved
+    return template.compute_train_band_stats(train_images, logger)
+
+
+def _checkpoint(dataset: str, run_id: str) -> Path:
+    from gotrain import run_artifacts
+
+    return run_artifacts.checkpoint_path(dataset, run_id, RUNS_DIR)
 
 
 def _get_run_record(dataset: str, run_id: str) -> dict:
@@ -122,7 +128,7 @@ def scan_classification_run(dataset: str, run_id: str, max_samples: Optional[int
 
     run_record = _get_run_record(dataset, run_id)
     config = run_record["config"]
-    run_dir = _run_dir(dataset, run_id)
+    checkpoint = _checkpoint(dataset, run_id)
 
     import logging
 
@@ -135,7 +141,6 @@ def scan_classification_run(dataset: str, run_id: str, max_samples: Optional[int
     task_specs = geobench.load_task_specs(task_dir)
     all_band_names = [b.name for b in task_specs.bands_info]
     band_names = config.get("bands") or all_band_names
-    n_bands = len(band_names)
     spec = spec_for(dataset, task_specs=task_specs)
     n_classes = spec.n_classes
 
@@ -158,22 +163,21 @@ def scan_classification_run(dataset: str, run_id: str, max_samples: Optional[int
         )
 
     train_images, train_labels = tc.build_dataset_arrays(task_specs, "train", band_names, max_samples, logger)
-    mean, std = tc.compute_train_band_stats(train_images, logger)
+    n_bands = train_images.shape[-1]
+    mean, std = _normalization(dataset, run_id, train_images, tc, logger)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = tc.build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes, band_names)
-    model.load_state_dict(torch.load(run_dir / "best_model.pt", map_location=device))
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
     model = model.to(device)
     model.eval()
-
-    normalized = (train_images - mean.astype(np.float32)) / std.astype(np.float32)
-    normalized = np.transpose(normalized, (0, 3, 1, 2))
+    image_size = config.get("image_size")
 
     batch_size = 32
     all_losses, all_preds, all_confidences = [], [], []
     with torch.no_grad():
-        for start in range(0, len(normalized), batch_size):
-            batch = torch.from_numpy(normalized[start:start + batch_size]).float().to(device)
+        for start in range(0, len(train_images), batch_size):
+            batch = tc.prepare_batch(train_images[start:start + batch_size], mean, std, image_size).to(device)
             targets = torch.from_numpy(train_labels[start:start + batch_size]).long().to(device)
             logits = model(batch)
             losses = F.cross_entropy(logits, targets, reduction="none")
@@ -242,7 +246,7 @@ def scan_segmentation_run(dataset: str, run_id: str, max_samples: Optional[int] 
 
     run_record = _get_run_record(dataset, run_id)
     config = run_record["config"]
-    run_dir = _run_dir(dataset, run_id)
+    checkpoint = _checkpoint(dataset, run_id)
 
     import logging
 
@@ -253,28 +257,25 @@ def scan_segmentation_run(dataset: str, run_id: str, max_samples: Optional[int] 
     task_specs = geobench.load_task_specs(task_dir)
     all_band_names = [b.name for b in task_specs.bands_info]
     band_names = config.get("bands") or all_band_names
-    n_bands = len(band_names)
     n_classes = task_specs.label_type.n_classes
 
     train_images, train_masks = ts.build_dataset_arrays(task_specs, "train", band_names, max_samples, logger)
-    mean, std = ts.compute_train_band_stats(train_images, logger)
+    n_bands = train_images.shape[-1]
+    mean, std = _normalization(dataset, run_id, train_images, ts, logger)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ts.build_model(
         config.get("architecture", "unet"), config.get("encoder", "resnet34"), False, n_bands, n_classes
     )
-    model.load_state_dict(torch.load(run_dir / "best_model.pt", map_location=device))
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
     model = model.to(device)
     model.eval()
-
-    normalized = (train_images.astype(np.float64) - mean) / std
-    normalized = np.transpose(normalized, (0, 3, 1, 2)).astype(np.float32)
 
     batch_size = 8
     all_mean_losses, all_fg_ious = [], []
     with torch.no_grad():
-        for start in range(0, len(normalized), batch_size):
-            batch = torch.from_numpy(normalized[start:start + batch_size]).float().to(device)
+        for start in range(0, len(train_images), batch_size):
+            batch = ts.prepare_batch(train_images[start:start + batch_size], mean, std).to(device)
             targets = torch.from_numpy(train_masks[start:start + batch_size]).long().to(device)
             logits = model(batch)
             pixel_losses = F.cross_entropy(logits, targets, reduction="none")  # (B, H, W)

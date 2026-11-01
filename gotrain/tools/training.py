@@ -83,6 +83,74 @@ def _resolve_warm_start_checkpoint(dataset: str, parent_id: Optional[str]) -> di
     }
 
 
+class ResourceBudgetError(PreflightValidationError):
+    """Raised before spawning when the template's eager train+val load
+    can't fit in available RAM. A PreflightValidationError, so it never
+    costs the agent one of its max_runs."""
+
+
+# Share of currently-available RAM the eager train+val arrays may use; the
+# rest covers the model, optimizer, DataLoader batches and the OS.
+MEMORY_BUDGET_FRACTION = 0.7
+
+
+def check_memory_budget(dataset: str, task_type: str, config: dict) -> None:
+    """Refuse, before any subprocess runs, a config whose eager data load
+    would not fit in RAM -- the way a large split (m-SA-crop-type ~5 GB,
+    m-bigearthnet ~14 GB at float32, m-NeonTree all-bands ~87 GB) used to
+    get the training subprocess OOM-killed (exit -9) with no usable reason.
+    Skipped when memory or the estimate can't be determined."""
+    if task_type not in ("classification", "segmentation"):
+        return
+    try:
+        import psutil
+
+        available = psutil.virtual_memory().available
+    except Exception:
+        return
+    from gotrain.dataset_spec import estimate_training_memory
+
+    estimate = estimate_training_memory(dataset, task_type, config)
+    if estimate is None:
+        return
+    budget = available * MEMORY_BUDGET_FRACTION
+    if estimate["total_bytes"] <= budget:
+        return
+
+    gb = 1e9
+    per_sample = estimate["per_sample_bytes"]
+    val_bytes = per_sample * estimate["n_val"]
+    fits = int((budget - val_bytes) // per_sample) if budget > val_bytes else 0
+    parts = [
+        f"Not enough RAM for this config: loading {estimate['n_train']} train + {estimate['n_val']} "
+        f"validation samples ({estimate['channels']} channels at {estimate['height']}x{estimate['width']}, "
+        f"{per_sample / 1e6:.1f} MB each) needs ~{estimate['total_bytes'] / gb:.1f} GB, but only "
+        f"~{budget / gb:.1f} GB of the {available / gb:.1f} GB currently free is safe to use.",
+    ]
+    if fits >= 1:
+        parts.append(f"Set max_train_samples <= {fits}.")
+    else:
+        parts.append("Set max_val_samples too: the validation split alone exceeds the budget.")
+    shapes = estimate["band_shapes"]
+    if any(c > 1 for c in estimate["band_channels"].values()) or len({tuple(s) for s in shapes.values()}) > 1:
+        parts.append(
+            f"Per-band channels {estimate['band_channels']} and native sizes {shapes}: lower-resolution "
+            f"bands are upsampled to {estimate['height']}x{estimate['width']}, so choosing `bands` "
+            "explicitly can shrink this a lot."
+        )
+    raise ResourceBudgetError(" ".join(parts))
+
+
+def describe_exit_code(returncode: int) -> str:
+    """Short human reason for a training subprocess's non-zero exit."""
+    if returncode < 0:
+        signal_number = -returncode
+        if signal_number == 9:
+            return "killed by SIGKILL (exit -9), usually the OS out-of-memory killer"
+        return f"killed by signal {signal_number}"
+    return f"exited with code {returncode}"
+
+
 def launch_training(
     dataset: str,
     task_type: str,
@@ -176,6 +244,8 @@ def launch_training(
     if task_type in ("classification", "segmentation") and timeout_seconds:
         effective_config = {**effective_config, "_timeout_seconds": timeout_seconds}
 
+    check_memory_budget(dataset, task_type, effective_config)
+
     template_path = TEMPLATES[task_type]
     status.set_action("training", from_=parent_id or "agent", where=dataset)
     log_event("training_started", dataset=dataset, task_type=task_type, config=effective_config)
@@ -209,28 +279,43 @@ def launch_training(
     status.set_current_run(None)
 
     if proc.returncode != 0:
+        reason = describe_exit_code(proc.returncode)
         log_event(
             "training_failed",
             dataset=dataset,
             task_type=task_type,
+            returncode=proc.returncode,
+            reason=reason,
             stderr=proc.stderr[-4000:],
         )
-        raise RuntimeError(f"Training failed for {dataset}: {proc.stderr[-2000:]}")
+        raise RuntimeError(f"Training failed for {dataset} ({reason}): {proc.stderr[-2000:]}")
 
-    result = json.loads(proc.stdout.strip().splitlines()[-1])
-    val_metric = result["val_metric"]
+    stdout_lines = proc.stdout.strip().splitlines()
+    try:
+        result = json.loads(stdout_lines[-1])
+        val_metric = result["val_metric"]
+    except (IndexError, ValueError, KeyError, TypeError):
+        log_event(
+            "training_failed", dataset=dataset, task_type=task_type, returncode=0,
+            reason="exited 0 but printed no result JSON line", stderr=proc.stderr[-4000:],
+        )
+        raise RuntimeError(
+            f"Training for {dataset} exited 0 but did not print its result JSON line "
+            f"(stdout tail: {proc.stdout[-300:]!r})."
+        )
 
-    # The ledger's run_id is generated here (rather than inside
-    # ledger.add_run) so the same id can be stamped into the registry
-    # manifest below, before the ledger record itself exists.
-    ledger_run_id = str(uuid.uuid4())
+    # Use the template's own run directory name as the ledger run_id, so
+    # runs/<dataset>/<run_id>/ (train.log, best_model.pt) is findable from
+    # the ledger. These used to be two unrelated uuids, which made every
+    # runs/<dataset>/<ledger_run_id>/ lookup fail for real runs.
+    run_dir = result.get("run_dir")
+    ledger_run_id = Path(run_dir).name if run_dir else str(uuid.uuid4())
 
     # Promote the run's config/metrics/checkpoint into the versioned model
     # registry (models/<dataset>/<version>/) when the template reported a
     # run_dir — fake_train.py doesn't produce real artifacts, so there's
     # nothing to register for task_type="fake".
     version_id = None
-    run_dir = result.get("run_dir")
     if run_dir is not None:
         version_id = registry.register_run(
             dataset=dataset,

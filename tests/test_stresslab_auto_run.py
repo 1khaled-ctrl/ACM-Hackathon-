@@ -101,7 +101,7 @@ def test_stresslab_failure_does_not_break_submission(isolated_logs, monkeypatch)
     """
     from gotrain.tools import stresslab as stresslab_tools
 
-    def _boom(dataset, task_type, run_id, max_samples=None):
+    def _boom(dataset, task_type, run_id, **kwargs):
         raise FileNotFoundError("no checkpoint found (simulated)")
 
     monkeypatch.setattr(stresslab_tools, "run_stresslab", _boom)
@@ -137,7 +137,7 @@ def test_auto_run_stresslab_directly_handles_real_exception(isolated_logs, monke
     from gotrain import agent as agent_mod_inner
     from gotrain.tools import stresslab as stresslab_tools
 
-    def _boom(dataset, task_type, run_id, max_samples=None):
+    def _boom(dataset, task_type, run_id, **kwargs):
         raise RuntimeError("simulated torch forward pass crash")
 
     monkeypatch.setattr(stresslab_tools, "run_stresslab", _boom)
@@ -160,7 +160,7 @@ def test_auto_run_stresslab_calls_through_for_supported_task_with_checkpoint(iso
 
     calls = []
 
-    def _record_call(dataset, task_type, run_id, max_samples=None):
+    def _record_call(dataset, task_type, run_id, **kwargs):
         calls.append((dataset, task_type, run_id))
         return {"overall_verdict": "robust"}
 
@@ -175,7 +175,7 @@ def test_auto_run_stresslab_calls_through_for_supported_task_with_checkpoint(iso
     assert logging_utils.read_events(event="stresslab_failed") == []
 
 
-def test_auto_run_stresslab_skips_segmentation_with_checkpoint_too():
+def test_auto_run_stresslab_skips_segmentation_with_checkpoint_too(isolated_logs):
     """segmentation is the other supported task_type -- confirms the
     unavailable check isn't accidentally classification-only.
     """
@@ -190,3 +190,50 @@ def test_auto_run_stresslab_skips_segmentation_with_checkpoint_too():
 
     events = logging_utils.read_events(event="stresslab_unavailable")
     assert any(e["run_id"] == "run-abc" and "checkpoint" in e["reason"] for e in events)
+
+
+def test_auto_run_passes_bounded_samples_and_time_budget(isolated_logs, monkeypatch):
+    """The automatic run happens inside submit_final_model in the agent
+    process, so it must be bounded in both samples and wall-clock time."""
+    from gotrain.tools import stresslab as stresslab_tools
+
+    seen = {}
+
+    def _record(dataset, task_type, run_id, **kwargs):
+        seen.update(kwargs)
+        return {"overall_verdict": "robust"}
+
+    monkeypatch.setattr(stresslab_tools, "run_stresslab", _record)
+    agent_mod._auto_run_stresslab("m-eurosat", "run-1", {"task_type": "classification", "version_id": "v1"})
+    assert seen["max_samples"] == agent_mod.AUTO_STRESSLAB_MAX_SAMPLES
+    assert seen["time_budget_seconds"] == agent_mod.AUTO_STRESSLAB_TIME_BUDGET_SECONDS
+
+
+def test_missing_checkpoint_is_reported_unavailable_not_failed(isolated_logs, monkeypatch):
+    from gotrain.tools import stresslab as stresslab_tools
+
+    def _missing(dataset, task_type, run_id, **kwargs):
+        raise FileNotFoundError("No checkpoint found for run 'run-1'")
+
+    monkeypatch.setattr(stresslab_tools, "run_stresslab", _missing)
+    agent_mod._auto_run_stresslab("m-eurosat", "run-1", {"task_type": "classification", "version_id": "v1"})
+    assert logging_utils.read_events(event="stresslab_unavailable")
+    assert not logging_utils.read_events(event="stresslab_failed")
+
+
+def test_battery_time_budget_produces_an_explicit_partial_report():
+    import time
+
+    import numpy as np
+
+    from gotrain.stresslab import runner
+
+    def slow_evaluate(images):
+        time.sleep(0.05)
+        return 0.8
+
+    result = runner.run_perturbation_battery(slow_evaluate, np.zeros((2, 4, 4, 3), dtype=np.float32), time_budget_seconds=0.12)
+    assert result["truncated"] is True
+    assert 0 < result["n_perturbations_tested"] < result["n_perturbations_planned"]
+    assert result["overall_verdict"].startswith("partial")
+    assert result["clean_metric"] == 0.8

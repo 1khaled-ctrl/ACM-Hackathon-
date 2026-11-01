@@ -95,19 +95,15 @@ DEFAULTS = {
 
 BENCHMARK_DIRS = ["classification_v1.0", "segmentation_v1.0"]
 
-# Mirrors train_classification.py's identical constants -- see there for
-# the full rationale (data loading happens entirely before training_start
-# is set, so it's otherwise invisible to this template's own
-# time_budget_minutes check, and was previously only bounded by the parent
-# process's hard, unrecorded subprocess kill).
-LOADING_PHASE_BUDGET_FRACTION = 0.5
-LOADING_DEADLINE_CHECK_EVERY = 200
-
-
-class DataLoadingBudgetExceeded(RuntimeError):
-    """Mirrors train_classification.py's identical exception -- see there
-    for the full rationale.
-    """
+# Loading/time-budget helpers shared with train_classification.py; see
+# gotrain/data_loading.py for why each exists.
+from gotrain import data_loading  # noqa: E402
+from gotrain.data_loading import (  # noqa: E402,F401 -- re-exported for callers/tests
+    LOADING_DEADLINE_CHECK_EVERY,
+    LOADING_PHASE_BUDGET_FRACTION,
+    TRAINING_CUTOFF_FRACTION,
+    DataLoadingBudgetExceeded,
+)
 
 
 def is_oom_error(exc: BaseException) -> bool:
@@ -194,28 +190,27 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
     if max_samples is not None:
         n = min(n, max_samples)
 
-    images = []
-    masks = []
-    n_excluded_in_range = 0
-    for i in range(n):
-        if loading_deadline is not None and i % LOADING_DEADLINE_CHECK_EVERY == 0 and time.time() > loading_deadline:
-            raise DataLoadingBudgetExceeded(
-                f"Loading the {split!r} split for this dataset is taking too long: only "
-                f"{i}/{n} samples loaded before the data-loading time budget was reached. "
-                "At this rate the full load (and any actual training) would exceed this run's "
-                "wall-clock budget. Retry with a smaller max_train_samples/max_val_samples, or "
-                "a larger time_budget_minutes/run budget for this dataset."
-            )
-        if i in excluded_ids:
-            n_excluded_in_range += 1
-            continue
-        sample = ds[i]
-        arr, _ = sample.pack_to_3d(band_names=band_names)
-        images.append(arr)
-        masks.append(sample.label.data)
+    indices = [i for i in range(n) if i not in excluded_ids]
+    n_excluded_in_range = n - len(indices)
+    if not indices:
+        raise ValueError(f"No {split} samples left to load (n={n}, {n_excluded_in_range} excluded).")
 
-    images = np.stack(images, axis=0)
-    masks = np.stack(masks, axis=0)
+    # Preallocated (not list + np.stack) so peak memory is one copy, not
+    # two. Images keep their native dtype (uint8/int16) except float64,
+    # which pack_sample narrows to float32.
+    images = masks = None
+    started_at = time.time()
+    for k, i in enumerate(indices):
+        data_loading.check_loading_budget(split, k, len(indices), started_at, loading_deadline)
+        sample = ds[i]
+        arr = data_loading.pack_sample(sample, band_names)
+        mask = np.asarray(sample.label.data)
+        if images is None:
+            images = np.empty((len(indices),) + arr.shape, dtype=arr.dtype)
+            masks = np.empty((len(indices),) + mask.shape, dtype=mask.dtype)
+        images[k] = arr
+        masks[k] = mask
+
     exclusion_note = f", {n_excluded_in_range} excluded by manifest" if n_excluded_in_range else ""
     logger.info(
         f"Loaded {split} split: {images.shape[0]} samples, images {images.shape}, "
@@ -224,14 +219,21 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
     return images, masks
 
 
+def prepare_batch(images: np.ndarray, mean, std):
+    """(N,H,W,C) numpy batch -> normalized NCHW float tensor, exactly as
+    SegmentationArrayDataset prepares a training input. Used per batch by
+    StressLab, final_eval and the DataIQ loss scan."""
+    import torch
+
+    x = (images.astype(np.float32) - np.asarray(mean, dtype=np.float32)) / np.asarray(std, dtype=np.float32)
+    return torch.from_numpy(np.ascontiguousarray(np.transpose(x, (0, 3, 1, 2))))
+
+
 def compute_train_band_stats(train_images: np.ndarray, logger):
     """Per-band mean/std computed from TRAIN images only. train_images is
     (N, H, W, C) uint8; stats are returned as float64 arrays of length C.
     """
-    flat = train_images.reshape(-1, train_images.shape[-1]).astype(np.float64)
-    mean = flat.mean(axis=0)
-    std = flat.std(axis=0)
-    std[std < 1e-6] = 1.0  # guard against a constant band
+    mean, std = data_loading.band_stats(train_images)
     logger.info(f"TRAIN band stats — mean: {mean.tolist()}, std: {std.tolist()}")
     return mean, std
 
@@ -449,6 +451,9 @@ def main() -> None:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--config", required=True, help="JSON-encoded config dict")
     args = parser.parse_args()
+    # The parent's hard subprocess timeout counts from (roughly) here, so
+    # every internal deadline is measured from this moment too.
+    process_start = time.time()
 
     user_config = json.loads(args.config)
     cfg = {**DEFAULTS, **user_config}
@@ -490,9 +495,8 @@ def main() -> None:
     task_specs = geobench.load_task_specs(task_dir)
     all_band_names = [b.name for b in task_specs.bands_info]
     band_names = cfg["bands"] if cfg["bands"] else all_band_names
-    n_bands = len(band_names)
     n_classes = task_specs.label_type.n_classes
-    logger.info(f"Bands ({n_bands}/{len(all_band_names)} used): {band_names}")
+    logger.info(f"Bands ({len(band_names)}/{len(all_band_names)} used): {band_names}")
     logger.info(f"Image size: {task_specs.patch_size}, classes: {n_classes} ({task_specs.label_type.class_names})")
 
     excluded_ids = set()
@@ -506,12 +510,14 @@ def main() -> None:
     # loading BOTH splits combined, derived from this run's actual
     # subprocess timeout, so a large split can't alone consume the whole
     # budget and get silently SIGKILLed with no checkpoint and no reason.
-    loading_deadline = None
+    loading_deadline = train_cutoff = None
     if cfg["_timeout_seconds"]:
-        loading_deadline = time.time() + cfg["_timeout_seconds"] * LOADING_PHASE_BUDGET_FRACTION
+        loading_deadline = process_start + cfg["_timeout_seconds"] * LOADING_PHASE_BUDGET_FRACTION
+        train_cutoff = process_start + cfg["_timeout_seconds"] * TRAINING_CUTOFF_FRACTION
         logger.info(
-            f"Data-loading budget: {cfg['_timeout_seconds'] * LOADING_PHASE_BUDGET_FRACTION:.0f}s "
-            f"of this run's {cfg['_timeout_seconds']:.0f}s total timeout."
+            f"Time budget: loading until +{cfg['_timeout_seconds'] * LOADING_PHASE_BUDGET_FRACTION:.0f}s, "
+            f"training until +{cfg['_timeout_seconds'] * TRAINING_CUTOFF_FRACTION:.0f}s, "
+            f"of this run's {cfg['_timeout_seconds']:.0f}s timeout."
         )
 
     try:
@@ -527,6 +533,12 @@ def main() -> None:
         logger.error(str(e))
         print(f"DATA LOADING TIMEOUT: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Channel count comes from the packed data, not len(band_names): one
+    # band name can expand to many channels (m-NeonTree's "Neon" band is
+    # 369 hyperspectral channels).
+    n_bands = train_images.shape[-1]
+    logger.info(f"Input channels: {n_bands}")
 
     mean, std = compute_train_band_stats(train_images, logger)
     class_freqs = compute_class_pixel_frequencies(train_masks, n_classes, logger)
@@ -650,6 +662,10 @@ def main() -> None:
                 scaler.update()
                 running_loss += loss.item()
                 n_batches += 1
+                # Soft time cutoff -- see train_classification.py.
+                if train_cutoff is not None and time.time() > train_cutoff:
+                    interrupted_reason = "time_budget"
+                    break
         except (torch.OutOfMemoryError, RuntimeError) as e:
             if not is_oom_error(e):
                 raise
@@ -660,6 +676,17 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        if n_batches == 0 and epoch == 0:
+            logger.error("Time budget exhausted before a single training step completed.")
+            print(
+                "TIME BUDGET EXHAUSTED before any training step: loading left no time to train. "
+                "Retry with a smaller max_train_samples/max_val_samples or a larger run budget.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if interrupted_reason == "time_budget":
+            logger.info(f"Time budget cutoff reached during epoch {epoch + 1} after {n_batches} batch(es).")
 
         avg_train_loss = running_loss / max(n_batches, 1)
 
@@ -732,9 +759,17 @@ def main() -> None:
             torch.save(model.state_dict(), best_checkpoint_path)
             logger.info(f"New best val_mean_iou={mean_iou:.4f} — checkpoint saved to {best_checkpoint_path}")
 
+        if interrupted_reason == "time_budget":
+            break
         elapsed = time.time() - training_start
         if time_budget_seconds is not None and elapsed > time_budget_seconds:
             logger.info(f"Time budget of {cfg['time_budget_minutes']} minutes reached — stopping early.")
+            interrupted_reason = "time_budget"
+            break
+        # Predictive: don't start an epoch that can't finish before the cutoff.
+        if train_cutoff is not None and epoch + 1 < cfg["epochs"] and time.time() + epoch_seconds > train_cutoff:
+            logger.info("Next epoch would overrun the run's time budget — stopping with the best checkpoint so far.")
+            interrupted_reason = "time_budget"
             break
 
         # Engineer control plane (gotrain.control): see
@@ -762,6 +797,9 @@ def main() -> None:
         "amp_enabled": amp_enabled,
         "n_params": n_params,
         "n_bands": n_bands,
+        # Saved so StressLab / final_eval / loss-scan normalize exactly as
+        # training did without re-loading the whole train split.
+        "normalization": {"mean": mean.tolist(), "std": std.tolist()},
         "band_names": band_names,
         "n_classes": n_classes,
         "dependency_versions": reproducibility.capture_dependency_versions(),

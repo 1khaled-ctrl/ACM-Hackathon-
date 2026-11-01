@@ -183,9 +183,9 @@ function SessionList({ sessions, onOpen }) {
               <span className="font-mono text-[0.6rem] text-slate-600">{fmtClock(s.started_at)}</span>
             </div>
 
-            {s.status === 'STOPPED' && s.stop_reason && (
-              <div className="mt-1.5 font-mono text-[0.64rem] text-amber-400/90">
-                STOPPED — {s.stop_reason}
+            {(s.status === 'STOPPED' || s.status === 'FAILED') && s.stop_reason && (
+              <div className={cn('mt-1.5 font-mono text-[0.64rem]', s.status === 'FAILED' ? 'text-rose-300' : 'text-amber-400/90')}>
+                {s.status} — {s.stop_reason}
               </div>
             )}
 
@@ -228,9 +228,12 @@ function SessionDetail({ session: s }) {
         <PanelTitle right={<Badge tone={STATUS_TONE[s.status] || 'slate'}>{s.status}</Badge>}>
           {s.dataset} · {s.session_id}
         </PanelTitle>
-        {s.status === 'STOPPED' && s.stop_reason && (
-          <div className="border-b border-edge/60 bg-amber-500/[0.06] px-4 py-2 font-mono text-[0.68rem] text-amber-300">
-            STOPPED — {s.stop_reason}
+        {(s.status === 'STOPPED' || s.status === 'FAILED') && s.stop_reason && (
+          <div className={cn(
+            'border-b border-edge/60 px-4 py-2 font-mono text-[0.68rem]',
+            s.status === 'FAILED' ? 'bg-rose-500/[0.06] text-rose-300' : 'bg-amber-500/[0.06] text-amber-300',
+          )}>
+            {s.status} — {s.stop_reason}
           </div>
         )}
         <div className="grid grid-cols-2 gap-px bg-edge/50 sm:grid-cols-3 lg:grid-cols-4">

@@ -62,6 +62,10 @@ class DatasetSpec:
     class_names: Optional[list]
     n_bands: int
     band_names: list
+    # Real model input channels with every band selected. Differs from
+    # n_bands when one named band holds many channels (m-NeonTree's "Neon"
+    # band is 369 hyperspectral channels: 5 band names, 373 channels).
+    n_channels: int = 0
 
     @property
     def is_multi_label(self) -> bool:
@@ -142,6 +146,9 @@ def spec_for(dataset: str, task_specs=None) -> DatasetSpec:
     n_classes = label_type.n_classes
     class_names = _class_names_of(label_type)
     band_names = [b.name for b in task_specs.bands_info]
+    n_channels = sum(
+        len(b.expand_name()) if hasattr(b, "expand_name") else 1 for b in task_specs.bands_info
+    )
 
     return DatasetSpec(
         dataset=dataset,
@@ -151,7 +158,65 @@ def spec_for(dataset: str, task_specs=None) -> DatasetSpec:
         class_names=class_names,
         n_bands=len(band_names),
         band_names=band_names,
+        n_channels=n_channels,
     )
+
+
+def estimate_training_memory(dataset: str, task_type: str, config: dict) -> Optional[dict]:
+    """Bytes the training template will hold for its eagerly loaded train +
+    validation arrays under `config` (bands, max_train_samples,
+    max_val_samples). Reads ONE train sample's raw band shapes -- no
+    resampling -- so it stays cheap even for m-NeonTree, where packing all
+    bands costs ~40 s per sample. Returns None when it can't estimate (e.g.
+    data missing); callers then skip the check rather than block on it.
+    """
+    import numpy as np
+
+    try:
+        from gotrain.tools.datasets import _find_task_dir
+        import geobench
+
+        task_specs = geobench.load_task_specs(_find_task_dir(dataset))
+        band_names = config.get("bands") or [b.name for b in task_specs.bands_info]
+        train = task_specs.get_dataset(split="train")
+        val = task_specs.get_dataset(split="valid")
+        sample = train[0]
+    except Exception:
+        return None
+
+    wanted = set(band_names)
+    selected = [
+        b for b in sample.bands
+        if ({b.band_info.name} | set(getattr(b.band_info, "alt_names", ()) or ())) & wanted
+    ]
+    if not selected:
+        return None
+
+    height = max(b.data.shape[0] for b in selected)
+    width = max(b.data.shape[1] for b in selected)
+    channels = sum(1 if b.data.ndim == 2 else b.data.shape[2] for b in selected)
+    dtype = np.result_type(*[b.data.dtype for b in selected])
+    itemsize = 4 if dtype == np.float64 else dtype.itemsize  # pack_sample narrows float64
+    per_sample = height * width * channels * itemsize
+    if task_type == "segmentation":
+        per_sample += height * width * np.asarray(sample.label.data).dtype.itemsize
+
+    def _bounded(n, cap):
+        return n if cap is None else min(n, cap)
+
+    n_train = _bounded(len(train), config.get("max_train_samples"))
+    n_val = _bounded(len(val), config.get("max_val_samples"))
+    return {
+        "per_sample_bytes": per_sample,
+        "n_train": n_train,
+        "n_val": n_val,
+        "total_bytes": per_sample * (n_train + n_val),
+        "channels": channels,
+        "height": height,
+        "width": width,
+        "band_channels": {b.band_info.name: (1 if b.data.ndim == 2 else b.data.shape[2]) for b in selected},
+        "band_shapes": {b.band_info.name: list(b.data.shape[:2]) for b in selected},
+    }
 
 
 def check_support(dataset: str) -> dict:
@@ -186,11 +251,18 @@ def check_support(dataset: str) -> dict:
             "label_kind": None, "n_classes": None, "n_bands": None,
         }
 
-    return {
+    result = {
         "dataset": dataset,
         "supported": True,
         "reason": "ok",
         "label_kind": spec.label_kind,
         "n_classes": spec.n_classes,
         "n_bands": spec.n_bands,
+        "n_channels": spec.n_channels,
     }
+    if spec.n_channels != spec.n_bands:
+        result["note"] = (
+            f"{spec.n_bands} band names expand to {spec.n_channels} input channels; check "
+            "get_dataset_info/launch_training's memory estimate before training on all bands."
+        )
+    return result

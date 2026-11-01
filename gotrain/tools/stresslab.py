@@ -10,7 +10,10 @@ from gotrain.logging_utils import log_event
 from gotrain.stresslab import runner as stresslab_runner
 
 
-def run_stresslab(dataset: str, task_type: str, run_id: str, max_samples: Optional[int] = None) -> dict:
+def run_stresslab(
+    dataset: str, task_type: str, run_id: str, max_samples: Optional[int] = None,
+    time_budget_seconds: Optional[float] = None,
+) -> dict:
     """Robustness battery against `run_id`'s saved checkpoint. Needs
     torch + the real downloaded dataset -- see
     gotrain/stresslab/runner.py's module docstring for the full caveat.
@@ -19,9 +22,9 @@ def run_stresslab(dataset: str, task_type: str, run_id: str, max_samples: Option
     log_event("stresslab_started", dataset=dataset, task_type=task_type, run_id=run_id)
 
     if task_type == "classification":
-        summary = stresslab_runner.run_stresslab_classification(dataset, run_id, max_samples=max_samples)
+        summary = stresslab_runner.run_stresslab_classification(dataset, run_id, max_samples=max_samples, time_budget_seconds=time_budget_seconds)
     elif task_type == "segmentation":
-        summary = stresslab_runner.run_stresslab_segmentation(dataset, run_id, max_samples=max_samples)
+        summary = stresslab_runner.run_stresslab_segmentation(dataset, run_id, max_samples=max_samples, time_budget_seconds=time_budget_seconds)
     else:
         raise ValueError(f"task_type must be 'classification' or 'segmentation', got {task_type!r}")
 

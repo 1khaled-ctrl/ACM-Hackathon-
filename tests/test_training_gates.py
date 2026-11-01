@@ -116,7 +116,12 @@ def test_launch_training_default_backbone_never_gated(isolated_logs):
     # success (that needs torch/data); we assert it did NOT raise
     # ApprovalRequiredError, proving the gate itself let it through.
     try:
-        training.launch_training("m-eurosat", "classification", {"backbone": "resnet18"})
+        # Bounded: where torch + m-eurosat exist this really trains, so keep
+        # it tiny and offline (no pretrained-weight download).
+        training.launch_training("m-eurosat", "classification", {
+            "backbone": "resnet18", "pretrained": False, "epochs": 1, "batch_size": 4,
+            "max_train_samples": 8, "max_val_samples": 8, "amp": False,
+        })
     except approval.ApprovalRequiredError:
         pytest.fail("the default backbone value must never be gated")
     except Exception:

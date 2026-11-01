@@ -25,7 +25,7 @@ from strands import Agent, tool
 from strands.hooks import AfterToolCallEvent, BeforeToolCallEvent, HookRegistry
 
 from gotrain import config, control, goaudit, ledger, resource_intelligence, status
-from gotrain.config_schema import PreflightValidationError
+from gotrain.config_schema import HypothesisValidationError, PreflightValidationError
 from gotrain.logging_utils import log_event
 from gotrain.tools import adaptation as adaptation_tools
 from gotrain.tools import dataiq as dataiq_tools
@@ -277,7 +277,9 @@ def validate_model_compatibility(model_id: str, dataset: str, task_type: str, n_
         model_id: a model_id from list_compatible_models's results.
         dataset: the GEO-Bench dataset to validate against.
         task_type: "classification" or "segmentation".
-        n_bands: the dataset's actual band count (see get_dataset_info).
+        n_bands: the number of input CHANNELS the model will see: get_dataset_info's
+            n_channels for all bands, or the sum of band_channels over the bands
+            you select (not the number of band names).
         n_classes: the dataset's actual class count (see get_dataset_info).
     """
     return pretrained_tools.validate_model_compatibility(model_id, dataset, task_type, n_bands, n_classes)
@@ -554,9 +556,18 @@ def _submit_final_model(dataset: str, run_id: str, hooks: "LimitsAndLoggingHooks
     Bound into a per-session closure in build_agent, same pattern as
     _launch_training below -- see that function's comment for why.
     """
-    if hooks.run_count < 1:
+    # Gate on runs that actually COMPLETED this mission, not on attempts:
+    # hooks.run_count also counts timed-out/crashed attempts (they did spend
+    # budget), and gating on it let a mission whose only attempt failed
+    # submit an older historical run and end COMPLETED with zero usable runs.
+    if not hooks.successful_run_ids:
+        failed = hooks.run_count
+        failed_note = (
+            f" ({failed} attempt(s) this mission failed or timed out without producing a run)"
+            if failed else ""
+        )
         raise MissionRequiresNewExperimentError(
-            f"This mission has launched 0 new training runs for {dataset!r} so far "
+            f"This mission has completed 0 new training runs for {dataset!r} so far{failed_note} "
             f"(run budget: {hooks.max_runs}). query_history may show strong runs from "
             "earlier missions -- those remain valid reference knowledge, but this mission "
             "must call launch_training at least once before submit_final_model is allowed. "
@@ -592,6 +603,13 @@ def _submit_final_model(dataset: str, run_id: str, hooks: "LimitsAndLoggingHooks
     _auto_run_stresslab(dataset=dataset, run_id=run_id, record=record)
 
     return updated
+
+
+# The automatic post-submission robustness check runs in the agent process
+# with no subprocess timeout, so it evaluates a bounded slice of VALIDATION
+# (the report records how many samples were used).
+AUTO_STRESSLAB_MAX_SAMPLES = 256
+AUTO_STRESSLAB_TIME_BUDGET_SECONDS = 300
 
 
 def _auto_run_stresslab(dataset: str, run_id: str, record: dict) -> None:
@@ -642,7 +660,12 @@ def _auto_run_stresslab(dataset: str, run_id: str, record: dict) -> None:
         return
 
     try:
-        stresslab_tools.run_stresslab(dataset=dataset, task_type=task_type, run_id=run_id)
+        stresslab_tools.run_stresslab(
+            dataset=dataset, task_type=task_type, run_id=run_id, max_samples=AUTO_STRESSLAB_MAX_SAMPLES,
+            time_budget_seconds=AUTO_STRESSLAB_TIME_BUDGET_SECONDS,
+        )
+    except FileNotFoundError as e:
+        log_event("stresslab_unavailable", dataset=dataset, run_id=run_id, reason=f"no checkpoint: {e}")
     except Exception as e:
         log_event("stresslab_failed", dataset=dataset, run_id=run_id, error=str(e))
 
@@ -766,6 +789,9 @@ class LimitsAndLoggingHooks:
         self.tool_call_count = 0
         self.run_count = 0
         self.data_experiment_count = 0
+        # Ledger run_ids launch_training actually produced this mission.
+        # Distinct from run_count, which also counts failed/timed-out attempts.
+        self.successful_run_ids: list = []
 
     @staticmethod
     def _uses_data_experiment(tool_input: dict) -> bool:
@@ -961,7 +987,16 @@ def build_agent(
             hypothesis: required whenever parent_id is given — see the
                 launch_training @tool docstring above for its shape.
         """
-        return training_tools.launch_training(
+        # validate_hypothesis only demands one when parent_id is given, so a
+        # later run launched without parent_id skipped it. Every launch after
+        # this mission's first attempt must say what changed and why.
+        if hooks.run_count >= 1 and hypothesis is None:
+            raise HypothesisValidationError(
+                "A hypothesis is required for every run after this mission's first launch "
+                "(no run was spent). Pass hypothesis={'change': ..., 'why': ...} and, if this "
+                "run is derived from an earlier one, its parent_id."
+            )
+        record = training_tools.launch_training(
             dataset=dataset,
             task_type=task_type,
             config=config,
@@ -969,6 +1004,8 @@ def build_agent(
             hypothesis=hypothesis,
             timeout_seconds=timeout_seconds,
         )
+        hooks.successful_run_ids.append(record["run_id"])
+        return record
 
     # submit_final_model's real implementation needs to see this session's
     # hooks.run_count (how many NEW runs this mission has launched) before

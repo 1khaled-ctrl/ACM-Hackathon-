@@ -43,7 +43,7 @@ class _FakeSample:
         self._label = label
         self._arr = np.zeros((h, w, n_bands), dtype=np.float32)
 
-    def pack_to_3d(self, band_names):
+    def pack_to_3d(self, band_names, **kwargs):
         return self._arr, band_names
 
     @property
@@ -61,7 +61,7 @@ class _SlowFakeSample(_FakeSample):
         super().__init__(label, **kwargs)
         self._delay_seconds = delay_seconds
 
-    def pack_to_3d(self, band_names):
+    def pack_to_3d(self, band_names, **kwargs):
         time.sleep(self._delay_seconds)
         return super().pack_to_3d(band_names)
 
@@ -122,7 +122,7 @@ def test_classification_loading_raises_mid_load_for_a_slow_split():
     confirms the check fires DURING the loop (via
     LOADING_DEADLINE_CHECK_EVERY), not just as an upfront check.
     """
-    n = tc.LOADING_DEADLINE_CHECK_EVERY * 3
+    n = 300
     samples = [_SlowFakeSample(label=0, delay_seconds=0.01) for _ in range(n)]
     task_specs = _FakeTaskSpecs(samples)
     # Short enough that loading all n samples at 0.01s each cannot finish,
@@ -212,7 +212,7 @@ def test_segmentation_loading_with_no_deadline_is_unbounded_as_before():
 
 
 def test_segmentation_loading_raises_mid_load_for_a_slow_split():
-    n = ts.LOADING_DEADLINE_CHECK_EVERY * 3
+    n = 300
     samples = []
     for _ in range(n):
         s = _SlowFakeSample(label=None, delay_seconds=0.01)

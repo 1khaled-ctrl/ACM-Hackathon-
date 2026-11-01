@@ -619,7 +619,12 @@ export function StressLabCard({ dataset, runId }) {
         <div className="px-4 py-3">
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <span className="font-mono text-[0.64rem] text-slate-400">run {runId.slice(0, 8)}</span>
-            <Badge tone={data.summary.n_fragile > 0 ? 'amber' : 'green'}>{data.summary.overall_verdict}</Badge>
+            <Badge tone={data.summary.n_fragile > 0 || data.summary.truncated ? 'amber' : 'green'}>{data.summary.overall_verdict}</Badge>
+            {typeof data.summary.n_samples === 'number' && (
+              <span className="font-mono text-[0.6rem] text-slate-500">
+                {data.summary.n_samples} validation samples
+              </span>
+            )}
             <span className="ml-auto font-mono text-[0.6rem] text-slate-500">
               clean metric {fmtPct(data.summary.clean_metric)}
             </span>

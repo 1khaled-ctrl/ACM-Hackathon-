@@ -195,8 +195,7 @@ spending your whole budget chasing diminishing returns.
   told the exact number). Each run also has a wall-clock time budget.
 - If you call a tool after a budget is exhausted, the tool will refuse and
   tell you so. That is not an error to retry — it means stop immediately,
-  pick your best run from `query_history` / `get_best`, and call
-  `submit_final_model`.
+  pick your best run from `query_history`, and call `submit_final_model`.
 - There is also a cap on the total number of tool calls you may make in
   this session. Budget your exploration accordingly: don't spend calls
   re-reading the same run's metrics repeatedly.
@@ -221,6 +220,20 @@ spending your whole budget chasing diminishing returns.
   Early in a dataset, there's no history yet to estimate from
   (`has_data=false`) — that's expected, not an error, and just means
   proceed with ordinary judgment for that run.
+- Training loads the whole train + validation split into RAM first. If a
+  config would not fit, `launch_training` refuses it **before** running
+  (no run spent) and tells you the largest `max_train_samples` that fits —
+  set it and retry. If loading would take too long for the per-run time
+  budget, the run fails within seconds with the `max_train_samples` that
+  would fit; that attempt does count as a run, so on a large dataset set
+  `max_train_samples` from the start (see the per-dataset notes below).
+- A run that reaches its time budget mid-training stops early, still
+  validates, and keeps its best checkpoint (`interrupted_reason:
+  "time_budget"`). It is a real, usable run — but it trained less than
+  configured, so prefer fewer epochs or fewer samples next time.
+- A run that crashed or timed out produces no run_id. It does not satisfy
+  "this mission has completed a run" — diagnose the error message (memory,
+  time, a bad band name) and change the config; do not resubmit the same one.
 
 Suggested budgets per dataset (you will be told the actual numbers you're
 running with — these are guidance for pacing your exploration within
@@ -235,6 +248,26 @@ them):
   classification — budget around 10 minutes per run (image patches are
   320x320 and 500x500 respectively, much larger than the classification
   datasets' 64x64/32x32).
+- **m-bigearthnet**: MULTI-LABEL (43 classes, a sample can have several);
+  trained with BCE and scored by validation micro-F1, not accuracy. 12
+  bands at 120x120, 20,000 train samples (~14.5 GB for train+val) — start
+  with `max_train_samples` around 2000-4000 and grow it only if time allows.
+- **m-brick-kiln** (binary, 13 bands 64x64, ~15,000 train) and **m-pv4ger**
+  (binary, RGB 320x320, ~11,800 train): large train sets — cap
+  `max_train_samples` (e.g. 3000) for early runs.
+- **m-forestnet**: 12 classes, 6 bands at 332x332, ~6,500 train.
+- **m-chesapeake** (7 classes, RGBN 256x256), **m-cashew-plant** (7 classes,
+  13 bands 256x256) and **m-SA-crop-type** (10 classes, 13 bands 256x256):
+  segmentation on large multispectral patches, 1,350-3,000 train samples —
+  treat like the slow segmentation datasets above; cap `max_train_samples`
+  if a run would not fit the time budget.
+- **m-NeonTree**: its bands have different native resolutions — RGB at
+  400x400, `Canopy Height Model` at 40x40, and `Neon` = 369 hyperspectral
+  channels at 40x40. All bands together means 373 channels upsampled to
+  400x400 (~87 GB, ~40 s per sample): infeasible, and refused before
+  running. Set `bands` explicitly, e.g. `["Red", "Green", "Blue",
+  "Canopy Height Model"]` (RGB + elevation, ~1 GB). Say in your hypothesis
+  that you excluded the hyperspectral band and why.
 
 ## The engineer control plane
 
@@ -283,11 +316,12 @@ assembles what's already recorded into one document.
 
 ## Stopping condition
 
-**You must launch at least one new training run this mission before any of
-the conditions below can apply.** A strong run already sitting in
+**You must complete at least one new training run this mission before any
+of the conditions below can apply.** A strong run already sitting in
 `query_history` from an earlier mission does NOT satisfy this — it is
-reference knowledge, not this mission's work. `submit_final_model` enforces
-this in code and will refuse if you haven't launched a run yet, regardless
+reference knowledge, not this mission's work — and neither does an attempt
+that crashed or timed out. `submit_final_model` enforces this in code and
+will refuse until a run of this mission has actually finished, regardless
 of what history shows.
 
 Once you have launched at least one run this mission, stop iterating and
@@ -330,7 +364,11 @@ extra fine-tuning pass, a lr/schedule tweak) to an already-good run,
 not as a default for every run — a fresh pretrained start is still the
 right baseline for exploring a genuinely different config.
 
-### Classification (`task_type="classification"` — m-eurosat, m-so2sat)
+Every task type also accepts `max_train_samples` / `max_val_samples` (int,
+or `null` for the whole split; default `null`) to bound how many samples
+are loaded — the main lever for the large datasets above.
+
+### Classification (`task_type="classification"` — m-eurosat, m-so2sat, m-bigearthnet, m-brick-kiln, m-forestnet, m-pv4ger)
 
 | key | valid values / type | default |
 |---|---|---|
@@ -350,8 +388,9 @@ right baseline for exploring a genuinely different config.
 | `class_weights` | list of floats (length = n_classes), or `null` | `null` |
 | `amp` | bool (no effect without a GPU) | `true` |
 | `tta` | bool — test-time augmentation at validation only | `false` |
+| `loss` | `auto` (CE for single-label, BCE for multi-label), `ce`, `bce` | `auto` |
 
-### Segmentation (`task_type="segmentation"` — m-pv4ger-seg, m-nz-cattle)
+### Segmentation (`task_type="segmentation"` — m-pv4ger-seg, m-nz-cattle, m-chesapeake, m-cashew-plant, m-SA-crop-type, m-NeonTree)
 
 | key | valid values / type | default |
 |---|---|---|

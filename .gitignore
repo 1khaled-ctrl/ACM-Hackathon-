@@ -29,6 +29,12 @@ __pycache__/
 /logs/approvals_state.json
 /logs/approvals.jsonl
 /logs/history/
+/logs/dataiq/
+/logs/geoguard/
+/logs/goaudit/
+/logs/model_passports/
+/logs/pretrained/
+/logs/stresslab/
 
 # Secrets
 .env

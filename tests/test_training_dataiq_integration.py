@@ -63,7 +63,9 @@ def test_launch_training_allows_from_scratch_without_pretrained(isolated_logs):
     try:
         training.launch_training(
             "m-eurosat", "classification",
-            {"backbone": "resnet18", "pretrained": False, "fine_tuning_strategy": "from_scratch"},
+            {"backbone": "resnet18", "pretrained": False, "fine_tuning_strategy": "from_scratch",
+             # Bounded: where torch + m-eurosat exist this really trains.
+             "epochs": 1, "batch_size": 4, "max_train_samples": 8, "max_val_samples": 8, "amp": False},
         )
     except ConfigValidationError:
         pytest.fail("from_scratch with pretrained=False must not be rejected")

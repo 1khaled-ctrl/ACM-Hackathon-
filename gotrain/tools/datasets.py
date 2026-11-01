@@ -87,6 +87,11 @@ def get_dataset_info(dataset: str) -> dict:
         "split_sizes": split_sizes,
         "band_names": [b.name for b in task_specs.bands_info],
         "n_bands": len(task_specs.bands_info),
+        # Model input channels per band name, and in total with every band.
+        # One name can be many channels: m-NeonTree's "Neon" band is 369
+        # hyperspectral channels, so its 5 band names are 373 channels.
+        "band_channels": {b.name: len(b.expand_name()) for b in task_specs.bands_info},
+        "n_channels": sum(len(b.expand_name()) for b in task_specs.bands_info),
         "patch_size": list(task_specs.patch_size),
         "n_time_steps": task_specs.n_time_steps,
         "label_info": label_info,

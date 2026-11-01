@@ -115,6 +115,7 @@ def start_session(
     max_tool_calls: Optional[int] = None,
     pid: Optional[int] = None,
     session_id: Optional[str] = None,
+    agent_log_offset: Optional[int] = None,
 ) -> dict:
     """Open a new session record. Called by the dashboard API the moment
     a mission is launched -- before the subprocess has done anything, so
@@ -129,6 +130,7 @@ def start_session(
         "minutes_per_run": run_minutes,
         "max_tool_calls": max_tool_calls,
         "pid": pid,
+        "agent_log_offset": agent_log_offset,
         "started_at": _now(),
         "finished_at": None,
         "status": RUNNING,
@@ -239,6 +241,53 @@ def _windowed_events(start: Optional[datetime], end: Optional[datetime]) -> list
     return deduped
 
 
+# Markers the training templates print on a controlled failure, plus the
+# shape of an uncaught Python exception line.
+_FAILURE_MARKERS = ("OUT OF MEMORY", "DATA LOADING TIMEOUT", "INVALID CONFIG", "WARM-START FAILED")
+
+
+def _most_informative_stderr_line(stderr: str) -> Optional[str]:
+    """The templates log every INFO line to stderr, so the LAST line of a
+    killed process is usually just progress noise ("Loaded validation
+    split..."). Prefer an explicit failure marker, then an exception line,
+    then fall back to the last line."""
+    lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+    for line in reversed(lines):
+        if any(marker in line for marker in _FAILURE_MARKERS):
+            return line[:200]
+    for line in reversed(lines):
+        head = line.split(":", 1)[0]
+        if head.endswith(("Error", "Exception")) or head == "Traceback (most recent call last)":
+            return line[:200]
+    return lines[-1][:200]
+
+
+def final_submission_in_window(dataset: Optional[str], started_at: Optional[str], ended_at: Optional[str] = None) -> Optional[str]:
+    """run_id this session submitted via submit_final_model, or None. The
+    authoritative test for COMPLETED: control.json's state persists across
+    missions, so a stale COMPLETED from the previous mission must not mark
+    a session that submitted nothing as completed."""
+    try:
+        events = _windowed_events(_parse(started_at), _parse(ended_at) if ended_at else None)
+    except Exception:
+        return None
+    submitted = [
+        e for e in events
+        if e.get("event") == "final_model_submitted" and (dataset is None or e.get("dataset") == dataset)
+    ]
+    return submitted[-1].get("run_id") if submitted else None
+
+
+def reason_from_agent_output(text: str) -> Optional[str]:
+    """A stop reason from the agent process's own captured output -- used
+    only when the session has no training events to explain it (e.g. the
+    agent died before its first tool call)."""
+    line = _most_informative_stderr_line(text[-8000:])
+    return f"agent process exited: {line}" if line else None
+
+
 def derive_stop_reason(dataset: Optional[str], started_at: Optional[str], ended_at: Optional[str] = None) -> Optional[str]:
     """A short, human-readable reason a STOPPED session ended with no
     completed runs or fewer than requested -- previously the dashboard
@@ -289,9 +338,11 @@ def derive_stop_reason(dataset: Optional[str], started_at: Optional[str], ended_
             suffix = f" after {timeout:.0f}s" if isinstance(timeout, (int, float)) else ""
             return f"training timed out{suffix} with no completed run"
         if last["event"] == "training_failed":
-            stderr_tail = (last.get("stderr") or "").strip().splitlines()
-            last_line = stderr_tail[-1][:160] if stderr_tail else None
-            return f"training crashed: {last_line}" if last_line else "training crashed (see train.log)"
+            exit_note = f" ({last['reason']})" if last.get("reason") else ""
+            detail = _most_informative_stderr_line(last.get("stderr") or "")
+            if detail:
+                return f"training crashed{exit_note}: {detail}"
+            return f"training crashed{exit_note} (see train.log)"
         # last event is training_finished: runs did complete, so a
         # shortfall vs. the requested count means something stopped the
         # MISSION after that, not training itself (budget exhaustion,
@@ -471,9 +522,14 @@ def _derive(record: dict) -> dict:
 
     events = _windowed_events(start, end)
     record["event_count"] = len(events)
-    submitted = [e for e in events if e.get("event") == "final_model_submitted"]
+    dataset = record.get("dataset")
+
+    def _ours(e):  # run-level events must also match this session's dataset
+        return dataset is None or e.get("dataset") in (None, dataset)
+
+    submitted = [e for e in events if e.get("event") == "final_model_submitted" and _ours(e)]
     record["final_model_run_id"] = submitted[-1].get("run_id") if submitted else None
-    record["timed_out_runs"] = sum(1 for e in events if e.get("event") == "training_timed_out")
+    record["timed_out_runs"] = sum(1 for e in events if e.get("event") == "training_timed_out" and _ours(e))
     # "Engineer intervention" = anything a human did to this mission from
     # the dashboard: pause/resume/manual-control (control_transition),
     # approve/reject (approval_decided -- approval_requested is the

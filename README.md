@@ -40,12 +40,25 @@ tasks used in this project).
 
 ## Data
 
-Only 4 GEO-Bench tasks are used (not the full benchmark):
+All 12 GEO-Bench v1.0 tasks are supported:
 
-- Classification: `m-eurosat`, `m-so2sat`
-- Segmentation: `m-pv4ger-seg`, `m-nz-cattle`
+- Classification: `m-eurosat`, `m-so2sat`, `m-bigearthnet` (multi-label, 43
+  classes), `m-brick-kiln`, `m-forestnet`, `m-pv4ger`
+- Segmentation: `m-pv4ger-seg`, `m-nz-cattle`, `m-chesapeake`,
+  `m-cashew-plant`, `m-SA-crop-type`, `m-NeonTree`
 
-Set `GEO_BENCH_DIR=./data/geobench` before downloading/loading.
+Set `GEO_BENCH_DIR=./data/geobench`, then:
+
+```bash
+python scripts/download_geobench_subset.py          # the original 4 (~1.9 GB)
+python scripts/download_geobench_subset.py all      # all 12 (~17 GB of zips)
+python scripts/download_geobench_subset.py m-NeonTree m-chesapeake   # any subset
+```
+
+`m-NeonTree`'s bands have different native resolutions (RGB 400x400; Canopy
+Height and 369 hyperspectral channels at 40x40). Training on all of them is
+refused up front as infeasible; select `bands` (e.g. RGB + `Canopy Height
+Model`).
 
 ## How to run
 
@@ -67,6 +80,11 @@ streamlit run dashboard.py
 
 # Tests:
 pytest tests/ -v
+
+# End-to-end smoke check of every dataset (tiny bounded runs, isolated logs,
+# never touches the test split), and the evidence behind past missions:
+python scripts/smoke_all_datasets.py
+python scripts/mission_forensics.py [dataset]
 ```
 
 ## GoTrain NEXUS (React dashboard — the one to demo)

@@ -70,6 +70,19 @@ def build_eval_fn(run: dict):
     raise NotImplementedError(f"No test-eval path wired up for task_type={task_type!r}.")
 
 
+def preflight(run: dict) -> None:
+    """Fail BEFORE the one-time test lock is taken if the submitted run's
+    checkpoint can't be found. final_test_eval acquires the lock before it
+    calls eval_fn and never releases it, so a missing checkpoint discovered
+    inside eval_fn would permanently burn this dataset's test evaluation.
+    Reads no test data."""
+    if run.get("task_type") in ("classification", "segmentation"):
+        from gotrain.tools.final_eval import resolve_checkpoint
+
+        checkpoint = resolve_checkpoint(run["dataset"], run["run_id"])
+        print(f"  checkpoint: {checkpoint}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the one-time final test-split evaluation.")
     parser.add_argument("--dataset", required=True)
@@ -81,6 +94,11 @@ def main() -> None:
     print(f"Submitted final run for {args.dataset!r}: {run['run_id']}")
     print(f"  validation metric: {run['val_metric']}")
     print(f"  config: {json.dumps(run['config'])}")
+    try:
+        preflight(run)
+    except FileNotFoundError as e:
+        print(f"Refused before touching the test split: {e}")
+        sys.exit(1)
 
     confirm = input(
         f"\nThis will evaluate run {run['run_id']} on the TEST split for "

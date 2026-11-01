@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import sys
 from pathlib import Path
 from typing import Optional
@@ -203,6 +204,19 @@ def agent_process_alive() -> bool:
         return False
 
 
+def _agent_output_reason(offset: Optional[int]) -> Optional[str]:
+    """Reason from this mission's slice of logs/agent.log (run_gotrain.py's
+    captured stdout/stderr), starting at the offset recorded at launch."""
+    try:
+        if not AGENT_LOG_PATH.exists():
+            return None
+        with open(AGENT_LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(offset or 0)
+            return history_mod.reason_from_agent_output(f.read())
+    except OSError:
+        return None
+
+
 def reconcile_open_session() -> None:
     """Close out a mission-history session whose process is gone.
 
@@ -225,23 +239,31 @@ def reconcile_open_session() -> None:
         # step failed; anything else means the process went away without
         # finishing (killed via Stop, crashed on startup, etc.).
         state = control.get_state()
-        if state == control.COMPLETED:
-            status = history_mod.COMPLETED
-        elif state == control.FAILED_SAFE:
+        submitted = history_mod.final_submission_in_window(session.get("dataset"), session.get("started_at"))
+        # COMPLETED requires THIS session's own final_model_submitted event:
+        # control.json persists across missions, so a stale COMPLETED left by
+        # the previous mission (agent died before run_gotrain.py's
+        # control.reset()) must not mark an empty session completed.
+        if state == control.FAILED_SAFE:
             status = history_mod.FAILED
+        elif submitted:
+            status = history_mod.COMPLETED
         else:
             status = history_mod.STOPPED
 
         extra = {"ended_in_state": state}
-        if status == history_mod.STOPPED:
-            # "0/3" alone doesn't say WHY -- see derive_stop_reason's
-            # docstring. Computed once, here, at the moment the session is
-            # actually closed (not on every later read), and stored on the
-            # session record so History always shows the same reason it
-            # showed the moment this fired.
-            extra["stop_reason"] = history_mod.derive_stop_reason(
-                session.get("dataset"), session.get("started_at")
-            )
+        if status == history_mod.FAILED:
+            extra["stop_reason"] = (control.get_control() or {}).get("reason") or "control plane entered FAILED_SAFE"
+        elif status == history_mod.STOPPED:
+            # Computed once, here, at the moment the session is closed, and
+            # stored on the session record so History always shows the
+            # same reason it showed the moment this fired.
+            reason = history_mod.derive_stop_reason(session.get("dataset"), session.get("started_at"))
+            if reason is None:
+                reason = _agent_output_reason(session.get("agent_log_offset"))
+            if reason is None and state == control.COMPLETED:
+                reason = "agent exited without submitting a model this mission (stale COMPLETED state from an earlier mission)"
+            extra["stop_reason"] = reason or "agent process exited without completing a run or submitting a model"
 
         history_mod.finish_session(session["session_id"], status=status, **extra)
     except Exception as e:
@@ -439,6 +461,11 @@ class StartRequest(BaseModel):
     max_tool_calls: int = 40
 
 
+# FastAPI runs sync endpoints in a thread pool: without this, two Start
+# requests can both pass the alive-check before either writes agent.pid.
+_START_LOCK = threading.Lock()
+
+
 @app.post("/api/agent/start")
 def api_agent_start(req: StartRequest) -> dict:
     """Launch run_gotrain.py as a detached subprocess.
@@ -448,6 +475,11 @@ def api_agent_start(req: StartRequest) -> dict:
     an unknown dataset name rather than passing arbitrary strings to the
     subprocess.
     """
+    with _START_LOCK:
+        return _start_agent(req)
+
+
+def _start_agent(req: StartRequest) -> dict:
     if agent_process_alive():
         raise HTTPException(status_code=409, detail="An agent process is already running.")
 
@@ -470,6 +502,7 @@ def api_agent_start(req: StartRequest) -> dict:
         "--max-tool-calls", str(req.max_tool_calls),
     ]
     logfile = open(AGENT_LOG_PATH, "a", encoding="utf-8")
+    agent_log_offset = logfile.tell()  # this mission's output starts here
     popen_kwargs = {"stdout": logfile, "stderr": subprocess.STDOUT, "cwd": str(REPO_ROOT)}
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True
@@ -506,6 +539,7 @@ def api_agent_start(req: StartRequest) -> dict:
         run_minutes=req.run_minutes,
         max_tool_calls=req.max_tool_calls,
         pid=proc.pid,
+        agent_log_offset=agent_log_offset,
     )
 
     write_status(

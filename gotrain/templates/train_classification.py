@@ -145,40 +145,19 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-# Fraction of the subprocess's total wall-clock budget (cfg["_timeout_seconds"],
-# set by gotrain.tools.launch_training from the agent's per-run timeout)
-# that data LOADING alone is allowed to consume, across both the train and
-# validation splits combined. Loading two splits eagerly (see
-# build_dataset_arrays's docstring) happens entirely before training_start
-# is set, so it is otherwise invisible to this template's own
-# time_budget_minutes check (an in-loop, between-epochs check that never
-# even starts running until after both splits are already loaded) -- the
-# ONLY thing that was previously stopping a slow load was the parent
-# process's hard subprocess.run(timeout=...) kill, which leaves no
-# checkpoint, no stdout, and no recorded reason. Left at 0.5 (not higher)
-# so at least half the budget remains for the thing the budget is actually
-# for: training and saving a checkpoint.
-LOADING_PHASE_BUDGET_FRACTION = 0.5
-# How often (in samples) to check the deadline during the load loop --
-# frequent enough to catch a slow split well before the full budget is
-# gone, cheap enough (time.time() is ~100ns) to not matter next to one
-# sample's actual disk read + pack_to_3d cost.
-LOADING_DEADLINE_CHECK_EVERY = 200
-
-
-class DataLoadingBudgetExceeded(RuntimeError):
-    """Raised by build_dataset_arrays when loading alone would consume the
-    run's whole wall-clock budget, leaving no time to actually train or
-    save a checkpoint. Raised well before the parent process's hard
-    subprocess timeout would otherwise SIGKILL this process mid-load --
-    turning an opaque, unrecorded kill (previously surfaced only as
-    "STOPPED, 0/3, timeout" with no further detail) into a clear,
-    logged, actionable failure.
-    """
+# Loading/time-budget helpers shared with train_segmentation.py; see
+# gotrain/data_loading.py for why each exists.
+from gotrain import data_loading  # noqa: E402
+from gotrain.data_loading import (  # noqa: E402,F401 -- re-exported for callers/tests
+    LOADING_DEADLINE_CHECK_EVERY,
+    LOADING_PHASE_BUDGET_FRACTION,
+    TRAINING_CUTOFF_FRACTION,
+    DataLoadingBudgetExceeded,
+)
 
 
 def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None, is_multi_label=False, loading_deadline=None):
-    """Load every sample of `split` into memory as (N, H, W, C) float32 images
+    """Load every sample of `split` into memory as (N, H, W, C) native-dtype images
     and labels. GEO-Bench classification tasks here are small enough (a few
     thousand small patches) that this is simpler than writing a lazy
     on-disk Dataset, and makes computing TRAIN-only normalization stats a
@@ -214,31 +193,34 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
     if max_samples is not None:
         n = min(n, max_samples)
 
-    images = []
-    labels = []
-    n_excluded_in_range = 0
-    for i in range(n):
-        if loading_deadline is not None and i % LOADING_DEADLINE_CHECK_EVERY == 0 and time.time() > loading_deadline:
-            raise DataLoadingBudgetExceeded(
-                f"Loading the {split!r} split for this dataset is taking too long: only "
-                f"{i}/{n} samples loaded before the data-loading time budget was reached. "
-                "At this rate the full load (and any actual training) would exceed this run's "
-                "wall-clock budget. Retry with a smaller max_train_samples/max_val_samples, or "
-                "a larger time_budget_minutes/run budget for this dataset."
-            )
-        if i in excluded_ids:
-            n_excluded_in_range += 1
-            continue
-        sample = ds[i]
-        arr, _ = sample.pack_to_3d(band_names=band_names)
-        images.append(arr.astype(np.float32))
-        if is_multi_label:
-            labels.append(np.asarray(sample.label, dtype=np.float32))
-        else:
-            labels.append(int(sample.label))
+    indices = [i for i in range(n) if i not in excluded_ids]
+    n_excluded_in_range = n - len(indices)
+    if not indices:
+        raise ValueError(f"No {split} samples left to load (n={n}, {n_excluded_in_range} excluded).")
 
-    images = np.stack(images, axis=0)
-    labels = np.stack(labels, axis=0) if is_multi_label else np.array(labels, dtype=np.int64)
+    # Preallocated (not list + np.stack) so peak memory is one copy, not
+    # two, and kept in the native dtype (uint8/int16; float64 is narrowed to
+    # float32) -- ClassificationArrayDataset normalizes per item, so casting
+    # the whole split to float32 up front only cost memory (4x for m-pv4ger's
+    # uint8 RGB).
+    images = labels = None
+    started_at = time.time()
+    for k, i in enumerate(indices):
+        data_loading.check_loading_budget(split, k, len(indices), started_at, loading_deadline)
+        sample = ds[i]
+        arr = data_loading.pack_sample(sample, band_names)
+        if images is None:
+            images = np.empty((len(indices),) + arr.shape, dtype=arr.dtype)
+            if is_multi_label:
+                labels = np.empty((len(indices), np.asarray(sample.label).shape[0]), dtype=np.float32)
+            else:
+                labels = np.empty(len(indices), dtype=np.int64)
+        images[k] = arr
+        if is_multi_label:
+            labels[k] = np.asarray(sample.label, dtype=np.float32)
+        else:
+            labels[k] = int(sample.label)
+
     exclusion_note = f", {n_excluded_in_range} excluded by manifest" if n_excluded_in_range else ""
     logger.info(
         f"Loaded {split} split: {images.shape[0]} samples, images {images.shape}, "
@@ -247,14 +229,26 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
     return images, labels
 
 
+def prepare_batch(images: np.ndarray, mean, std, image_size=None):
+    """(N,H,W,C) numpy batch -> normalized NCHW float tensor, exactly as
+    ClassificationArrayDataset prepares a training input (including the
+    optional image_size resize). Used per batch by StressLab, final_eval and
+    the DataIQ loss scan so evaluation always matches training."""
+    import torch
+    import torch.nn.functional as F
+
+    x = (images.astype(np.float32) - np.asarray(mean, dtype=np.float32)) / np.asarray(std, dtype=np.float32)
+    tensor = torch.from_numpy(np.ascontiguousarray(np.transpose(x, (0, 3, 1, 2))))
+    if image_size is not None:
+        tensor = F.interpolate(tensor, size=(image_size, image_size), mode="bilinear", align_corners=False)
+    return tensor
+
+
 def compute_train_band_stats(train_images: np.ndarray, logger):
     """Per-band mean/std computed from TRAIN images only. train_images is
     (N, H, W, C) float32; stats are returned as float64 arrays of length C.
     """
-    flat = train_images.reshape(-1, train_images.shape[-1]).astype(np.float64)
-    mean = flat.mean(axis=0)
-    std = flat.std(axis=0)
-    std[std < 1e-6] = 1.0  # guard against a constant band
+    mean, std = data_loading.band_stats(train_images)
     logger.info(f"TRAIN band stats — mean: {mean.tolist()}, std: {std.tolist()}")
     return mean, std
 
@@ -534,6 +528,9 @@ def main() -> None:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--config", required=True, help="JSON-encoded config dict")
     args = parser.parse_args()
+    # The parent's hard subprocess timeout counts from (roughly) here, so
+    # every internal deadline is measured from this moment too.
+    process_start = time.time()
 
     user_config = json.loads(args.config)
     cfg = {**DEFAULTS, **user_config}
@@ -575,7 +572,6 @@ def main() -> None:
     task_specs = geobench.load_task_specs(task_dir)
     all_band_names = [b.name for b in task_specs.bands_info]
     band_names = cfg["bands"] if cfg["bands"] else all_band_names
-    n_bands = len(band_names)
 
     from gotrain.dataset_spec import spec_for
 
@@ -597,7 +593,7 @@ def main() -> None:
             f"{'multi-label' if is_multi_label else 'single-label'} path regardless."
         )
 
-    logger.info(f"Bands ({n_bands}/{len(all_band_names)} used): {band_names}")
+    logger.info(f"Bands ({len(band_names)}/{len(all_band_names)} used): {band_names}")
     logger.info(
         f"Image size: {task_specs.patch_size}, classes: {n_classes} ({spec.class_names}), "
         f"label_kind: {spec.label_kind}, is_multi_label: {is_multi_label}"
@@ -623,12 +619,14 @@ def main() -> None:
     # loading BOTH splits combined, derived from this run's actual
     # subprocess timeout, so a large split can't alone consume the whole
     # budget and get silently SIGKILLed with no checkpoint and no reason.
-    loading_deadline = None
+    loading_deadline = train_cutoff = None
     if cfg["_timeout_seconds"]:
-        loading_deadline = time.time() + cfg["_timeout_seconds"] * LOADING_PHASE_BUDGET_FRACTION
+        loading_deadline = process_start + cfg["_timeout_seconds"] * LOADING_PHASE_BUDGET_FRACTION
+        train_cutoff = process_start + cfg["_timeout_seconds"] * TRAINING_CUTOFF_FRACTION
         logger.info(
-            f"Data-loading budget: {cfg['_timeout_seconds'] * LOADING_PHASE_BUDGET_FRACTION:.0f}s "
-            f"of this run's {cfg['_timeout_seconds']:.0f}s total timeout."
+            f"Time budget: loading until +{cfg['_timeout_seconds'] * LOADING_PHASE_BUDGET_FRACTION:.0f}s, "
+            f"training until +{cfg['_timeout_seconds'] * TRAINING_CUTOFF_FRACTION:.0f}s, "
+            f"of this run's {cfg['_timeout_seconds']:.0f}s timeout."
         )
 
     try:
@@ -644,6 +642,12 @@ def main() -> None:
         logger.error(str(e))
         print(f"DATA LOADING TIMEOUT: {e}", file=sys.stderr)
         sys.exit(1)
+
+    # Channel count comes from the packed data, not len(band_names): one
+    # band name can expand to many channels (m-NeonTree's "Neon" band is
+    # 369 hyperspectral channels).
+    n_bands = train_images.shape[-1]
+    logger.info(f"Input channels: {n_bands}")
 
     mean, std = compute_train_band_stats(train_images, logger)
     class_freqs = compute_class_frequencies(train_labels, n_classes, logger, is_multi_label=is_multi_label)
@@ -773,6 +777,12 @@ def main() -> None:
                 scaler.update()
                 running_loss += loss.item()
                 n_batches += 1
+                # Soft time cutoff: stop training mid-epoch so validation,
+                # the checkpoint and the result line still happen before
+                # the parent's hard timeout would SIGKILL this process.
+                if train_cutoff is not None and time.time() > train_cutoff:
+                    interrupted_reason = "time_budget"
+                    break
         except (torch.OutOfMemoryError, RuntimeError) as e:
             if not is_oom_error(e):
                 raise
@@ -783,6 +793,17 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        if n_batches == 0 and epoch == 0:
+            logger.error("Time budget exhausted before a single training step completed.")
+            print(
+                "TIME BUDGET EXHAUSTED before any training step: loading left no time to train. "
+                "Retry with a smaller max_train_samples/max_val_samples or a larger run budget.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if interrupted_reason == "time_budget":
+            logger.info(f"Time budget cutoff reached during epoch {epoch + 1} after {n_batches} batch(es).")
 
         avg_train_loss = running_loss / max(n_batches, 1)
 
@@ -870,9 +891,17 @@ def main() -> None:
             torch.save(model.state_dict(), best_checkpoint_path)
             logger.info(f"New best {metric_name}={primary_metric:.4f} — checkpoint saved to {best_checkpoint_path}")
 
+        if interrupted_reason == "time_budget":
+            break
         elapsed = time.time() - training_start
         if time_budget_seconds is not None and elapsed > time_budget_seconds:
             logger.info(f"Time budget of {cfg['time_budget_minutes']} minutes reached — stopping early.")
+            interrupted_reason = "time_budget"
+            break
+        # Predictive: don't start an epoch that can't finish before the cutoff.
+        if train_cutoff is not None and epoch + 1 < cfg["epochs"] and time.time() + epoch_seconds > train_cutoff:
+            logger.info("Next epoch would overrun the run's time budget — stopping with the best checkpoint so far.")
+            interrupted_reason = "time_budget"
             break
 
         # Engineer control plane (gotrain.control): checked once per epoch,
@@ -903,6 +932,9 @@ def main() -> None:
         "n_params": n_params,
         "n_bands": n_bands,
         "band_names": band_names,
+        # Saved so StressLab / final_eval / loss-scan normalize exactly as
+        # training did without re-loading the whole train split.
+        "normalization": {"mean": mean.tolist(), "std": std.tolist()},
         "n_classes": n_classes,
         "label_kind": spec.label_kind,
         "is_multi_label": is_multi_label,
