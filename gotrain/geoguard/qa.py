@@ -16,7 +16,15 @@ pass/fail + problems; it never mutates or "fixes" the data itself.
 import numpy as np
 
 
-def check_classification_batch(images: np.ndarray, labels: np.ndarray, n_bands: int, n_classes: int) -> dict:
+def check_classification_batch(
+    images: np.ndarray, labels: np.ndarray, n_bands: int, n_classes: int, is_multi_label: bool = False
+) -> dict:
+    """`is_multi_label=True` (e.g. m-bigearthnet): `labels` is (N, n_classes)
+    {0,1} multi-hot, not a (N,) int class-index vector -- the shape check
+    and the range check below are each one of two shapes/ranges, not one,
+    specifically because a 2D multi-hot batch is a valid, expected shape
+    here, not a malformed single-label batch.
+    """
     problems = []
 
     if images.ndim != 4:
@@ -29,15 +37,24 @@ def check_classification_batch(images: np.ndarray, labels: np.ndarray, n_bands: 
     if images.size and np.isinf(images).any():
         problems.append("Inf values present after normalization")
 
-    if labels.ndim != 1:
-        problems.append(f"expected a 1D label vector, got shape {labels.shape}")
-    elif images.ndim == 4 and len(labels) != images.shape[0]:
-        problems.append(f"image/label count mismatch: {images.shape[0]} images vs {len(labels)} labels")
+    if is_multi_label:
+        if labels.ndim != 2 or (labels.size and labels.shape[1] != n_classes):
+            problems.append(f"expected a 2D (N,{n_classes}) multi-hot label batch, got shape {labels.shape}")
+        elif images.ndim == 4 and len(labels) != images.shape[0]:
+            problems.append(f"image/label count mismatch: {images.shape[0]} images vs {len(labels)} labels")
 
-    if labels.size and (int(labels.min()) < 0 or int(labels.max()) >= n_classes):
-        problems.append(
-            f"label values out of range [0, {n_classes}): min={int(labels.min())}, max={int(labels.max())}"
-        )
+        if labels.size and not np.all(np.isin(labels, (0, 1))):
+            problems.append("multi-label targets must be 0/1 -- found a value outside {0, 1}")
+    else:
+        if labels.ndim != 1:
+            problems.append(f"expected a 1D label vector, got shape {labels.shape}")
+        elif images.ndim == 4 and len(labels) != images.shape[0]:
+            problems.append(f"image/label count mismatch: {images.shape[0]} images vs {len(labels)} labels")
+
+        if labels.size and (int(labels.min()) < 0 or int(labels.max()) >= n_classes):
+            problems.append(
+                f"label values out of range [0, {n_classes}): min={int(labels.min())}, max={int(labels.max())}"
+            )
 
     return {"passed": not problems, "problems": problems}
 

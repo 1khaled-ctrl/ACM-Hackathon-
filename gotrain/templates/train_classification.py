@@ -138,12 +138,21 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None):
+def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None, is_multi_label=False):
     """Load every sample of `split` into memory as (N, H, W, C) float32 images
-    and (N,) int64 labels. GEO-Bench classification tasks here are small
-    enough (a few thousand small patches) that this is simpler than writing
-    a lazy on-disk Dataset, and makes computing TRAIN-only normalization
-    stats a single pass instead of two.
+    and labels. GEO-Bench classification tasks here are small enough (a few
+    thousand small patches) that this is simpler than writing a lazy
+    on-disk Dataset, and makes computing TRAIN-only normalization stats a
+    single pass instead of two.
+
+    `is_multi_label=False` (ordinary classification, e.g. m-eurosat,
+    m-so2sat): labels is (N,) int64, one class index per sample.
+    `is_multi_label=True` (e.g. m-bigearthnet): sample.label is already a
+    {0,1}^n_classes multi-hot np.ndarray (see geobench.MultiLabelClassification
+    .assert_valid), so labels is (N, n_classes) float32 instead of (N,) int64
+    -- this is the one place that distinction has to be made, since
+    sample.label's shape differs by label kind, not by anything the loader
+    itself chooses.
 
     `excluded_ids` (a DataIQ manifest's excluded_sample_ids, see
     gotrain/dataiq/manifest.py) skips those indices entirely -- never
@@ -176,10 +185,13 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
         sample = ds[i]
         arr, _ = sample.pack_to_3d(band_names=band_names)
         images.append(arr.astype(np.float32))
-        labels.append(int(sample.label))
+        if is_multi_label:
+            labels.append(np.asarray(sample.label, dtype=np.float32))
+        else:
+            labels.append(int(sample.label))
 
     images = np.stack(images, axis=0)
-    labels = np.array(labels, dtype=np.int64)
+    labels = np.stack(labels, axis=0) if is_multi_label else np.array(labels, dtype=np.int64)
     exclusion_note = f", {n_excluded_in_range} excluded by manifest" if n_excluded_in_range else ""
     logger.info(
         f"Loaded {split} split: {images.shape[0]} samples, images {images.shape}, "
@@ -200,11 +212,23 @@ def compute_train_band_stats(train_images: np.ndarray, logger):
     return mean, std
 
 
-def compute_class_frequencies(labels: np.ndarray, n_classes: int, logger):
+def compute_class_frequencies(labels: np.ndarray, n_classes: int, logger, is_multi_label: bool = False):
     """Class frequency across the TRAIN split, logged for visibility into
     class imbalance and returned for optional use as inverse-frequency
     class weights.
+
+    For multi-label (labels is (N, n_classes) multi-hot), frequency means
+    "fraction of samples where this class is active" -- there's no single
+    label per sample to bincount, so each class column is averaged
+    independently instead (classes aren't mutually exclusive, so these
+    don't sum to 1, unlike the single-label case).
     """
+    if is_multi_label:
+        freqs = labels.mean(axis=0).astype(np.float64)
+        for c, f in enumerate(freqs):
+            logger.info(f"TRAIN class {c} active-fraction: {f:.6f} ({int(labels[:, c].sum())} samples)")
+        return freqs
+
     counts = np.bincount(labels, minlength=n_classes).astype(np.float64)
     freqs = counts / counts.sum()
     for c, f in enumerate(freqs):
@@ -213,9 +237,16 @@ def compute_class_frequencies(labels: np.ndarray, n_classes: int, logger):
 
 
 class ClassificationArrayDataset:
-    """Thin torch Dataset over in-memory (N,H,W,C) images / (N,) labels."""
+    """Thin torch Dataset over in-memory (N,H,W,C) images / labels.
 
-    def __init__(self, images, labels, mean, std, augment: str, seed: int, image_size=None):
+    `is_multi_label=False`: labels is (N,) int64 -> yields a torch.long
+    scalar label per sample. `is_multi_label=True`: labels is (N, n_classes)
+    float32 multi-hot -> yields a torch.float32 vector per sample (matches
+    what BCEWithLogitsLoss expects as its target, vs. CrossEntropyLoss's
+    int class index).
+    """
+
+    def __init__(self, images, labels, mean, std, augment: str, seed: int, image_size=None, is_multi_label=False):
         self.images = images
         self.labels = labels
         self.mean = mean.astype(np.float32)
@@ -223,6 +254,7 @@ class ClassificationArrayDataset:
         self.augment = augment
         self.rng = random.Random(seed)
         self.image_size = image_size
+        self.is_multi_label = is_multi_label
 
     def __len__(self):
         return len(self.images)
@@ -267,7 +299,8 @@ class ClassificationArrayDataset:
                 mode="bilinear", align_corners=False,
             ).squeeze(0)
 
-        return tensor, torch.tensor(label, dtype=torch.long)
+        label_dtype = torch.float32 if self.is_multi_label else torch.long
+        return tensor, torch.tensor(label, dtype=label_dtype)
 
 
 def build_model(backbone: str, pretrained: bool, in_chans: int, n_classes: int, band_names=None):
@@ -284,8 +317,27 @@ def build_model(backbone: str, pretrained: bool, in_chans: int, n_classes: int, 
     return timm.create_model(backbone, pretrained=pretrained, in_chans=in_chans, num_classes=n_classes)
 
 
-def build_loss(n_classes: int, class_weights, label_smoothing: float, device):
+def build_loss(n_classes: int, class_weights, label_smoothing: float, device, is_multi_label: bool = False):
+    """CrossEntropyLoss for ordinary (single-label) classification --
+    softmax over mutually-exclusive classes. BCEWithLogitsLoss for
+    multi-label (e.g. m-bigearthnet): each class is an independent
+    sigmoid/binary decision, since a sample can belong to any number of
+    classes at once -- CrossEntropyLoss's softmax assumption (exactly one
+    correct class) does not apply. label_smoothing is a CrossEntropyLoss-
+    only concept and has no multi-label equivalent here.
+    """
     import torch
+
+    if is_multi_label:
+        weight_tensor = None
+        if class_weights is not None:
+            # pos_weight (per-class positive-class weight), not the
+            # per-class `weight` CrossEntropyLoss takes -- BCEWithLogitsLoss
+            # has no `weight` that reweights by target class the way
+            # CrossEntropyLoss does; pos_weight is its closest equivalent
+            # for countering class imbalance.
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        return torch.nn.BCEWithLogitsLoss(pos_weight=weight_tensor)
 
     weight_tensor = None
     if class_weights is not None:
@@ -329,12 +381,16 @@ def build_scheduler(name: str, optimizer, epochs: int, warmup_epochs: int):
     return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs])
 
 
-def predict_with_tta(model, images, device, amp_enabled, autocast):
-    """Average softmax probabilities over the identity image plus 3 flip/
+def predict_with_tta(model, images, device, amp_enabled, autocast, is_multi_label: bool = False):
+    """Average per-class probabilities over the identity image plus 3 flip/
     rotation variants, then undo nothing (predictions are per-image class
     scores, orientation-invariant by construction) and return the averaged
     probabilities. Only used at validation (and only when cfg["tta"] is
     true) — never changes what the model is trained on.
+
+    softmax (single-label, classes mutually exclusive) vs. sigmoid
+    (multi-label, each class an independent binary decision) — same
+    averaging either way, only the activation differs.
     """
     import torch
 
@@ -348,7 +404,7 @@ def predict_with_tta(model, images, device, amp_enabled, autocast):
     for variant in variants:
         with autocast(device_type=device.type, enabled=amp_enabled):
             logits = model(variant)
-        probs = torch.softmax(logits.float(), dim=1)
+        probs = torch.sigmoid(logits.float()) if is_multi_label else torch.softmax(logits.float(), dim=1)
         probs_sum = probs if probs_sum is None else probs_sum + probs
     return probs_sum / len(variants)
 
@@ -368,6 +424,62 @@ def compute_accuracy_metrics(pred: "np.ndarray", target: "np.ndarray", n_classes
         else:
             per_class.append(float((pred[mask] == target[mask]).mean()))
     return overall, per_class
+
+
+def compute_multilabel_metrics(pred: "np.ndarray", target: "np.ndarray", n_classes: int):
+    """pred/target are (N, n_classes) {0,1} int arrays (pred already
+    thresholded at 0.5 sigmoid probability by the caller). There is no
+    single "accuracy" for multi-label the way there is for single-label
+    (a prediction is neither simply right nor wrong -- it can get some of
+    a sample's classes right and others wrong), so this reports three
+    standard multi-label metrics instead of inventing one top-1-style number:
+
+      - exact_match: fraction of samples where the predicted label SET is
+        identical to the target label set (strictest, most intuitive).
+      - micro_f1: F1 computed over all (sample, class) decisions pooled
+        together -- dominated by common classes, matches overall
+        "is this model useful" better than exact_match when n_classes=43
+        (m-bigearthnet) and getting every one of 43 bits right is rare.
+      - macro_f1: F1 averaged per-class then across classes -- surfaces
+        whether rare classes are being learned at all, which micro_f1 can
+        hide by being dominated by common ones.
+
+    final_val_metric (what decision_recorded compares across runs, see
+    gotrain/ledger.py) uses micro_f1, not exact_match -- picked because a
+    43-class multi-label task practically never hits exact_match early in
+    training, which would make every run's selection/comparison signal flat
+    at ~0 until much later than micro_f1 would already be informative.
+    """
+    overall_exact_match = float((pred == target).all(axis=1).mean())
+
+    tp = np.logical_and(pred == 1, target == 1).sum(axis=0).astype(np.float64)
+    fp = np.logical_and(pred == 1, target == 0).sum(axis=0).astype(np.float64)
+    fn = np.logical_and(pred == 0, target == 1).sum(axis=0).astype(np.float64)
+
+    micro_tp, micro_fp, micro_fn = tp.sum(), fp.sum(), fn.sum()
+    micro_precision = micro_tp / (micro_tp + micro_fp) if (micro_tp + micro_fp) > 0 else 0.0
+    micro_recall = micro_tp / (micro_tp + micro_fn) if (micro_tp + micro_fn) > 0 else 0.0
+    micro_f1 = (
+        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+        if (micro_precision + micro_recall) > 0 else 0.0
+    )
+
+    per_class_f1 = []
+    for c in range(n_classes):
+        precision_c = tp[c] / (tp[c] + fp[c]) if (tp[c] + fp[c]) > 0 else 0.0
+        recall_c = tp[c] / (tp[c] + fn[c]) if (tp[c] + fn[c]) > 0 else 0.0
+        f1_c = 2 * precision_c * recall_c / (precision_c + recall_c) if (precision_c + recall_c) > 0 else 0.0
+        per_class_f1.append(float(f1_c) if target[:, c].sum() > 0 else None)
+
+    present = [f for f in per_class_f1 if f is not None]
+    macro_f1 = float(np.mean(present)) if present else 0.0
+
+    return {
+        "exact_match": overall_exact_match,
+        "micro_f1": float(micro_f1),
+        "macro_f1": macro_f1,
+        "per_class_f1": per_class_f1,
+    }
 
 
 def main() -> None:
@@ -417,9 +529,32 @@ def main() -> None:
     all_band_names = [b.name for b in task_specs.bands_info]
     band_names = cfg["bands"] if cfg["bands"] else all_band_names
     n_bands = len(band_names)
-    n_classes = task_specs.label_type.n_classes
+
+    from gotrain.dataset_spec import spec_for
+
+    spec = spec_for(dataset, task_specs=task_specs)
+    n_classes = spec.n_classes
+
+    # cfg["loss"] (see gotrain/config_schema.py's CLASSIFICATION_VALID_VALUES):
+    # "auto" (default) follows the dataset's own label_kind -- only an
+    # explicit "ce"/"bce" override forces the other loss/label-shape path
+    # on a dataset whose label_kind would normally pick the other. Resolved
+    # here, before any data is loaded, so every downstream step (label
+    # shape, loss, metrics) agrees on the same is_multi_label for this run.
+    loss_choice = cfg.get("loss", "auto") or "auto"
+    is_multi_label = spec.is_multi_label if loss_choice == "auto" else (loss_choice == "bce")
+    if loss_choice != "auto" and is_multi_label != spec.is_multi_label:
+        logger.warning(
+            f"cfg['loss']={loss_choice!r} overrides this dataset's own label_kind "
+            f"({spec.label_kind!r}) -- training with the "
+            f"{'multi-label' if is_multi_label else 'single-label'} path regardless."
+        )
+
     logger.info(f"Bands ({n_bands}/{len(all_band_names)} used): {band_names}")
-    logger.info(f"Image size: {task_specs.patch_size}, classes: {n_classes} ({task_specs.label_type.class_names})")
+    logger.info(
+        f"Image size: {task_specs.patch_size}, classes: {n_classes} ({spec.class_names}), "
+        f"label_kind: {spec.label_kind}, is_multi_label: {is_multi_label}"
+    )
 
     if dataset == "m-eurosat" and cfg["bands"]:
         logger.warning(
@@ -438,23 +573,25 @@ def main() -> None:
         logger.info(f"DataIQ manifest {cfg['manifest_id']!r}: excluding {len(excluded_ids)} TRAIN sample(s)")
 
     train_images, train_labels = build_dataset_arrays(
-        task_specs, "train", band_names, cfg["max_train_samples"], logger, excluded_ids=excluded_ids
+        task_specs, "train", band_names, cfg["max_train_samples"], logger,
+        excluded_ids=excluded_ids, is_multi_label=is_multi_label,
     )
     val_images, val_labels = build_dataset_arrays(
-        task_specs, "validation", band_names, cfg["max_val_samples"], logger
+        task_specs, "validation", band_names, cfg["max_val_samples"], logger, is_multi_label=is_multi_label
     )
 
     mean, std = compute_train_band_stats(train_images, logger)
-    class_freqs = compute_class_frequencies(train_labels, n_classes, logger)
+    class_freqs = compute_class_frequencies(train_labels, n_classes, logger, is_multi_label=is_multi_label)
 
     class_weights = cfg["class_weights"]
     logger.info(f"Class weights used: {class_weights}")
 
     train_dataset = ClassificationArrayDataset(
-        train_images, train_labels, mean, std, cfg["augmentation"], cfg["seed"], cfg["image_size"]
+        train_images, train_labels, mean, std, cfg["augmentation"], cfg["seed"], cfg["image_size"],
+        is_multi_label=is_multi_label,
     )
     val_dataset = ClassificationArrayDataset(
-        val_images, val_labels, mean, std, "none", cfg["seed"], cfg["image_size"]
+        val_images, val_labels, mean, std, "none", cfg["seed"], cfg["image_size"], is_multi_label=is_multi_label
     )
 
     # drop_last=True on TRAIN only -- see train_segmentation.py's
@@ -541,7 +678,7 @@ def main() -> None:
         print(f"INVALID CONFIG: {e}", file=sys.stderr)
         sys.exit(1)
 
-    loss_fn = build_loss(n_classes, class_weights, cfg["label_smoothing"], device)
+    loss_fn = build_loss(n_classes, class_weights, cfg["label_smoothing"], device, is_multi_label=is_multi_label)
     optimizer = build_optimizer(cfg["optimizer"], trainable_parameters(model), cfg["lr"], cfg["weight_decay"])
     scheduler = build_scheduler(cfg["scheduler"], optimizer, cfg["epochs"], cfg["warmup_epochs"])
     scaler = GradScaler(device="cuda", enabled=amp_enabled)
@@ -591,12 +728,12 @@ def main() -> None:
                 images = images.to(device)
                 try:
                     if cfg["tta"]:
-                        probs = predict_with_tta(model, images, device, amp_enabled, autocast)
-                        preds = probs.argmax(dim=1).cpu().numpy()
+                        probs = predict_with_tta(model, images, device, amp_enabled, autocast, is_multi_label=is_multi_label)
                     else:
                         with autocast(device_type=device.type, enabled=amp_enabled):
                             logits = model(images)
-                        preds = logits.argmax(dim=1).cpu().numpy()
+                        probs = torch.sigmoid(logits.float()) if is_multi_label else torch.softmax(logits.float(), dim=1)
+                    preds = (probs >= 0.5).to(torch.int64).cpu().numpy() if is_multi_label else probs.argmax(dim=1).cpu().numpy()
                 except (torch.OutOfMemoryError, RuntimeError) as e:
                     if not is_oom_error(e):
                         raise
@@ -612,7 +749,20 @@ def main() -> None:
 
         all_preds = np.concatenate(all_preds, axis=0)
         all_targets = np.concatenate(all_targets, axis=0)
-        accuracy, per_class_accuracy = compute_accuracy_metrics(all_preds, all_targets, n_classes)
+
+        if is_multi_label:
+            all_targets_int = all_targets.astype(np.int64)
+            ml_metrics = compute_multilabel_metrics(all_preds, all_targets_int, n_classes)
+            # micro_f1 (not exact_match) drives best-checkpoint selection and
+            # cross-run comparison -- see compute_multilabel_metrics's
+            # docstring for why exact_match is too strict a signal at
+            # n_classes=43 to be useful for autonomous tuning.
+            primary_metric = ml_metrics["micro_f1"]
+            metric_name = "val_micro_f1"
+            per_class_metric = ml_metrics["per_class_f1"]
+        else:
+            primary_metric, per_class_metric = compute_accuracy_metrics(all_preds, all_targets, n_classes)
+            metric_name = "val_accuracy"
 
         if scheduler is not None:
             scheduler.step()
@@ -620,7 +770,7 @@ def main() -> None:
         epoch_seconds = time.time() - epoch_start
         logger.info(
             f"Epoch {epoch + 1}/{cfg['epochs']} — train_loss={avg_train_loss:.4f} "
-            f"val_accuracy={accuracy:.4f} per_class_accuracy={per_class_accuracy} "
+            f"{metric_name}={primary_metric:.4f} per_class={per_class_metric} "
             f"time={epoch_seconds:.1f}s (split=validation)"
         )
 
@@ -635,22 +785,25 @@ def main() -> None:
             epoch=epoch + 1,
             epochs=cfg["epochs"],
             train_loss=avg_train_loss,
-            val_metric=accuracy,
-            metric_name="val_accuracy",
-            best_val_metric=max(best_val_acc, accuracy),
+            val_metric=primary_metric,
+            metric_name=metric_name,
+            best_val_metric=max(best_val_acc, primary_metric),
             elapsed_seconds=time.time() - training_start,
         )
 
-        if accuracy > best_val_acc:
-            best_val_acc = accuracy
+        if primary_metric > best_val_acc:
+            best_val_acc = primary_metric
             best_metrics = {
                 "epoch": epoch + 1,
-                "val_accuracy": accuracy,
-                "val_per_class_accuracy": per_class_accuracy,
+                metric_name: primary_metric,
+                f"val_per_class_{'f1' if is_multi_label else 'accuracy'}": per_class_metric,
                 "train_loss": avg_train_loss,
             }
+            if is_multi_label:
+                best_metrics["val_exact_match"] = ml_metrics["exact_match"]
+                best_metrics["val_macro_f1"] = ml_metrics["macro_f1"]
             torch.save(model.state_dict(), best_checkpoint_path)
-            logger.info(f"New best val_accuracy={accuracy:.4f} — checkpoint saved to {best_checkpoint_path}")
+            logger.info(f"New best {metric_name}={primary_metric:.4f} — checkpoint saved to {best_checkpoint_path}")
 
         elapsed = time.time() - training_start
         if time_budget_seconds is not None and elapsed > time_budget_seconds:
@@ -686,6 +839,9 @@ def main() -> None:
         "n_bands": n_bands,
         "band_names": band_names,
         "n_classes": n_classes,
+        "label_kind": spec.label_kind,
+        "is_multi_label": is_multi_label,
+        "metric_name": metric_name,
         "dependency_versions": reproducibility.capture_dependency_versions(),
         "warm_started_from": warm_started_from,
         "class_frequencies": class_freqs.tolist(),
@@ -700,10 +856,10 @@ def main() -> None:
         "n_excluded_by_manifest": len(excluded_ids),
     }
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    logger.info(f"Run finished in {total_seconds:.1f}s. Best val_accuracy={best_val_acc:.4f}")
+    logger.info(f"Run finished in {total_seconds:.1f}s. Best {metric_name}={best_val_acc:.4f}")
     logger.info(f"FINAL_VAL_METRIC: {final_val_metric}")
 
-    rationale = f"best val_accuracy={final_val_metric:.4f} at epoch {best_metrics['epoch']} (run_dir={run_dir})"
+    rationale = f"best {metric_name}={final_val_metric:.4f} at epoch {best_metrics['epoch']} (run_dir={run_dir})"
     if interrupted_reason:
         rationale += f" -- stopped early: {interrupted_reason}"
 
@@ -721,6 +877,8 @@ def main() -> None:
             "frozen_parameters": fine_tuning_summary["frozen_parameters"],
             "manifest_id": cfg["manifest_id"],
             "n_excluded_by_manifest": len(excluded_ids),
+            "is_multi_label": is_multi_label,
+            "metric_name": metric_name,
         },
     }))
 

@@ -29,6 +29,7 @@ from gotrain.config_schema import PreflightValidationError
 from gotrain.logging_utils import log_event
 from gotrain.tools import adaptation as adaptation_tools
 from gotrain.tools import dataiq as dataiq_tools
+from gotrain.tools import dataset_support as dataset_support_tools
 from gotrain.tools import datasets as datasets_tools
 from gotrain.tools import experiment_planner as experiment_planner_tools
 from gotrain.tools import geoguard as geoguard_tools
@@ -74,6 +75,37 @@ def get_dataset_info(dataset: str) -> dict:
         dataset: the GEO-Bench dataset name, e.g. "m-eurosat".
     """
     return datasets_tools.get_dataset_info(dataset)
+
+
+@tool
+def check_dataset_support(dataset: str) -> dict:
+    """Check whether GoTrain's training/evaluation code supports `dataset`,
+    without downloading anything -- only task_specs.pkl (a small geobench
+    metadata file) needs to already exist locally under GEO_BENCH_DIR.
+
+    Returns {"dataset", "supported": bool, "reason": str, "label_kind":
+    "single_label"|"multi_label"|"segmentation"|None, "n_classes": int|None,
+    "n_bands": int|None}. "supported": False with reason "not found
+    locally: ..." means it just hasn't been downloaded yet, not that it
+    can't be trained on -- re-check after downloading.
+
+    Args:
+        dataset: the GEO-Bench dataset name, e.g. "m-bigearthnet".
+    """
+    return dataset_support_tools.check_dataset_support(dataset)
+
+
+@tool
+def report_all_datasets() -> dict:
+    """Check support status for all 12 GEO-Bench hackathon datasets at
+    once, without downloading anything. Use this to see which datasets are
+    already trainable and which still need to be downloaded or aren't
+    supported, before spending a run budget on any of them.
+
+    Returns {"datasets": [one check_dataset_support result per dataset],
+    "n_supported": int, "n_unsupported": int}.
+    """
+    return dataset_support_tools.report_all_datasets()
 
 
 @tool
@@ -619,6 +651,8 @@ def download_from_s3(dataset: str, version: str) -> dict:
 ALL_TOOLS = [
     list_datasets,
     get_dataset_info,
+    check_dataset_support,
+    report_all_datasets,
     run_geoguard,
     run_dataiq_structural_scan,
     run_dataiq_loss_scan,

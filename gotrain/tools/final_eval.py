@@ -114,12 +114,16 @@ def build_classification_test_eval_fn(dataset: str, run_id: str, config: dict):
     run_dir = _run_dir(dataset, run_id)
     logger = _silent_logger(f"final_eval.classification.{run_id}")
 
+    from gotrain.dataset_spec import spec_for
+
     task_dir = tc.find_task_dir(dataset)
     task_specs = geobench.load_task_specs(task_dir)
     all_band_names = [b.name for b in task_specs.bands_info]
     band_names = config.get("bands") or all_band_names
     n_bands = len(band_names)
-    n_classes = task_specs.label_type.n_classes
+    spec = spec_for(dataset, task_specs=task_specs)
+    n_classes = spec.n_classes
+    is_multi_label = spec.is_multi_label
 
     train_images, _ = tc.build_dataset_arrays(
         task_specs, "train", band_names, config.get("max_train_samples"), logger
@@ -133,9 +137,12 @@ def build_classification_test_eval_fn(dataset: str, run_id: str, config: dict):
         sample = test_ds[i]
         arr, _ = sample.pack_to_3d(band_names=band_names)
         test_images.append(arr.astype(np.float32))
-        test_labels.append(int(sample.label))
+        if is_multi_label:
+            test_labels.append(np.asarray(sample.label, dtype=np.float32))
+        else:
+            test_labels.append(int(sample.label))
     test_images = np.stack(test_images, axis=0)
-    test_labels = np.array(test_labels, dtype=np.int64)
+    test_labels = np.stack(test_labels, axis=0) if is_multi_label else np.array(test_labels, dtype=np.int64)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = tc.build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes, band_names)
@@ -152,8 +159,23 @@ def build_classification_test_eval_fn(dataset: str, run_id: str, config: dict):
         for start in range(0, len(normalized), batch_size):
             batch = torch.from_numpy(normalized[start:start + batch_size]).float().to(device)
             logits = model(batch)
-            all_preds.append(logits.argmax(dim=1).cpu().numpy())
+            if is_multi_label:
+                preds = (torch.sigmoid(logits) >= 0.5).to(torch.int64).cpu().numpy()
+            else:
+                preds = logits.argmax(dim=1).cpu().numpy()
+            all_preds.append(preds)
     preds = np.concatenate(all_preds, axis=0)
+
+    if is_multi_label:
+        ml_metrics = tc.compute_multilabel_metrics(preds, test_labels.astype(np.int64), n_classes)
+        return {
+            "micro_f1": ml_metrics["micro_f1"],
+            "macro_f1": ml_metrics["macro_f1"],
+            "exact_match": ml_metrics["exact_match"],
+            "per_class_f1": ml_metrics["per_class_f1"],
+            "n_test_samples": int(len(test_labels)),
+            "band_names": band_names,
+        }
 
     accuracy, per_class_accuracy = tc.compute_accuracy_metrics(preds, test_labels, n_classes)
     return {

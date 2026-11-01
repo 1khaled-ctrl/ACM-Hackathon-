@@ -173,18 +173,24 @@ def run_stresslab_classification(dataset: str, run_id: str, max_samples: Optiona
     config = record["config"]
     logger = _silent_logger(f"stresslab.classification.{run_id}")
 
+    from gotrain.dataset_spec import spec_for
+
     task_dir = tc.find_task_dir(dataset)
     task_specs = geobench.load_task_specs(task_dir)
     all_band_names = [b.name for b in task_specs.bands_info]
     band_names = config.get("bands") or all_band_names
     n_bands = len(band_names)
-    n_classes = task_specs.label_type.n_classes
+    spec = spec_for(dataset, task_specs=task_specs)
+    n_classes = spec.n_classes
+    is_multi_label = spec.is_multi_label
 
     train_images, _ = tc.build_dataset_arrays(task_specs, "train", band_names, config.get("max_train_samples"), logger)
     mean, std = tc.compute_train_band_stats(train_images, logger)
     del train_images
 
-    val_images, val_labels = tc.build_dataset_arrays(task_specs, "validation", band_names, max_samples, logger)
+    val_images, val_labels = tc.build_dataset_arrays(
+        task_specs, "validation", band_names, max_samples, logger, is_multi_label=is_multi_label
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = tc.build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes, band_names)
@@ -201,8 +207,22 @@ def run_stresslab_classification(dataset: str, run_id: str, max_samples: Optiona
             for start in range(0, len(normalized), batch_size):
                 batch = torch.from_numpy(normalized[start:start + batch_size]).float().to(device)
                 logits = model(batch)
-                all_preds.append(logits.argmax(dim=1).cpu().numpy())
+                if is_multi_label:
+                    preds = (torch.sigmoid(logits) >= 0.5).to(torch.int64).cpu().numpy()
+                else:
+                    preds = logits.argmax(dim=1).cpu().numpy()
+                all_preds.append(preds)
         preds = np.concatenate(all_preds, axis=0)
+        if is_multi_label:
+            # StressLab's single scalar-per-perturbation contract (see
+            # run_perturbation_battery) wants one number, same as the
+            # single-label accuracy path -- micro_f1 is the primary metric
+            # train_classification.py already uses for multi-label (see its
+            # compute_multilabel_metrics docstring for why), so StressLab's
+            # robustness score stays directly comparable to training's own
+            # val_micro_f1 for this dataset.
+            ml_metrics = tc.compute_multilabel_metrics(preds, val_labels.astype(np.int64), n_classes)
+            return ml_metrics["micro_f1"]
         accuracy, _ = tc.compute_accuracy_metrics(preds, val_labels, n_classes)
         return accuracy
 

@@ -20,12 +20,23 @@ __all__ = ["decision", "diagnostics", "manifest", "report", "run_structural_scan
 
 
 def run_structural_scan(dataset: str, task_type: str, max_samples: int = 300) -> dict:
-    images, labels, band_names, _task_specs = geoguard_diagnostics.load_train_sample(
+    images, labels, band_names, task_specs = geoguard_diagnostics.load_train_sample(
         dataset, task_type, max_samples
     )
-    n_classes = int(labels.max()) + 1 if labels.size else 0
 
-    structural_records = diagnostics.scan_samples(images, labels, task_type, n_classes)
+    # n_classes must come from the dataset's own spec, not be inferred from
+    # label VALUES (int(labels.max())+1): for multi-label (e.g.
+    # m-bigearthnet), labels.max() is always 1 (it's a {0,1} multi-hot
+    # array), which would wrongly compute n_classes=2 instead of the real
+    # 43 -- a silent, not a crashing, bug, and a worse one for that.
+    from gotrain.dataset_spec import spec_for
+
+    spec = spec_for(dataset, task_specs=task_specs)
+    n_classes = spec.n_classes
+
+    structural_records = diagnostics.scan_samples(
+        images, labels, task_type, n_classes, is_multi_label=spec.is_multi_label
+    )
     duplicate_groups = diagnostics.find_exact_duplicates(images)
     summary = diagnostics.summarize_scan(structural_records, duplicate_groups)
 

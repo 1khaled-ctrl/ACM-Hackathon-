@@ -18,13 +18,19 @@ SEVERITY_HIGH = "high"      # objectively corrupted/invalid -- eligible for auto
 SEVERITY_NONE = "none"
 
 
-def scan_samples(images: np.ndarray, labels: np.ndarray, task_type: str, n_classes: int) -> list:
+def scan_samples(
+    images: np.ndarray, labels: np.ndarray, task_type: str, n_classes: int, is_multi_label: bool = False
+) -> list:
     """Return one record per sample: {"sample_id", "severity", "problems"}.
 
-    `images` is (N, H, W, C). `labels` is (N,) ints for classification or
-    (N, H, W) ints for segmentation. `sample_id` is the index of a sample
-    within `images`/`labels` -- see gotrain/dataiq/manifest.py's module
-    docstring for exactly what that index means and its limits.
+    `images` is (N, H, W, C). `labels` is (N,) ints for single-label
+    classification, (N, H, W) ints for segmentation, or (N, n_classes) {0,1}
+    multi-hot for multi-label classification (`is_multi_label=True`, e.g.
+    m-bigearthnet) -- coercing a multi-hot row with int() (the single-label
+    path) would raise, since it's a vector, not a scalar. `sample_id` is the
+    index of a sample within `images`/`labels` -- see
+    gotrain/dataiq/manifest.py's module docstring for exactly what that
+    index means and its limits.
     """
     if images.shape[0] != labels.shape[0]:
         raise ValueError(f"images/labels count mismatch: {images.shape[0]} vs {labels.shape[0]}")
@@ -52,6 +58,12 @@ def scan_samples(images: np.ndarray, labels: np.ndarray, task_type: str, n_class
                 problems.append(
                     f"mask values out of range [0, {n_classes}): min={int(mask.min())}, max={int(mask.max())}"
                 )
+        elif is_multi_label:
+            label_vec = labels[i]
+            if label_vec.shape != (n_classes,):
+                problems.append(f"multi-label vector shape {label_vec.shape} does not match n_classes={n_classes}")
+            elif not np.all(np.isin(label_vec, (0, 1))):
+                problems.append("multi-label targets must be 0/1 -- found a value outside {0, 1}")
         else:
             label = int(labels[i])
             if label < 0 or label >= n_classes:

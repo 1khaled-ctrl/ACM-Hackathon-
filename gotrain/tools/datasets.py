@@ -60,14 +60,26 @@ def get_dataset_info(dataset: str) -> dict:
         except Exception:
             split_sizes[public_split] = None
 
+    from gotrain.dataset_spec import classify_label_type, UnsupportedLabelTypeError
+
     label_type = task_specs.label_type
-    label_kind = type(label_type).__name__
-    label_info: dict = {"kind": label_kind}
-    if hasattr(label_type, "class_names"):
-        label_info["classes"] = list(label_type.class_names)
-        label_info["n_classes"] = getattr(label_type, "n_classes", len(label_info["classes"]))
-    elif hasattr(label_type, "n_classes"):
+    label_info: dict = {"kind": type(label_type).__name__}
+    if hasattr(label_type, "n_classes"):
         label_info["n_classes"] = label_type.n_classes
+    # _class_names_of covers the class_names/class_name attribute-name
+    # inconsistency between geobench's label types (see
+    # gotrain/dataset_spec.py's docstring) -- using it directly here (not
+    # duplicating the hasattr check) means a multi-label dataset's classes
+    # are reported here too, not silently empty.
+    from gotrain.dataset_spec import _class_names_of
+
+    class_names = _class_names_of(label_type)
+    if class_names is not None:
+        label_info["classes"] = class_names
+    try:
+        label_info["label_kind"] = classify_label_type(label_type)
+    except UnsupportedLabelTypeError:
+        label_info["label_kind"] = None
 
     return {
         "dataset": dataset,

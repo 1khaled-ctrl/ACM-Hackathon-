@@ -123,16 +123,31 @@ def compute_pixel_diagnostics(images: np.ndarray, band_names: list) -> dict:
     }
 
 
-def compute_class_diagnostics(labels: np.ndarray, class_names: list, is_pixelwise: bool) -> dict:
+def compute_class_diagnostics(
+    labels: np.ndarray, class_names: list, is_pixelwise: bool, is_multi_label: bool = False
+) -> dict:
     """Class-count (classification) or pixel-count (segmentation) frequency
     diagnostics -- the two are the same computation over a differently
     shaped `labels` array (per-sample vs. per-pixel), so one function
     serves both task types.
+
+    `is_multi_label=True` (e.g. m-bigearthnet): `labels` is (N, n_classes)
+    {0,1} multi-hot, not a per-sample/per-pixel class index -- bincount over
+    a flattened multi-hot array would just count 0s and 1s, not class
+    frequencies, so this computes "fraction of samples where each class is
+    active" directly from the multi-hot columns instead. Classes aren't
+    mutually exclusive here, so frequencies don't sum to 1 the way the
+    single-label/segmentation case does -- that's expected, not a bug.
     """
     n_classes = len(class_names)
-    counts = np.bincount(labels.reshape(-1), minlength=n_classes).astype(np.float64)
-    total = counts.sum()
-    freqs = (counts / total).tolist() if total else [0.0] * n_classes
+    if is_multi_label:
+        freqs = labels.mean(axis=0).astype(np.float64).tolist()
+        counts = labels.sum(axis=0).astype(int).tolist()
+    else:
+        counts_arr = np.bincount(labels.reshape(-1), minlength=n_classes).astype(np.float64)
+        total = counts_arr.sum()
+        freqs = (counts_arr / total).tolist() if total else [0.0] * n_classes
+        counts = counts_arr.astype(int).tolist()
 
     rare_threshold = 0.02
     rare_classes = [class_names[c] for c, f in enumerate(freqs) if 0 < f < rare_threshold]
@@ -144,13 +159,13 @@ def compute_class_diagnostics(labels: np.ndarray, class_names: list, is_pixelwis
     return {
         "n_classes": n_classes,
         "class_names": class_names,
-        "counts": counts.astype(int).tolist(),
+        "counts": counts,
         "frequencies": freqs,
         "rare_classes": rare_classes,
         "classes_absent_from_sample": absent_classes,
         "imbalance_ratio": imbalance_ratio,
         "background_dominant": background_dominant,
-        "unit": "pixels" if is_pixelwise else "samples",
+        "unit": "active-samples" if is_multi_label else ("pixels" if is_pixelwise else "samples"),
     }
 
 
@@ -172,13 +187,23 @@ def load_train_sample(dataset: str, task_type: str, max_samples: int = 300):
     bounded and read-only: GeoGuard never trains anything and never opens
     validation or test.
 
+    `task_type` only distinguishes segmentation (per-pixel mask) from
+    everything else here; whether "everything else" is single- or
+    multi-label classification is resolved from the dataset's own
+    geobench.LabelType via gotrain.dataset_spec, not guessed from task_type
+    or the dataset name -- m-bigearthnet's sample.label is already a
+    {0,1}^n_classes multi-hot np.ndarray, not an int, so coercing it with
+    int() (the pre-existing single-label path) would raise on it.
+
     Returns (images, labels_or_masks, band_names, task_specs).
     """
     import geobench
+    from gotrain.dataset_spec import spec_for
 
     task_dir = _find_task_dir(dataset)
     task_specs = geobench.load_task_specs(task_dir)
     band_names = [b.name for b in task_specs.bands_info]
+    is_multi_label = spec_for(dataset, task_specs=task_specs).is_multi_label
 
     ds = task_specs.get_dataset(split="train")
     n = min(len(ds), max_samples)
@@ -190,9 +215,14 @@ def load_train_sample(dataset: str, task_type: str, max_samples: int = 300):
         images.append(arr.astype(np.float32))
         if task_type == "segmentation":
             labels.append(sample.label.data)
+        elif is_multi_label:
+            labels.append(np.asarray(sample.label, dtype=np.float32))
         else:
             labels.append(int(sample.label))
 
     images = np.stack(images, axis=0)
-    labels = np.stack(labels, axis=0) if task_type == "segmentation" else np.array(labels, dtype=np.int64)
+    if task_type == "segmentation" or is_multi_label:
+        labels = np.stack(labels, axis=0)
+    else:
+        labels = np.array(labels, dtype=np.int64)
     return images, labels, band_names, task_specs

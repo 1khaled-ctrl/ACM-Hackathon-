@@ -129,12 +129,33 @@ def scan_classification_run(dataset: str, run_id: str, max_samples: Optional[int
     logger = logging.getLogger(f"dataiq.loss_scan.{run_id}")
     logger.addHandler(logging.NullHandler())
 
+    from gotrain.dataset_spec import spec_for
+
     task_dir = tc.find_task_dir(dataset)
     task_specs = geobench.load_task_specs(task_dir)
     all_band_names = [b.name for b in task_specs.bands_info]
     band_names = config.get("bands") or all_band_names
     n_bands = len(band_names)
-    n_classes = task_specs.label_type.n_classes
+    spec = spec_for(dataset, task_specs=task_specs)
+    n_classes = spec.n_classes
+
+    if spec.is_multi_label:
+        # Per-example label-noise scanning (high-confidence-wrong,
+        # high-loss-and-wrong) is defined here in terms of ONE predicted
+        # class vs. ONE assigned label per sample -- that has no direct
+        # multi-label equivalent (a multi-label prediction is right about
+        # some classes and wrong about others, not simply right/wrong), so
+        # extending it correctly is a real design decision, not a
+        # mechanical type change. Refusing explicitly here means a
+        # multi-label dataset's loss-scan results are never silently wrong
+        # (e.g. from F.cross_entropy on a multi-hot target) -- it surfaces
+        # as this clear error instead.
+        raise ValueError(
+            f"dataset {dataset!r} is multi-label (label_kind={spec.label_kind!r}) -- "
+            "scan_classification_run's high-confidence-wrong / high-loss label-noise "
+            "heuristics are defined for single-label classification only and do not "
+            "have a correct multi-label equivalent yet."
+        )
 
     train_images, train_labels = tc.build_dataset_arrays(task_specs, "train", band_names, max_samples, logger)
     mean, std = tc.compute_train_band_stats(train_images, logger)

@@ -1,4 +1,5 @@
 from gotrain.tools.datasets import list_datasets, get_dataset_info
+from gotrain.tools.dataset_support import check_dataset_support, report_all_datasets
 from gotrain.tools.training import (
     launch_training,
     get_run_status,
@@ -27,6 +28,8 @@ from gotrain.tools.adaptation import record_adaptation
 __all__ = [
     "list_datasets",
     "get_dataset_info",
+    "check_dataset_support",
+    "report_all_datasets",
     "launch_training",
     "get_run_status",
     "get_run_metrics",

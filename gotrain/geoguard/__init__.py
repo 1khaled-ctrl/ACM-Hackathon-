@@ -32,11 +32,13 @@ def run_geoguard(dataset: str, task_type: str, max_samples: int = 300) -> dict:
     pixel_diag = diagnostics.compute_pixel_diagnostics(images, band_names)
     band_class = diagnostics.classify_bands(band_names)
 
-    class_names = list(getattr(task_specs.label_type, "class_names", []))
-    if not class_names:
-        n_classes = getattr(task_specs.label_type, "n_classes", int(labels.max()) + 1)
-        class_names = [str(i) for i in range(n_classes)]
-    class_diag = diagnostics.compute_class_diagnostics(labels, class_names, is_pixelwise=(task_type == "segmentation"))
+    from gotrain.dataset_spec import spec_for
+
+    spec = spec_for(dataset, task_specs=task_specs)
+    class_names = spec.class_names or [str(i) for i in range(spec.n_classes)]
+    class_diag = diagnostics.compute_class_diagnostics(
+        labels, class_names, is_pixelwise=(task_type == "segmentation"), is_multi_label=spec.is_multi_label
+    )
 
     dataset_notes = diagnostics.DATASET_NOTES.get(dataset, {"sensor": "unknown", "warnings": []})
 

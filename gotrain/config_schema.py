@@ -29,6 +29,12 @@ CLASSIFICATION_VALID_VALUES = {
     "augmentation": ["none", "basic", "strong"],
     "backbone": ["resnet18", "resnet50", "efficientnet_b0", "convnext_tiny", "dinov2_small"],
     "fine_tuning_strategy": FINE_TUNING_STRATEGIES,
+    # "auto" (default) picks ce/bce from the dataset's own label_kind (see
+    # gotrain/dataset_spec.py) -- a multi-label dataset like m-bigearthnet
+    # is detected from task_specs, never guessed from the dataset name, so
+    # an explicit override is only needed to force one on a dataset whose
+    # label_kind would normally pick the other.
+    "loss": ["auto", "ce", "bce"],
 }
 
 SEGMENTATION_VALID_VALUES = {
