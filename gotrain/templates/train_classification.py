@@ -91,6 +91,13 @@ DEFAULTS = {
     "tta": False,
     "fine_tuning_strategy": "full",
     "manifest_id": None,
+    # Set by gotrain.tools.training.launch_training from the agent's actual
+    # per-run subprocess timeout -- not a user-facing knob (no config_schema
+    # entry), just how build_dataset_arrays learns its own deadline. None
+    # when this template is invoked directly/without a timeout (e.g. tests,
+    # manual runs): loading is then unbounded, exactly like before this
+    # budget check existed.
+    "_timeout_seconds": None,
 }
 
 BENCHMARK_DIRS = ["classification_v1.0", "segmentation_v1.0"]
@@ -138,7 +145,39 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None, is_multi_label=False):
+# Fraction of the subprocess's total wall-clock budget (cfg["_timeout_seconds"],
+# set by gotrain.tools.launch_training from the agent's per-run timeout)
+# that data LOADING alone is allowed to consume, across both the train and
+# validation splits combined. Loading two splits eagerly (see
+# build_dataset_arrays's docstring) happens entirely before training_start
+# is set, so it is otherwise invisible to this template's own
+# time_budget_minutes check (an in-loop, between-epochs check that never
+# even starts running until after both splits are already loaded) -- the
+# ONLY thing that was previously stopping a slow load was the parent
+# process's hard subprocess.run(timeout=...) kill, which leaves no
+# checkpoint, no stdout, and no recorded reason. Left at 0.5 (not higher)
+# so at least half the budget remains for the thing the budget is actually
+# for: training and saving a checkpoint.
+LOADING_PHASE_BUDGET_FRACTION = 0.5
+# How often (in samples) to check the deadline during the load loop --
+# frequent enough to catch a slow split well before the full budget is
+# gone, cheap enough (time.time() is ~100ns) to not matter next to one
+# sample's actual disk read + pack_to_3d cost.
+LOADING_DEADLINE_CHECK_EVERY = 200
+
+
+class DataLoadingBudgetExceeded(RuntimeError):
+    """Raised by build_dataset_arrays when loading alone would consume the
+    run's whole wall-clock budget, leaving no time to actually train or
+    save a checkpoint. Raised well before the parent process's hard
+    subprocess timeout would otherwise SIGKILL this process mid-load --
+    turning an opaque, unrecorded kill (previously surfaced only as
+    "STOPPED, 0/3, timeout" with no further detail) into a clear,
+    logged, actionable failure.
+    """
+
+
+def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None, is_multi_label=False, loading_deadline=None):
     """Load every sample of `split` into memory as (N, H, W, C) float32 images
     and labels. GEO-Bench classification tasks here are small enough (a few
     thousand small patches) that this is simpler than writing a lazy
@@ -179,6 +218,14 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
     labels = []
     n_excluded_in_range = 0
     for i in range(n):
+        if loading_deadline is not None and i % LOADING_DEADLINE_CHECK_EVERY == 0 and time.time() > loading_deadline:
+            raise DataLoadingBudgetExceeded(
+                f"Loading the {split!r} split for this dataset is taking too long: only "
+                f"{i}/{n} samples loaded before the data-loading time budget was reached. "
+                "At this rate the full load (and any actual training) would exceed this run's "
+                "wall-clock budget. Retry with a smaller max_train_samples/max_val_samples, or "
+                "a larger time_budget_minutes/run budget for this dataset."
+            )
         if i in excluded_ids:
             n_excluded_in_range += 1
             continue
@@ -572,13 +619,31 @@ def main() -> None:
         excluded_ids = get_excluded_ids(dataset, cfg["manifest_id"])
         logger.info(f"DataIQ manifest {cfg['manifest_id']!r}: excluding {len(excluded_ids)} TRAIN sample(s)")
 
-    train_images, train_labels = build_dataset_arrays(
-        task_specs, "train", band_names, cfg["max_train_samples"], logger,
-        excluded_ids=excluded_ids, is_multi_label=is_multi_label,
-    )
-    val_images, val_labels = build_dataset_arrays(
-        task_specs, "validation", band_names, cfg["max_val_samples"], logger, is_multi_label=is_multi_label
-    )
+    # See LOADING_PHASE_BUDGET_FRACTION's comment: a hard deadline for
+    # loading BOTH splits combined, derived from this run's actual
+    # subprocess timeout, so a large split can't alone consume the whole
+    # budget and get silently SIGKILLed with no checkpoint and no reason.
+    loading_deadline = None
+    if cfg["_timeout_seconds"]:
+        loading_deadline = time.time() + cfg["_timeout_seconds"] * LOADING_PHASE_BUDGET_FRACTION
+        logger.info(
+            f"Data-loading budget: {cfg['_timeout_seconds'] * LOADING_PHASE_BUDGET_FRACTION:.0f}s "
+            f"of this run's {cfg['_timeout_seconds']:.0f}s total timeout."
+        )
+
+    try:
+        train_images, train_labels = build_dataset_arrays(
+            task_specs, "train", band_names, cfg["max_train_samples"], logger,
+            excluded_ids=excluded_ids, is_multi_label=is_multi_label, loading_deadline=loading_deadline,
+        )
+        val_images, val_labels = build_dataset_arrays(
+            task_specs, "validation", band_names, cfg["max_val_samples"], logger,
+            is_multi_label=is_multi_label, loading_deadline=loading_deadline,
+        )
+    except DataLoadingBudgetExceeded as e:
+        logger.error(str(e))
+        print(f"DATA LOADING TIMEOUT: {e}", file=sys.stderr)
+        sys.exit(1)
 
     mean, std = compute_train_band_stats(train_images, logger)
     class_freqs = compute_class_frequencies(train_labels, n_classes, logger, is_multi_label=is_multi_label)

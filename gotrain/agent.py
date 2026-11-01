@@ -589,7 +589,62 @@ def _submit_final_model(dataset: str, run_id: str, hooks: "LimitsAndLoggingHooks
     except Exception as e:
         log_event("model_passport_generation_failed", dataset=dataset, run_id=run_id, error=str(e))
 
+    _auto_run_stresslab(dataset=dataset, run_id=run_id, record=record)
+
     return updated
+
+
+def _auto_run_stresslab(dataset: str, run_id: str, record: dict) -> None:
+    """Run StressLab automatically on the model the agent just submitted
+    as final -- this is the ONLY place StressLab is triggered without an
+    explicit agent tool call. Previously StressLab only ran if the agent
+    chose to call the run_stresslab tool, which the system prompt
+    describes as optional ("call it on a candidate you're seriously
+    weighing... not on every run") -- under tool-call budget pressure the
+    agent would skip it, leaving every submitted model's robustness
+    unevaluated. This makes it unconditional for the one run that
+    actually matters (the submitted model), without spending it on every
+    experiment: it is called exactly once per submit_final_model, after
+    the submission itself has already succeeded.
+
+    Never raises -- a StressLab failure (missing checkpoint, unsupported
+    task_type, a crash inside the torch forward pass) must not undo an
+    otherwise-successful submission. Every outcome (ran, skipped as
+    unavailable, or failed) is logged and persisted so the dashboard can
+    show something more specific than silence:
+      - task_type not in ("classification", "segmentation"): logs
+        "stresslab_unavailable" with a reason and returns -- covers
+        task_type="fake" and any future task type StressLab doesn't
+        support yet.
+      - no registered checkpoint (version_id is empty -- set by
+        registry.register_run only when the training template actually
+        reported a run_dir, see gotrain/tools/training.py): same
+        "stresslab_unavailable" path, since run_stresslab would just
+        raise FileNotFoundError on a checkpoint that was never written.
+      - any other exception (torch/geobench import failure, OOM, a bug in
+        the perturbation battery itself): logged as "stresslab_failed"
+        with the error, not swallowed silently and not re-raised.
+    """
+    task_type = record.get("task_type")
+    if task_type not in ("classification", "segmentation"):
+        log_event(
+            "stresslab_unavailable", dataset=dataset, run_id=run_id,
+            reason=f"StressLab has no evaluation path for task_type={task_type!r}",
+        )
+        return
+
+    if not record.get("version_id"):
+        log_event(
+            "stresslab_unavailable", dataset=dataset, run_id=run_id,
+            reason="no registered checkpoint for this run (version_id is empty) -- "
+                   "the training template may not have reported a run_dir",
+        )
+        return
+
+    try:
+        stresslab_tools.run_stresslab(dataset=dataset, task_type=task_type, run_id=run_id)
+    except Exception as e:
+        log_event("stresslab_failed", dataset=dataset, run_id=run_id, error=str(e))
 
 
 @tool

@@ -231,9 +231,27 @@ def reconcile_open_session() -> None:
             status = history_mod.FAILED
         else:
             status = history_mod.STOPPED
-        history_mod.finish_session(session["session_id"], status=status, ended_in_state=state)
-    except Exception:
-        pass
+
+        extra = {"ended_in_state": state}
+        if status == history_mod.STOPPED:
+            # "0/3" alone doesn't say WHY -- see derive_stop_reason's
+            # docstring. Computed once, here, at the moment the session is
+            # actually closed (not on every later read), and stored on the
+            # session record so History always shows the same reason it
+            # showed the moment this fired.
+            extra["stop_reason"] = history_mod.derive_stop_reason(
+                session.get("dataset"), session.get("started_at")
+            )
+
+        history_mod.finish_session(session["session_id"], status=status, **extra)
+    except Exception as e:
+        # Best-effort (never allowed to break the live snapshot this piggy-
+        # backs on), but NOT silent: a failure here previously vanished
+        # entirely, leaving a session stuck RUNNING forever with no
+        # terminal state at all -- worse than a wrong one, since nothing
+        # about it is visible anywhere. Logged so it's at least
+        # discoverable in nexus.log instead of disappearing.
+        print(f"reconcile_open_session failed: {e}", file=sys.stderr)
 
 
 def build_current_mission() -> Optional[dict]:
@@ -600,18 +618,48 @@ def api_lineage(dataset: str) -> dict:
 
 @app.get("/api/stresslab/{dataset}/{run_id}")
 def api_stresslab(dataset: str, run_id: str) -> dict:
-    """StressLab robustness report for one run, or not_run=true if
-    run_stresslab was never called for it -- read-only over
+    """StressLab robustness report for one run, read-only over
     logs/stresslab/<dataset>/<run_id>.json (gotrain.stresslab.runner).
     Never runs the battery itself (that needs torch + the real dataset +
-    a saved checkpoint, and is only ever triggered by the agent tool).
+    a saved checkpoint; see gotrain.agent._auto_run_stresslab, which
+    triggers it automatically on submit_final_model -- the only place it
+    now runs without an explicit agent tool call).
+
+    When no report exists, distinguishes three cases instead of a single
+    flat "not run", by checking the most recent matching event in
+    events.jsonl for this exact (dataset, run_id):
+      - not_run=true: StressLab has never been invoked for this run at all.
+      - unavailable=true: it WAS invoked (at submit_final_model time) but
+        was skipped on purpose -- task_type has no StressLab path (e.g.
+        "fake"), or this run has no registered checkpoint to evaluate.
+      - failed=true: it WAS invoked and raised (missing checkpoint found
+        too late, OOM, a torch/geobench import failure) -- the submission
+        itself still succeeded; only the robustness check didn't run.
     """
     from gotrain.stresslab import runner as stresslab_runner
 
     report = stresslab_runner.read_report(dataset, run_id)
-    if report is None:
-        return {"dataset": dataset, "run_id": run_id, "not_run": True}
-    return {"dataset": dataset, "run_id": run_id, "not_run": False, **report}
+    if report is not None:
+        return {"dataset": dataset, "run_id": run_id, "not_run": False, **report}
+
+    matches = [
+        e for e in read_jsonl(EVENTS_PATH)
+        if e.get("dataset") == dataset and e.get("run_id") == run_id
+        and e.get("event") in ("stresslab_unavailable", "stresslab_failed")
+    ]
+    if matches:
+        latest = matches[-1]
+        if latest["event"] == "stresslab_unavailable":
+            return {
+                "dataset": dataset, "run_id": run_id, "not_run": False,
+                "unavailable": True, "reason": latest.get("reason") or "unavailable",
+            }
+        return {
+            "dataset": dataset, "run_id": run_id, "not_run": False,
+            "failed": True, "reason": latest.get("error") or "StressLab failed",
+        }
+
+    return {"dataset": dataset, "run_id": run_id, "not_run": True}
 
 
 @app.get("/api/goaudit/{dataset}")

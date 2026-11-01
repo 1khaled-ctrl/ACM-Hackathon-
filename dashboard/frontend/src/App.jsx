@@ -327,8 +327,17 @@ export default function App() {
           <GoAuditCard dataset={snap?.mission?.dataset} />
         </div>
 
-        {/* ---- StressLab robustness for the mission's best run so far ---- */}
-        <StressLabCard dataset={snap?.mission?.dataset} runId={snap?.mission?.best_run_id} />
+        {/* ---- StressLab robustness -- auto-runs once, on the run
+            submitted via submit_final_model (gotrain.agent._auto_run_stresslab),
+            not on every experiment, so there's usually nothing to show
+            here until the mission actually submits a final model.
+            Falls back to best_run_id only so an older session that
+            finished before this auto-run existed still renders a report
+            saved under the previous manual-call flow. ---- */}
+        <StressLabCard
+          dataset={snap?.mission?.dataset}
+          runId={snap?.mission?.final_model_run_id || snap?.mission?.best_run_id}
+        />
 
         {/* ---- live event feed + datasets ---- */}
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">

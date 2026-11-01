@@ -183,6 +183,12 @@ function SessionList({ sessions, onOpen }) {
               <span className="font-mono text-[0.6rem] text-slate-600">{fmtClock(s.started_at)}</span>
             </div>
 
+            {s.status === 'STOPPED' && s.stop_reason && (
+              <div className="mt-1.5 font-mono text-[0.64rem] text-amber-400/90">
+                STOPPED — {s.stop_reason}
+              </div>
+            )}
+
             <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[0.66rem] text-slate-400">
               <span>duration <span className="text-slate-200">{fmtDur(s.duration_seconds)}</span></span>
               <span>
@@ -222,6 +228,11 @@ function SessionDetail({ session: s }) {
         <PanelTitle right={<Badge tone={STATUS_TONE[s.status] || 'slate'}>{s.status}</Badge>}>
           {s.dataset} · {s.session_id}
         </PanelTitle>
+        {s.status === 'STOPPED' && s.stop_reason && (
+          <div className="border-b border-edge/60 bg-amber-500/[0.06] px-4 py-2 font-mono text-[0.68rem] text-amber-300">
+            STOPPED — {s.stop_reason}
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-px bg-edge/50 sm:grid-cols-3 lg:grid-cols-4">
           <Field label="Dataset" value={s.dataset} />
           <Field label="Runs requested" value={s.runs_requested} />
@@ -262,7 +273,13 @@ function SessionDetail({ session: s }) {
         <LineageCard dataset={s.dataset} />
         <GoAuditCard dataset={s.dataset} />
       </div>
-      <StressLabCard dataset={s.dataset} runId={s.best_run_id} />
+      {/* StressLab now auto-runs on the SUBMITTED model (see
+          gotrain.agent._auto_run_stresslab), not necessarily the highest
+          val_metric run -- final_model_run_id is the correct run to show
+          a report for. Falls back to best_run_id only for an older
+          session that finished before this auto-run existed, so a report
+          saved under the old manual-call flow still renders. */}
+      <StressLabCard dataset={s.dataset} runId={s.final_model_run_id || s.best_run_id} />
 
       {curves.length > 0 && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">

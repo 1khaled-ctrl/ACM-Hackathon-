@@ -86,9 +86,28 @@ DEFAULTS = {
     "max_val_samples": None,
     "fine_tuning_strategy": "full",
     "manifest_id": None,
+    # Set by gotrain.tools.training.launch_training from the agent's actual
+    # per-run subprocess timeout -- see train_classification.py's identical
+    # field for the full rationale. Not a user-facing knob (no
+    # config_schema entry).
+    "_timeout_seconds": None,
 }
 
 BENCHMARK_DIRS = ["classification_v1.0", "segmentation_v1.0"]
+
+# Mirrors train_classification.py's identical constants -- see there for
+# the full rationale (data loading happens entirely before training_start
+# is set, so it's otherwise invisible to this template's own
+# time_budget_minutes check, and was previously only bounded by the parent
+# process's hard, unrecorded subprocess kill).
+LOADING_PHASE_BUDGET_FRACTION = 0.5
+LOADING_DEADLINE_CHECK_EVERY = 200
+
+
+class DataLoadingBudgetExceeded(RuntimeError):
+    """Mirrors train_classification.py's identical exception -- see there
+    for the full rationale.
+    """
 
 
 def is_oom_error(exc: BaseException) -> bool:
@@ -139,7 +158,7 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None):
+def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger, excluded_ids=None, loading_deadline=None):
     """Load every sample of `split` into memory as (N, H, W, C) uint8 images
     and (N, H, W) uint8 masks. GEO-Bench segmentation tasks here are small
     enough (a few thousand 320x320x3 or 500x500x3 samples) that this is
@@ -152,6 +171,14 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
     train_classification.py's identical guard: a non-empty `excluded_ids`
     for any split other than "train" is refused outright, so a manifest
     can never touch validation even by mistake.
+
+    `loading_deadline` (a time.time()-scale deadline, see
+    LOADING_PHASE_BUDGET_FRACTION's comment) raises DataLoadingBudgetExceeded
+    if loading is still running past it -- some segmentation datasets have
+    much larger patches than the hackathon's original two (m-nz-cattle
+    500x500, m-pv4ger-seg 320x320) with no sample cap by default, and a
+    slow load here was previously only bounded by the parent process's
+    hard, unrecorded subprocess kill.
     """
     if excluded_ids and split != "train":
         raise ValueError(
@@ -171,6 +198,14 @@ def build_dataset_arrays(task_specs, split: str, band_names, max_samples, logger
     masks = []
     n_excluded_in_range = 0
     for i in range(n):
+        if loading_deadline is not None and i % LOADING_DEADLINE_CHECK_EVERY == 0 and time.time() > loading_deadline:
+            raise DataLoadingBudgetExceeded(
+                f"Loading the {split!r} split for this dataset is taking too long: only "
+                f"{i}/{n} samples loaded before the data-loading time budget was reached. "
+                "At this rate the full load (and any actual training) would exceed this run's "
+                "wall-clock budget. Retry with a smaller max_train_samples/max_val_samples, or "
+                "a larger time_budget_minutes/run budget for this dataset."
+            )
         if i in excluded_ids:
             n_excluded_in_range += 1
             continue
@@ -467,12 +502,31 @@ def main() -> None:
         excluded_ids = get_excluded_ids(dataset, cfg["manifest_id"])
         logger.info(f"DataIQ manifest {cfg['manifest_id']!r}: excluding {len(excluded_ids)} TRAIN sample(s)")
 
-    train_images, train_masks = build_dataset_arrays(
-        task_specs, "train", band_names, cfg["max_train_samples"], logger, excluded_ids=excluded_ids
-    )
-    val_images, val_masks = build_dataset_arrays(
-        task_specs, "validation", band_names, cfg["max_val_samples"], logger
-    )
+    # See LOADING_PHASE_BUDGET_FRACTION's comment: a hard deadline for
+    # loading BOTH splits combined, derived from this run's actual
+    # subprocess timeout, so a large split can't alone consume the whole
+    # budget and get silently SIGKILLed with no checkpoint and no reason.
+    loading_deadline = None
+    if cfg["_timeout_seconds"]:
+        loading_deadline = time.time() + cfg["_timeout_seconds"] * LOADING_PHASE_BUDGET_FRACTION
+        logger.info(
+            f"Data-loading budget: {cfg['_timeout_seconds'] * LOADING_PHASE_BUDGET_FRACTION:.0f}s "
+            f"of this run's {cfg['_timeout_seconds']:.0f}s total timeout."
+        )
+
+    try:
+        train_images, train_masks = build_dataset_arrays(
+            task_specs, "train", band_names, cfg["max_train_samples"], logger,
+            excluded_ids=excluded_ids, loading_deadline=loading_deadline,
+        )
+        val_images, val_masks = build_dataset_arrays(
+            task_specs, "validation", band_names, cfg["max_val_samples"], logger,
+            loading_deadline=loading_deadline,
+        )
+    except DataLoadingBudgetExceeded as e:
+        logger.error(str(e))
+        print(f"DATA LOADING TIMEOUT: {e}", file=sys.stderr)
+        sys.exit(1)
 
     mean, std = compute_train_band_stats(train_images, logger)
     class_freqs = compute_class_pixel_frequencies(train_masks, n_classes, logger)

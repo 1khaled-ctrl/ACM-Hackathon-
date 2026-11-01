@@ -578,9 +578,18 @@ export function LineageCard({ dataset }) {
 // ---------------------------------------------------------------------
 // 5. StressLab Robustness -- per-run report.
 // GET /api/stresslab/{dataset}/{run_id} (gotrain.stresslab.runner,
-// logs/stresslab/<dataset>/<run_id>.json). "Not run" is the normal case
-// until an engineer/agent calls run_stresslab on a candidate -- shown
-// plainly, never inferred from clean validation accuracy alone.
+// logs/stresslab/<dataset>/<run_id>.json). StressLab now runs
+// automatically once, on the run submitted via submit_final_model (see
+// gotrain.agent._auto_run_stresslab) -- never on every experiment. Three
+// distinct "nothing to show" states, never inferred from clean
+// validation accuracy alone:
+//   NOT RUN       -- this run was never submitted as final (StressLab
+//                     only triggers at submission time).
+//   UNAVAILABLE   -- it WAS triggered but skipped on purpose (no
+//                     StressLab path for this task_type, or no
+//                     checkpoint was ever registered for this run).
+//   FAILED        -- it WAS triggered and raised; the submission itself
+//                     still succeeded, only the robustness check didn't.
 // ---------------------------------------------------------------------
 
 const FRAGILITY_TONE = { robust: 'green', fragile: 'amber', severely_fragile: 'red', unknown: 'slate' }
@@ -600,6 +609,10 @@ export function StressLabCard({ dataset, runId }) {
         <Empty>no run selected</Empty>
       ) : loading ? (
         <Empty>loading…</Empty>
+      ) : data?.unavailable ? (
+        <Empty>UNAVAILABLE — {data.reason}</Empty>
+      ) : data?.failed ? (
+        <Empty>FAILED — {data.reason}</Empty>
       ) : !data || data.not_run ? (
         <Empty>NOT RUN — run_stresslab has not been called for this run</Empty>
       ) : (

@@ -239,6 +239,73 @@ def _windowed_events(start: Optional[datetime], end: Optional[datetime]) -> list
     return deduped
 
 
+def derive_stop_reason(dataset: Optional[str], started_at: Optional[str], ended_at: Optional[str] = None) -> Optional[str]:
+    """A short, human-readable reason a STOPPED session ended with no
+    completed runs or fewer than requested -- previously the dashboard
+    could only show "STOPPED, 0/3" with no indication of WHY, even though
+    gotrain.tools.training.launch_training already logs exactly what went
+    wrong (training_timed_out / training_failed) to events.jsonl every
+    time; that information just never made it into the session record.
+
+    Looks at this session's own event window (same merged/deduped stream
+    load_session()/list_sessions() already use) for the most specific
+    signal available, in priority order:
+      1. The LAST launch_training attempt's outcome (timeout vs. crash) --
+         the most direct, almost always the actual cause when runs_completed
+         is 0 or short of what was requested.
+      2. Tool-call budget exhaustion (the hook's own cancellation message,
+         logged nowhere currently -- inferred from the session having hit
+         its max_tool_calls with no final_model_submitted event).
+      3. None when there's no training-related event at all to point to
+         (e.g. the agent process died before ever calling launch_training,
+         or the session is not actually STOPPED) -- callers fall back to a
+         generic label rather than inventing a reason with no evidence.
+
+    `ended_at` defaults to now (ISO string or None) -- a STOPPED session is
+    always closed out live, at the moment its process is found dead, so
+    there is no better "end" to bound the window with than the present.
+
+    Returns None, never raises -- a courtesy annotation, same spirit as
+    _training_health, never allowed to break session closing itself.
+    """
+    if not dataset:
+        return None
+    try:
+        start = _parse(started_at)
+        end = _parse(ended_at) if ended_at else datetime.now(timezone.utc)
+        events = _windowed_events(start, end)
+    except Exception:
+        return None
+
+    training_events = [
+        e for e in events
+        if e.get("event") in ("training_timed_out", "training_failed", "training_finished")
+        and e.get("dataset") == dataset
+    ]
+    if training_events:
+        last = training_events[-1]
+        if last["event"] == "training_timed_out":
+            timeout = last.get("timeout_seconds")
+            suffix = f" after {timeout:.0f}s" if isinstance(timeout, (int, float)) else ""
+            return f"training timed out{suffix} with no completed run"
+        if last["event"] == "training_failed":
+            stderr_tail = (last.get("stderr") or "").strip().splitlines()
+            last_line = stderr_tail[-1][:160] if stderr_tail else None
+            return f"training crashed: {last_line}" if last_line else "training crashed (see train.log)"
+        # last event is training_finished: runs did complete, so a
+        # shortfall vs. the requested count means something stopped the
+        # MISSION after that, not training itself (budget exhaustion,
+        # engineer stop) -- fall through to the generic reasons below.
+
+    submitted = any(e.get("event") == "final_model_submitted" for e in events)
+    if not submitted:
+        tool_calls = sum(1 for e in events if e.get("event") == "tool_call")
+        if tool_calls:
+            return "stopped before submitting a final model (tool-call or run budget exhausted)"
+
+    return None
+
+
 # Training Health card states. UNSTABLE is deliberately not produced by
 # _training_health below -- gotrain/experiment_planner.py's
 # diagnose_run_record has no loss-spike/NaN/divergence diagnosis to map

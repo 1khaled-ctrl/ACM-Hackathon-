@@ -157,6 +157,25 @@ def launch_training(
     if config.get("warm_start_from_parent"):
         effective_config = {**config, **_resolve_warm_start_checkpoint(dataset, parent_id)}
 
+    # Root cause of "STOPPED, 0/3, timeout" on a dataset's first-ever run
+    # (seen on m-bigearthnet): train_classification.py/train_segmentation.py
+    # eagerly load the WHOLE train+validation split into memory before a
+    # single epoch starts. A large split (BigEarthNet: ~20k 12-band
+    # samples) can alone exceed the whole subprocess timeout during
+    # loading -- subprocess.run(timeout=...) below then hard-kills the
+    # process via SIGKILL/TerminateProcess with NO checkpoint, NO ledger
+    # entry, NO stdout, and NO recorded reason: that run silently vanishes
+    # into "0 runs completed" instead of surfacing as what it actually was.
+    #
+    # Fixed by giving the subprocess visibility into its own deadline
+    # (_timeout_seconds, read by build_dataset_arrays in both templates) so
+    # IT can raise a clear, loggable error and exit cleanly with time to
+    # spare -- turning an opaque hard kill into a real "training_failed"
+    # event with an actionable reason (e.g. "reduce max_train_samples").
+    # task_type="fake" has no real loading loop and is left alone.
+    if task_type in ("classification", "segmentation") and timeout_seconds:
+        effective_config = {**effective_config, "_timeout_seconds": timeout_seconds}
+
     template_path = TEMPLATES[task_type]
     status.set_action("training", from_=parent_id or "agent", where=dataset)
     log_event("training_started", dataset=dataset, task_type=task_type, config=effective_config)
