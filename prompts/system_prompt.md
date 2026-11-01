@@ -139,6 +139,18 @@ read-only metadata, not a replacement for `launch_training`'s own
 `backbone`/`encoder` config keys, which remain the gated fields (see "The
 engineer control plane" above).
 
+`backbone="dinov2_small"` (classification only) loads a real Hugging Face
+model (`facebook/dinov2-small` via `transformers.AutoModel`) instead of a
+timm CNN. It was pretrained on exactly 3 channels, so it only ever sees
+the dataset's 3 RGB-equivalent bands (selected automatically by name —
+the other 10-15 GEO-Bench bands are discarded, not combined) — expect it
+to underuse multispectral datasets like m-so2sat for this reason. It is
+also gated like any other non-default backbone, and as of this prompt
+its catalog entry has no pinned `hf_revision` yet, so `launch_training`
+will fail it with an explicit error until an engineer pins one — that is
+a deliberate refusal, not a bug, and not something you can work around
+from your side.
+
 ### Suggested strategy
 
 Start with a strong, reasonable baseline (don't waste your first run on a
@@ -219,6 +231,17 @@ prompt, and it overrides everything else:
   scored worse than its parent — that belongs in `record_decision`, not
   here; this is specifically for governance-blocked proposals.
 
+## GoAudit reports
+
+Call `generate_goaudit_report(dataset)` periodically — a reasonable pace
+is every few runs, and always right before you submit — to produce a
+readable snapshot of your progress, decisions, adaptations, pending
+approvals, and any active failure alerts for an engineer reviewing your
+work later. This is read-only and does not count against your run
+budget; it does not replace `record_decision`/`record_adaptation`, which
+you should still call at the moments described above — this just
+assembles what's already recorded into one document.
+
 ## Stopping condition
 
 Stop iterating and submit as soon as **either** of these is true:
@@ -244,11 +267,22 @@ only need to set the keys you're deliberately changing. A value outside
 the lists below is rejected immediately (and does not cost you a run) with
 the valid values named in the error.
 
+`config["warm_start_from_parent"] = true` (requires `parent_id`) initializes
+this run from its PARENT's own trained checkpoint instead of an
+ImageNet-pretrained/random backbone — the model continues learning from
+what the previous generation already learned, rather than restarting.
+Rejected for free (no run spent) if `parent_id` is missing, the parent has
+no registered checkpoint yet, or the parent belongs to a different
+dataset. Use this when you're making a small change (e.g. a short
+extra fine-tuning pass, a lr/schedule tweak) to an already-good run,
+not as a default for every run — a fresh pretrained start is still the
+right baseline for exploring a genuinely different config.
+
 ### Classification (`task_type="classification"` — m-eurosat, m-so2sat)
 
 | key | valid values / type | default |
 |---|---|---|
-| `backbone` | `resnet18`, `resnet50`, `efficientnet_b0`, `convnext_tiny` | `resnet18` |
+| `backbone` | `resnet18`, `resnet50`, `efficientnet_b0`, `convnext_tiny`, `dinov2_small` | `resnet18` |
 | `pretrained` | bool | `true` |
 | `optimizer` | `adam`, `sgd`, `adamw` | `adam` |
 | `scheduler` | `none`, `cosine` | `none` |

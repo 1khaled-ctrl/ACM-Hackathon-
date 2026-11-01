@@ -138,7 +138,7 @@ def build_classification_test_eval_fn(dataset: str, run_id: str, config: dict):
     test_labels = np.array(test_labels, dtype=np.int64)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = tc.build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes)
+    model = tc.build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes, band_names)
     model.load_state_dict(torch.load(run_dir / "best_model.pt", map_location=device))
     model = model.to(device)
     model.eval()

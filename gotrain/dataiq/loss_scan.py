@@ -140,7 +140,7 @@ def scan_classification_run(dataset: str, run_id: str, max_samples: Optional[int
     mean, std = tc.compute_train_band_stats(train_images, logger)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = tc.build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes)
+    model = tc.build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes, band_names)
     model.load_state_dict(torch.load(run_dir / "best_model.pt", map_location=device))
     model = model.to(device)
     model.eval()

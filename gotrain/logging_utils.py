@@ -73,6 +73,29 @@ def log_evaluation(
     )
 
 
+def read_events(event: Optional[str] = None, dataset: Optional[str] = None) -> list:
+    """Read logs/events.jsonl, optionally filtered to one event type and/or
+    one dataset, oldest first. Used by gotrain.alerts and gotrain.goaudit
+    to read back the same event stream log_event writes -- there was
+    previously no reader for this file at all.
+    """
+    if not EVENTS_PATH.exists():
+        return []
+    records = []
+    with open(EVENTS_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if event is not None and record.get("event") != event:
+                continue
+            if dataset is not None and record.get("dataset") != dataset:
+                continue
+            records.append(record)
+    return records
+
+
 def read_status() -> dict:
     if not STATUS_PATH.exists():
         return {}

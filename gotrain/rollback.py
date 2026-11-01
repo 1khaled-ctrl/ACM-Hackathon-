@@ -140,7 +140,8 @@ def verify_inference_sanity(dataset: str, version: str, task_type: str) -> dict:
         if task_type == "classification":
             from gotrain.templates.train_classification import build_model
 
-            model = build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes)
+            band_names = metrics.get("band_names")
+            model = build_model(config.get("backbone", "resnet18"), False, n_bands, n_classes, band_names)
             dummy = torch.zeros(1, n_bands, 32, 32)
         elif task_type == "segmentation":
             from gotrain.templates.train_segmentation import build_model

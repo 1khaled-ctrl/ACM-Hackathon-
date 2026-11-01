@@ -37,6 +37,8 @@ if str(REPO_ROOT) not in sys.path:
     # only puts this file's own directory on sys.path by default.
     sys.path.insert(0, str(REPO_ROOT))
 
+from gotrain import reproducibility  # noqa: E402 -- needs sys.path fix above
+
 
 def report_progress(**fields) -> None:
     """Best-effort live per-epoch status update for the dashboard. Never
@@ -253,7 +255,15 @@ class ClassificationArrayDataset:
         return tensor, torch.tensor(label, dtype=torch.long)
 
 
-def build_model(backbone: str, pretrained: bool, in_chans: int, n_classes: int):
+def build_model(backbone: str, pretrained: bool, in_chans: int, n_classes: int, band_names=None):
+    if backbone == "dinov2_small":
+        from gotrain.pretrained import CATALOG, load_dinov2_classification_backbone
+
+        if band_names is None:
+            raise ValueError("backbone='dinov2_small' requires band_names (it selects 3 RGB-equivalent bands)")
+        entry = CATALOG["huggingface/facebook-dinov2-small"]
+        return load_dinov2_classification_backbone(entry, band_names, n_classes)
+
     import timm
 
     return timm.create_model(backbone, pretrained=pretrained, in_chans=in_chans, num_classes=n_classes)
@@ -451,7 +461,7 @@ def main() -> None:
     effective_pretrained = cfg["pretrained"] and fine_tuning_strategy != "from_scratch"
 
     try:
-        model = build_model(cfg["backbone"], effective_pretrained, n_bands, n_classes)
+        model = build_model(cfg["backbone"], effective_pretrained, n_bands, n_classes, band_names)
         model = model.to(device)
     except (torch.OutOfMemoryError, RuntimeError) as e:
         if not is_oom_error(e):
@@ -462,6 +472,34 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Recursive self-improvement: if launch_training resolved a parent
+    # checkpoint (config["warm_start_from_parent"]), load its learned
+    # weights now -- BEFORE fine-tuning strategy freezes anything, same
+    # as a normal pretrained checkpoint would be loaded. A shape mismatch
+    # here means the parent's architecture doesn't actually match this
+    # run's (e.g. a different backbone was used) -- that must fail
+    # loudly, not silently train from whatever partially loaded.
+    warm_start_checkpoint_path = cfg.get("_warm_start_checkpoint_path")
+    warm_started_from = None
+    if warm_start_checkpoint_path:
+        try:
+            state_dict = torch.load(warm_start_checkpoint_path, map_location=device)
+            model.load_state_dict(state_dict)
+        except Exception as e:
+            logger.error(f"Warm-start failed to load parent checkpoint {warm_start_checkpoint_path}: {e}")
+            print(
+                f"WARM-START FAILED: could not load parent checkpoint into this architecture: {e}. "
+                "This usually means the backbone/architecture changed between parent and child run.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        warm_started_from = {
+            "parent_run_id": cfg.get("_warm_start_parent_run_id"),
+            "parent_version": cfg.get("_warm_start_parent_version"),
+            "checkpoint_path": warm_start_checkpoint_path,
+        }
+        logger.info(f"Warm-started from parent run {warm_started_from['parent_run_id']} ({warm_started_from['parent_version']})")
 
     from gotrain.finetuning import apply_fine_tuning_strategy, trainable_parameters
 
@@ -633,6 +671,8 @@ def main() -> None:
         "n_bands": n_bands,
         "band_names": band_names,
         "n_classes": n_classes,
+        "dependency_versions": reproducibility.capture_dependency_versions(),
+        "warm_started_from": warm_started_from,
         "class_frequencies": class_freqs.tolist(),
         "best": best_metrics,
         "final_val_metric": final_val_metric,

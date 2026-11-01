@@ -24,7 +24,7 @@ from typing import Any, Optional
 from strands import Agent, tool
 from strands.hooks import AfterToolCallEvent, BeforeToolCallEvent, HookRegistry
 
-from gotrain import config, control, ledger, status
+from gotrain import config, control, goaudit, ledger, status
 from gotrain.config_schema import PreflightValidationError
 from gotrain.logging_utils import log_event
 from gotrain.tools import adaptation as adaptation_tools
@@ -404,6 +404,30 @@ def record_adaptation(dataset: str, rejected_proposal: str, new_plan: str, ratio
 
 
 @tool
+def generate_goaudit_report(dataset: str) -> dict:
+    """Generate and persist a GoAudit engineering report for `dataset`:
+    a snapshot of progress so far, every kept/discarded decision and its
+    rationale, any adaptations recorded after a rejected/blocked
+    proposal, pending/rejected engineer approvals, currently active
+    failure alerts, and a statistical-confidence note on whether recent
+    validation-metric deltas can be told apart from ordinary run-to-run
+    noise yet. Call this periodically -- e.g. after every few runs, or
+    right before you stop -- so an engineer reviewing your work later
+    has a readable account of it instead of needing to reconstruct one
+    from raw logs. Purely read-only over your own history: it never
+    evaluates anything and never touches the test split. Each call is
+    saved as a new, separate report (never overwriting a previous one).
+
+    Args:
+        dataset: the dataset to report on.
+    """
+    report = goaudit.generate_report(dataset)
+    path = goaudit.write_report(dataset, report)
+    status.set_last_event(f"GoAudit report generated for {dataset}")
+    return {"report": report, "path": str(path)}
+
+
+@tool
 def submit_final_model(dataset: str, run_id: str) -> dict:
     """Submit your final chosen model for this dataset. This only RECORDS
     your choice in the ledger — it does not evaluate anything and does not
@@ -489,6 +513,7 @@ ALL_TOOLS = [
     compare_runs,
     record_decision,
     record_adaptation,
+    generate_goaudit_report,
     submit_final_model,
     upload_to_s3,
     download_from_s3,

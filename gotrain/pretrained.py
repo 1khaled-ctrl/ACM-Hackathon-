@@ -156,11 +156,27 @@ CATALOG = {
         "supported_modalities": ["optical_rgb"], "expected_channels": 3, "input_band_order": None,
         "normalization": {"method": "unknown -- would need DINOv2's own documented preprocessing"},
         "parameter_count": 22_000_000, "parameter_count_source": "published architecture spec (ViT-S/14), not measured in this environment",
-        "license": "Apache-2.0 (per DINOv2's public release, not re-confirmed here)", "checkpoint_revision": None,
-        "compatibility_verified": False, "loader_family": None, "task_types": ["classification"],
-        "notes": "RGB-only pretraining -- would need a non-trivial channel-adaptation strategy for "
-                 "13/18-band GEO-Bench inputs (e.g. selecting/compositing 3 bands, or a learned projection), "
-                 "not just timm's native in_chans resize. Not verified or loadable in this environment.",
+        "license": "Apache-2.0 (per DINOv2's public release, not re-confirmed here -- verify from the actual "
+                    "HF repo before using this in anything submitted)",
+        # Deliberately a real, loadable entry (see load_pretrained_backbone's
+        # "huggingface_transformers" branch below) -- channel adaptation is
+        # done by selecting the dataset's 3 RGB-equivalent bands
+        # (gotrain.band_selection.select_rgb_band_indices), not timm's
+        # in_chans resize, which doesn't apply to a transformers model.
+        "hf_repo_id": "facebook/dinov2-small",
+        # Intentionally left unpinned: "pin verified model revisions" means
+        # an actual commit SHA, looked up from
+        # https://huggingface.co/facebook/dinov2-small/commits/main -- not
+        # something to invent without network access to verify it exists.
+        # load_pretrained_backbone refuses to run with this still None
+        # rather than silently default to "main".
+        "hf_revision": None,
+        "checkpoint_revision": None,
+        "compatibility_verified": False, "loader_family": "huggingface_transformers", "task_types": ["classification"],
+        "notes": "RGB-only pretraining -- channel adaptation selects the dataset's 3 RGB-equivalent bands "
+                 "and discards the rest (see gotrain.band_selection), rather than using all 13/18 GEO-Bench "
+                 "channels. Requires `transformers` installed and a pinned hf_revision before use (see above) "
+                 "-- neither is satisfied in this environment, so this has NOT been run or verified here.",
     },
     "ibm-nasa/prithvi-eo-2.0-tiny": {
         "model_id": "ibm-nasa/prithvi-eo-2.0-tiny", "architecture": "ViT-based geospatial foundation model (Tiny variant)",
@@ -262,13 +278,21 @@ def estimate_model_resources(model_id: str) -> dict:
     }
 
 
-def validate_model_compatibility(model_id: str, dataset: str, task_type: str, n_bands: int, n_classes: int) -> dict:
+def validate_model_compatibility(
+    model_id: str, dataset: str, task_type: str, n_bands: int, n_classes: int, band_names: Optional[list] = None
+) -> dict:
     """The ONLY way an entry's compatibility can be considered verified:
     actually construct it with `dataset`'s real band/class count and run
     one forward pass on a synthetic all-zero input. Requires torch (and
-    timm or segmentation_models_pytorch, depending on loader_family) --
-    not runnable in this environment, written to be run on the
-    SageMaker lab. Caches its result; does not mutate CATALOG itself.
+    timm/segmentation_models_pytorch/transformers, depending on
+    loader_family) -- not runnable in this environment, written to be
+    run on the SageMaker lab. Caches its result; does not mutate CATALOG
+    itself.
+
+    `band_names` is required for `loader_family == "huggingface_transformers"`
+    entries (they select specific bands by name, see
+    gotrain.band_selection) -- omit it for timm/smp entries, which don't
+    need it.
     """
     if model_id not in CATALOG:
         raise KeyError(f"unknown model_id {model_id!r} -- see gotrain.pretrained.CATALOG")
@@ -288,11 +312,10 @@ def validate_model_compatibility(model_id: str, dataset: str, task_type: str, n_
         _write_verification(model_id, dataset, result)
         return result
 
-    import torch
-
     try:
-        model = load_pretrained_backbone(model_id, n_bands, n_classes, task_type)
+        model = load_pretrained_backbone(model_id, n_bands, n_classes, task_type, band_names=band_names)
         model.eval()
+        import torch
         dummy = torch.zeros(1, n_bands, 32, 32)
         with torch.no_grad():
             output = model(dummy)
@@ -309,15 +332,20 @@ def validate_model_compatibility(model_id: str, dataset: str, task_type: str, n_
     return result
 
 
-def load_pretrained_backbone(model_id: str, n_bands: int, n_classes: int, task_type: str):
+def load_pretrained_backbone(model_id: str, n_bands: int, n_classes: int, task_type: str, band_names: Optional[list] = None):
     """Construct `model_id` for `n_bands` input channels / `n_classes`
     outputs, reusing the EXACT same builder the training templates
     already use (gotrain.templates.train_classification.build_model /
     train_segmentation.build_model) -- no separate, divergent loading
     path. Raises NotImplementedError for catalog entries with no
-    loader_family (the aspirational torchgeo/dinov2/Prithvi candidates)
+    loader_family (the still-aspirational torchgeo/Prithvi candidates)
     rather than attempting an unverified download or executing
     third-party model code this project hasn't vetted.
+
+    `band_names` is required for `loader_family == "huggingface_transformers"`
+    (see load_dinov2_classification_backbone) -- these models have no
+    in_chans-style adaptation and need to know WHICH bands to select, not
+    just how many there are.
     """
     if model_id not in CATALOG:
         raise KeyError(f"unknown model_id {model_id!r} -- see gotrain.pretrained.CATALOG")
@@ -332,8 +360,75 @@ def load_pretrained_backbone(model_id: str, n_bands: int, n_classes: int, task_t
 
         architecture = "unet"  # the catalog entry is an encoder choice, not an architecture choice
         return build_model(architecture, entry["architecture"].split(" ")[0], True, n_bands, n_classes)
+    if entry["loader_family"] == "huggingface_transformers":
+        if band_names is None:
+            raise ValueError(
+                f"{model_id} requires band_names (to select its 3 RGB-equivalent input channels) -- "
+                "this entry has no timm-style in_chans adaptation."
+            )
+        return load_dinov2_classification_backbone(entry, band_names, n_classes)
 
     raise NotImplementedError(
         f"{model_id} has no loader implemented in this environment (loader_family=None). "
         "See its catalog 'notes' for why -- this is deliberate, not a bug."
     )
+
+
+def load_dinov2_classification_backbone(entry: dict, band_names: list, n_classes: int):
+    """Build a DINOv2-backed classification model: selects the dataset's
+    3 RGB-equivalent bands (gotrain.band_selection.select_rgb_band_indices
+    -- DINOv2 was pretrained on exactly 3 channels and has no native
+    mechanism to accept more, unlike timm's in_chans adaptation for the
+    CNN backbones elsewhere in this project, so the other 10-15 GEO-Bench
+    bands are discarded, not combined), runs them through DINOv2's
+    encoder, and attaches a new linear classification head.
+
+    The head is deliberately named `self.head` (not e.g. `self.classifier`):
+    gotrain.finetuning.HEAD_PARAM_PREFIXES_BY_FAMILY["timm"] already
+    recognizes that prefix, so fine_tuning_strategy (linear_probe/
+    partial/full) works on this model with zero changes to
+    gotrain/finetuning.py -- `apply_fine_tuning_strategy(model, "timm",
+    strategy)` is the right call for this wrapper too.
+
+    NEEDS transformers installed and entry["hf_revision"] pinned to an
+    actual commit SHA -- refuses to run with either missing rather than
+    silently installing nothing or defaulting to an unpinned "main".
+    Not runnable or verified in this project's local/CI environment (no
+    network-confirmed HF Hub access, no transformers installed) --
+    written to be run and verified on the SageMaker lab.
+    """
+    if entry.get("hf_revision") is None:
+        raise RuntimeError(
+            f"{entry['model_id']} has no pinned hf_revision -- look up an actual commit SHA from "
+            f"https://huggingface.co/{entry['hf_repo_id']}/commits/main and set it in "
+            "gotrain.pretrained.CATALOG before using this backbone. Refusing to default to "
+            "an unpinned 'main' revision."
+        )
+
+    # Resolved before importing torch/transformers: a bad band_names
+    # list should fail cheaply, not after paying for two heavy imports.
+    from gotrain.band_selection import select_rgb_band_indices
+
+    band_indices = select_rgb_band_indices(band_names)
+    hf_repo_id = entry["hf_repo_id"]
+    hf_revision = entry["hf_revision"]
+
+    import torch.nn as nn
+    from transformers import AutoModel
+
+    class Dinov2ClassificationBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.band_indices = band_indices
+            self.backbone = AutoModel.from_pretrained(hf_repo_id, revision=hf_revision)
+            self.head = nn.Linear(self.backbone.config.hidden_size, n_classes)
+
+        def forward(self, x):
+            rgb = x[:, self.band_indices, :, :]
+            outputs = self.backbone(pixel_values=rgb)
+            pooled = outputs.pooler_output
+            if pooled is None:
+                pooled = outputs.last_hidden_state.mean(dim=1)
+            return self.head(pooled)
+
+    return Dinov2ClassificationBackbone()

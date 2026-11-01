@@ -117,9 +117,16 @@ def generate_passport(dataset: str, run_id: Optional[str] = None) -> dict:
     version_id = run_record.get("version_id")
 
     checkpoint_sha256 = None
+    dependency_versions = None
+    warm_started_from = None
     if version_id:
-        checkpoint_path = registry.get_version_dir(dataset, version_id) / "model.pt"
-        checkpoint_sha256 = _sha256_of_file(checkpoint_path)
+        version_dir = registry.get_version_dir(dataset, version_id)
+        checkpoint_sha256 = _sha256_of_file(version_dir / "model.pt")
+        metrics_path = version_dir / "metrics.json"
+        if metrics_path.exists():
+            saved_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            dependency_versions = saved_metrics.get("dependency_versions")
+            warm_started_from = saved_metrics.get("warm_started_from")
 
     geoguard = geoguard_report.read_report(dataset)
     test_result = _find_test_result(dataset, run_id)
@@ -162,6 +169,8 @@ def generate_passport(dataset: str, run_id: Optional[str] = None) -> dict:
         "data_provenance": _data_provenance(dataset, run_record),
         "checkpoint_version": version_id,
         "checkpoint_sha256": checkpoint_sha256,
+        "dependency_versions": dependency_versions,
+        "warm_started_from": warm_started_from,
         "engineer_approval": {
             "config_gate_decisions": [
                 p for p in approval.list_proposals(kind="config_gate") if p["dataset"] == dataset
@@ -272,6 +281,20 @@ def _kv(label: str, value_html: str) -> str:
 
 def _status_pill(label: str, kind: str) -> str:
     return f'<span class="pill pill-{kind}">{_esc(label)}</span>'
+
+
+def _format_dependency_versions(dependency_versions: Optional[dict]) -> Optional[str]:
+    if not dependency_versions:
+        return None
+    return ", ".join(
+        f"{package}={version or 'not installed'}" for package, version in dependency_versions.items()
+    )
+
+
+def _format_warm_started_from(warm_started_from: Optional[dict]) -> Optional[str]:
+    if not warm_started_from:
+        return None
+    return f"run {warm_started_from.get('parent_run_id')} ({warm_started_from.get('parent_version')})"
 
 
 def format_passport_html(passport: dict) -> str:
@@ -559,6 +582,8 @@ a {{ color: var(--accent); }}
     <h2>Checkpoint</h2>
     {_kv("Registry version", _esc(passport['checkpoint_version']))}
     {_kv("SHA-256", _code(passport.get('checkpoint_sha256')))}
+    {_kv("Dependency versions", _code(_format_dependency_versions(passport.get('dependency_versions'))))}
+    {_kv("Warm-started from", _code(_format_warm_started_from(passport.get('warm_started_from'))))}
   </section>
 
   <section>
