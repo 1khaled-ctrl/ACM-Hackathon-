@@ -5,6 +5,7 @@ import {
 } from 'recharts'
 import { ArrowLeft, CheckCircle2, Clock, History as HistoryIcon, OctagonX, TriangleAlert, X } from 'lucide-react'
 import { Badge, Button, Panel, PanelTitle, cn } from './ui'
+import { DecisionTimeline, EventFeed, RunComparison } from './MissionPanels'
 
 /**
  * Mission history: every session launched from this dashboard.
@@ -243,90 +244,14 @@ function SessionDetail({ session: s }) {
         </div>
       </Panel>
 
-      {s.interventions?.length > 0 && (
-        <Panel>
-          <PanelTitle>Engineer Interventions</PanelTitle>
-          <div className="divide-y divide-edge/40">
-            {s.interventions.map((i, idx) => (
-              <div key={idx} className="flex flex-wrap items-baseline justify-between gap-2 px-4 py-2">
-                <span className="font-mono text-[0.68rem] text-amber-200">
-                  {i.from_state} → {i.to_state}
-                </span>
-                <span className="font-mono text-[0.6rem] text-slate-500">{i.reason}</span>
-                <span className="font-mono text-[0.58rem] text-slate-600">{fmtTime(i.timestamp)}</span>
-              </div>
-            ))}
-          </div>
-        </Panel>
-      )}
-
-      <Panel>
-        <PanelTitle>Experiments</PanelTitle>
-        {s.runs?.length ? (
-          <div className="divide-y divide-edge/40">
-            {s.runs.map((r, idx) => {
-              const c = r.config || {}
-              return (
-                <div key={r.run_id || idx} className="px-4 py-3">
-                  <div className="flex flex-wrap items-baseline justify-between gap-2">
-                    <span className="font-mono text-[0.7rem] text-slate-200">
-                      #{idx + 1} · {(r.run_id || '').slice(0, 8)}
-                      <span className="ml-2 text-sky-300">
-                        {c.backbone || c.encoder || c.architecture || '--'}
-                      </span>
-                    </span>
-                    <span className="font-display text-sm font-bold tabular-nums text-emerald-300">
-                      {fmtPct(r.val_metric)}
-                      {typeof r.delta_vs_parent === 'number' && (
-                        <span className={cn(
-                          'ml-2 font-mono text-[0.6rem]',
-                          r.delta_vs_parent >= 0 ? 'text-emerald-400' : 'text-rose-400',
-                        )}>
-                          {r.delta_vs_parent >= 0 ? '+' : ''}
-                          {(r.delta_vs_parent * 100).toFixed(2)}pp
-                        </span>
-                      )}
-                    </span>
-                  </div>
-                  <div className="mt-1 flex flex-wrap gap-x-3 font-mono text-[0.58rem] text-slate-500">
-                    {Object.entries(c)
-                      .filter(([, v]) => v !== null && typeof v !== 'object')
-                      .slice(0, 7)
-                      .map(([k, v]) => (
-                        <span key={k}>{k}=<span className="text-slate-400">{String(v)}</span></span>
-                      ))}
-                  </div>
-                  {r.decision && (
-                    <div className="mt-1 font-mono text-[0.6rem]">
-                      <span className={r.decision === 'kept' ? 'text-emerald-400' : 'text-slate-500'}>
-                        {r.decision}
-                      </span>
-                      {r.rationale && <span className="text-slate-500"> — {r.rationale}</span>}
-                    </div>
-                  )}
-                  {r.hypothesis && (
-                    <div className="mt-1 font-mono text-[0.58rem] text-slate-500">
-                      hypothesis: {r.hypothesis.statement || JSON.stringify(r.hypothesis)}
-                      {r.hypothesis_outcome && (
-                        <span className={cn(
-                          'ml-2',
-                          r.hypothesis_outcome === 'confirmed' ? 'text-emerald-400' : 'text-amber-400',
-                        )}>
-                          [{r.hypothesis_outcome}]
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              )
-            })}
-          </div>
-        ) : (
-          <div className="px-4 py-6 text-center font-mono text-[0.62rem] uppercase tracking-wider text-slate-600">
-            no completed experiments in this mission
-          </div>
-        )}
-      </Panel>
+      {/* Decision Timeline, Run Comparison and Event Feed are the SAME
+          components the live dashboard uses (dashboard/frontend/src/
+          components/MissionPanels.jsx) over the SAME `mission` shape --
+          gotrain/history.py's load_session() output -- so a finished
+          mission's History Details page can never show a different
+          picture than what was visible while it was running. */}
+      <DecisionTimeline mission={s} currentRunId={null} />
+      <RunComparison mission={s} currentRun={null} />
 
       {curves.length > 0 && (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -335,24 +260,7 @@ function SessionDetail({ session: s }) {
         </div>
       )}
 
-      <Panel>
-        <PanelTitle>Event Log ({s.events?.length ?? 0})</PanelTitle>
-        <div className="max-h-72 divide-y divide-edge/40 overflow-y-auto">
-          {(s.events || []).slice().reverse().map((e, i) => (
-            <div key={i} className="px-4 py-1.5">
-              <div className="flex items-baseline justify-between gap-2">
-                <span className="font-mono text-[0.66rem] text-emerald-300">{e.event}</span>
-                <span className="font-mono text-[0.56rem] text-slate-600">{fmtTime(e.timestamp)}</span>
-              </div>
-            </div>
-          ))}
-          {!s.events?.length && (
-            <div className="px-4 py-6 text-center font-mono text-[0.62rem] uppercase tracking-wider text-slate-600">
-              no events recorded
-            </div>
-          )}
-        </div>
-      </Panel>
+      <EventFeed mission={s} title={`Event Feed (${s.events?.length ?? 0} raw events)`} />
     </div>
   )
 }

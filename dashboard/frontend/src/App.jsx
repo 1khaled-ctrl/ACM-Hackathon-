@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   Activity, AlertTriangle, Cpu, Database, GitBranch, LayoutGrid,
-  LineChart as LineChartIcon, Radio, Satellite, Zap,
+  LineChart as LineChartIcon, Satellite, Zap,
 } from 'lucide-react'
 import {
   CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -12,6 +12,7 @@ import { Wordmark } from './components/Logo'
 import { HistoryButton, HistoryOverlay } from './components/History'
 import { Launcher } from './components/Launcher'
 import { MissionControl } from './components/MissionControl'
+import { DecisionTimeline, EventFeed, RunComparison } from './components/MissionPanels'
 import { Pipeline } from './components/Pipeline'
 import { Backdrop, Badge, Meter, Panel, PanelTitle, Ring, Stat, cn } from './components/ui'
 
@@ -117,6 +118,16 @@ export default function App() {
   )
 
   const epochPct = run.epochs ? (run.epoch || 0) / run.epochs : 0
+
+  // logs/status.json's current_run can lag behind (or outlive) a mission
+  // boundary -- never attribute it to the mission panels below unless
+  // its dataset actually matches the mission currently being shown. Same
+  // guard MissionPanels' normalizeLiveRun applies internally; checked
+  // again here because currentRunId is passed as a bare id string and
+  // can't carry its own dataset check through to DecisionTimeline.
+  const liveRunBelongsToMission = Boolean(
+    run.run_id && snap?.mission && run.dataset === snap.mission.dataset,
+  )
 
   // Set by POST /api/agent/start the instant a launch is requested --
   // before the new subprocess has done anything. Used to tell "stale tail
@@ -243,15 +254,27 @@ export default function App() {
             <div className="border-t border-edge/50 pb-3">
               <Meter label="CPU" percent={snap?.telemetry?.cpu_percent} />
               <Meter label="RAM" percent={snap?.telemetry?.ram_percent} tone="from-sky-400 to-indigo-500" />
+              <Meter
+                label="GPU"
+                percent={snap?.telemetry?.gpu?.util_percent}
+                tone="from-violet-400 to-fuchsia-500"
+              />
               {snap?.telemetry?.gpu ? (
-                <div className="px-4 pt-1">
-                  <div className="flex items-center gap-1.5 font-mono text-[0.6rem] uppercase tracking-wider text-emerald-300">
+                <>
+                  <Meter
+                    label="VRAM"
+                    percent={
+                      snap.telemetry.gpu.mem_total_gb
+                        ? (snap.telemetry.gpu.mem_used_gb / snap.telemetry.gpu.mem_total_gb) * 100
+                        : null
+                    }
+                    valueLabel={`${snap.telemetry.gpu.mem_used_gb} / ${snap.telemetry.gpu.mem_total_gb} GB`}
+                    tone="from-amber-400 to-rose-400"
+                  />
+                  <div className="flex items-center gap-1.5 px-4 pt-0.5 font-mono text-[0.58rem] uppercase tracking-wider text-slate-500">
                     <Zap className="h-3 w-3" /> {snap.telemetry.gpu.name}
                   </div>
-                  <div className="font-mono text-[0.65rem] text-slate-400">
-                    {snap.telemetry.gpu.mem_used_gb} / {snap.telemetry.gpu.mem_total_gb} GB
-                  </div>
-                </div>
+                </>
               ) : (
                 <div className="flex items-center gap-1.5 px-4 pt-1 font-mono text-[0.6rem] uppercase tracking-wider text-slate-600">
                   <Cpu className="h-3 w-3" /> no cuda device
@@ -280,86 +303,20 @@ export default function App() {
           />
         </div>
 
-        {/* ---- feed + runs + datasets ---- */}
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-          <Panel className="lg:col-span-5">
-            <PanelTitle right={<Radio className="h-3.5 w-3.5 text-emerald-400" />}>
-              Agent Decision Feed
-            </PanelTitle>
-            <div className="max-h-[22rem] divide-y divide-edge/40 overflow-y-auto">
-              {launchPendingFirstEvent && (
-                <div className="flex items-center gap-2 bg-sky-500/10 px-4 py-2.5">
-                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
-                  <span className="font-mono text-[0.68rem] text-sky-200">
-                    Launching mission on {launch.dataset} — waiting for the agent's first action…
-                  </span>
-                </div>
-              )}
-              <AnimatePresence initial={false}>
-                {(snap?.events || []).map((ev, i) => {
-                  // An event older than the most recent launch is left
-                  // over from a PREVIOUS session -- dim it and label it,
-                  // rather than letting it read as something the agent
-                  // just did (e.g. a stale "final_model_submitted" sitting
-                  // at the top while the new session is still starting up).
-                  const isStale = launch?.launched_at && ev.timestamp < launch.launched_at
-                  return (
-                    <motion.div
-                      key={`${ev.timestamp}-${i}`}
-                      initial={{ opacity: 0, x: -8 }}
-                      animate={{ opacity: isStale ? 0.45 : 1, x: 0 }}
-                      className="px-4 py-2"
-                    >
-                      <div className="flex items-baseline justify-between gap-2">
-                        <span className="font-mono text-[0.68rem] font-semibold text-emerald-300">
-                          {ev.event}
-                          {isStale && (
-                            <span className="ml-2 font-mono text-[0.56rem] font-normal uppercase tracking-wider text-slate-500">
-                              before this launch
-                            </span>
-                          )}
-                        </span>
-                        <span className="shrink-0 font-mono text-[0.58rem] text-slate-600">
-                          {(ev.timestamp || '').slice(11, 19)}
-                        </span>
-                      </div>
-                      <EventDetail ev={ev} />
-                    </motion.div>
-                  )
-                })}
-              </AnimatePresence>
-              {!snap?.events?.length && <Empty>no events logged yet</Empty>}
-            </div>
-          </Panel>
+        {/* ---- decision timeline (full width -- hypothesis -> config -> result -> outcome -> decision) ---- */}
+        <DecisionTimeline mission={snap?.mission} currentRunId={liveRunBelongsToMission ? run.run_id : null} />
 
-          <Panel className="lg:col-span-4">
-            <PanelTitle>Experiment Timeline</PanelTitle>
-            <div className="max-h-[22rem] overflow-y-auto px-4 py-3">
-              {(snap?.history || []).length ? (
-                <ol className="relative space-y-3 border-l border-edge pl-4">
-                  {snap.history.map((h, i) => (
-                    <li key={h.run_id || i} className="relative">
-                      <span className="absolute -left-[1.42rem] top-1.5 h-2 w-2 rounded-full bg-emerald-400 shadow-glow" />
-                      <div className="flex items-baseline justify-between gap-2">
-                        <span className="font-mono text-[0.68rem] text-slate-300">
-                          {(h.run_id || '').slice(0, 8)}
-                        </span>
-                        <span className="font-display text-sm font-bold tabular-nums text-emerald-300">
-                          {fmtNum(h.val_metric, 4)}
-                        </span>
-                      </div>
-                      <div className="font-mono text-[0.58rem] uppercase tracking-wider text-slate-600">
-                        {h.config?.backbone || h.config?.architecture || h.dataset}
-                        {h.hypothesis_outcome ? ` - ${h.hypothesis_outcome}` : ''}
-                      </div>
-                    </li>
-                  ))}
-                </ol>
-              ) : (
-                <Empty>ledger empty - no completed runs</Empty>
-              )}
-            </div>
-          </Panel>
+        {/* ---- run comparison (full width table) ---- */}
+        <RunComparison mission={snap?.mission} currentRun={liveRunBelongsToMission ? run : null} />
+
+        {/* ---- live event feed + datasets ---- */}
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+          <div className="lg:col-span-9">
+            <EventFeed
+              mission={snap?.mission}
+              title={launchPendingFirstEvent ? `Live Event Feed — launching on ${launch?.dataset}…` : 'Live Event Feed'}
+            />
+          </div>
 
           <Panel className="lg:col-span-3">
             <PanelTitle right={<Database className="h-3.5 w-3.5 text-sky-400" />}>
@@ -550,23 +507,6 @@ function ChartPanel({ title, data, dataKey, color, icon, domain }) {
         )}
       </div>
     </Panel>
-  )
-}
-
-function EventDetail({ ev }) {
-  const skip = new Set(['timestamp', 'event'])
-  const parts = Object.entries(ev)
-    .filter(([k, v]) => !skip.has(k) && v != null && typeof v !== 'object')
-    .slice(0, 4)
-  if (!parts.length) return null
-  return (
-    <div className="mt-0.5 flex flex-wrap gap-x-3 font-mono text-[0.58rem] text-slate-500">
-      {parts.map(([k, v]) => (
-        <span key={k}>
-          {k}=<span className="text-slate-400">{String(v).slice(0, 36)}</span>
-        </span>
-      ))}
-    </div>
   )
 }
 

@@ -264,3 +264,154 @@ def test_history_module_never_touches_the_test_split(history_env):
                 continue
             assert "test_lock" not in node.value, node.value
             assert "final_eval" not in node.value, node.value
+
+
+# ---------------------------------------------------------------------
+# Regression: a newer mission on a DIFFERENT dataset must never surface
+# an older mission's runs. Hit for real: NEXUS showed m-eurosat runs
+# while m-nz-cattle was the active mission, traced to
+# dashboard/api/server.py's /api/snapshot building its "history" field
+# from ledger.get_history() with no session/dataset scoping at all. The
+# fix added build_current_mission() (server.py), which calls exactly
+# this module's get_current_session() + load_session() -- these tests
+# pin down that those two functions can't blend two missions' runs.
+# ---------------------------------------------------------------------
+
+def test_a_newer_different_dataset_mission_cannot_show_an_older_missions_runs(history_env):
+    """The exact bug: m-eurosat mission finishes, m-nz-cattle mission
+    starts later and is now "current" -- get_current_session() +
+    load_session() must return ONLY m-nz-cattle's own run, never the
+    m-eurosat one, no matter how strong or recent-looking it is.
+    """
+    history, ledger, _ = history_env
+
+    old = history.start_session(dataset="m-eurosat", max_runs=2, run_minutes=4)
+    ledger.add_run(dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.95,
+                    task_type="classification", decision="kept")
+    history.finish_session(old["session_id"], status=history.COMPLETED)
+
+    new = history.start_session(dataset="m-nz-cattle", max_runs=3, run_minutes=10)
+    ledger.add_run(dataset="m-nz-cattle", config={"encoder": "resnet34"}, val_metric=0.61,
+                    task_type="segmentation", decision="kept")
+
+    current = history.get_current_session()
+    assert current is not None
+    assert current["session_id"] == new["session_id"]
+    assert current["dataset"] == "m-nz-cattle"
+
+    detail = history.load_session(current["session_id"])
+    assert detail["dataset"] == "m-nz-cattle"
+    assert len(detail["runs"]) == 1
+    assert all(r["dataset"] == "m-nz-cattle" for r in detail["runs"])
+    # The specific failure mode that was actually observed: the old
+    # dataset's name must not appear anywhere in the current mission's
+    # scoped runs.
+    assert not any(r["dataset"] == "m-eurosat" for r in detail["runs"])
+
+
+def test_get_current_session_prefers_the_running_one_over_a_newer_finished_one(history_env):
+    """If an OLDER session is still RUNNING while a NEWER one has already
+    finished (e.g. two dashboards, or a race during reconciliation), the
+    live dashboard must attribute to the one actually in progress --
+    showing a finished mission's data while a different one is training
+    would be just as wrong as the cross-dataset bug.
+    """
+    history, _, _ = history_env
+
+    still_running = history.start_session(dataset="m-eurosat", max_runs=2, run_minutes=4)
+    finished_after = history.start_session(dataset="m-nz-cattle", max_runs=1, run_minutes=1)
+    history.finish_session(finished_after["session_id"], status=history.COMPLETED)
+
+    current = history.get_current_session()
+    assert current["session_id"] == still_running["session_id"]
+    assert current["status"] == history.RUNNING
+
+
+def test_get_current_session_falls_back_to_most_recent_when_nothing_is_running(history_env):
+    """No RUNNING session -> the live panels should keep showing the last
+    mission's final state rather than going blank, so completing a
+    mission doesn't make the dashboard look broken.
+    """
+    history, _, _ = history_env
+
+    first = history.start_session(dataset="m-eurosat", max_runs=1, run_minutes=1)
+    history.finish_session(first["session_id"], status=history.COMPLETED)
+    second = history.start_session(dataset="m-nz-cattle", max_runs=1, run_minutes=1)
+    history.finish_session(second["session_id"], status=history.COMPLETED)
+
+    current = history.get_current_session()
+    assert current["session_id"] == second["session_id"]
+
+
+def test_get_current_session_returns_none_when_no_mission_ever_launched(history_env):
+    history, _, _ = history_env
+    assert history.get_current_session() is None
+
+
+def test_approval_decided_events_are_merged_into_the_session_event_stream(history_env):
+    """approval_requested/approval_decided live in logs/approvals.jsonl,
+    a separate file from events.jsonl (see gotrain/approval.py). History
+    must record engineer approve/reject actions, so load_session()'s
+    event stream has to merge both files, not just read events.jsonl.
+    """
+    history, _, logging_utils = history_env
+    from gotrain import approval
+    import importlib
+    importlib.reload(approval)
+
+    session = history.start_session(dataset="m-eurosat", max_runs=2, run_minutes=4)
+    proposal = approval.request_approval("m-eurosat", "classification", "backbone", "convnext_tiny", "try a bigger backbone")
+    approval.decide(proposal["key"], True, decided_by="engineer", decision_reason="worth trying")
+    history.finish_session(session["session_id"], status=history.COMPLETED)
+
+    detail = history.load_session(session["session_id"])
+    event_types = [e["event"] for e in detail["events"]]
+    assert "approval_requested" in event_types
+    assert "approval_decided" in event_types
+
+    decided = [e for e in detail["events"] if e["event"] == "approval_decided"][0]
+    assert decided["status"] == "approved"
+    assert decided["decided_by"] == "engineer"
+
+    # approval_decided counts as an engineer intervention for History's
+    # "pause/resume/approval/reject/rollback/manual-control" requirement.
+    intervention_types = [e["event"] for e in detail["interventions"]]
+    assert "approval_decided" in intervention_types
+    # approval_requested is the agent's own proposal, not an engineer
+    # action -- it must NOT be counted as an intervention.
+    assert "approval_requested" not in intervention_types
+
+
+def test_rollback_events_count_as_interventions(history_env):
+    history, _, logging_utils = history_env
+
+    session = history.start_session(dataset="m-eurosat", max_runs=2, run_minutes=4)
+    logging_utils.log_event("rollback_succeeded", dataset="m-eurosat", version="v2", verification={})
+    history.finish_session(session["session_id"], status=history.COMPLETED)
+
+    detail = history.load_session(session["session_id"])
+    intervention_types = [e["event"] for e in detail["interventions"]]
+    assert "rollback_succeeded" in intervention_types
+
+
+def test_windowed_events_are_deduplicated(history_env):
+    """Two identical events (same timestamp/type/run_id) landing in the
+    window -- e.g. a reconciler re-observing something already logged --
+    must appear once in the merged stream, not twice.
+    """
+    history, _, _ = history_env
+
+    session = history.start_session(dataset="m-eurosat", max_runs=1, run_minutes=1)
+    start = history._parse(session["started_at"])
+    end = None
+
+    dup_event = {"timestamp": session["started_at"], "event": "training_started", "dataset": "m-eurosat"}
+    from gotrain.logging_utils import EVENTS_PATH
+    import json as _json
+    with open(EVENTS_PATH, "a", encoding="utf-8") as f:
+        f.write(_json.dumps(dup_event) + "\n")
+        f.write(_json.dumps(dup_event) + "\n")
+
+    merged = history._windowed_events(start, end)
+    matching = [e for e in merged if e.get("event") == "training_started"]
+    assert len(matching) == 1

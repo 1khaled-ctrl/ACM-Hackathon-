@@ -123,14 +123,14 @@ export function Ring({ value = 0, size = 112, stroke = 8, label, sub, tone = '#2
 }
 
 /** Thin labelled meter, used for CPU/RAM telemetry. */
-export function Meter({ label, percent, tone = 'from-emerald-400 to-sky-500' }) {
+export function Meter({ label, percent, tone = 'from-emerald-400 to-sky-500', valueLabel }) {
   const p = percent == null ? null : Math.max(0, Math.min(100, percent))
   return (
     <div className="px-4 py-2">
       <div className="mb-1 flex items-baseline justify-between">
         <span className="font-mono text-[0.62rem] uppercase tracking-[0.18em] text-slate-500">{label}</span>
         <span className="font-mono text-xs tabular-nums text-slate-300">
-          {p == null ? '--' : `${p.toFixed(0)}%`}
+          {valueLabel ?? (p == null ? '--' : `${p.toFixed(0)}%`)}
         </span>
       </div>
       <div className="h-1.5 overflow-hidden rounded-full bg-slate-800">

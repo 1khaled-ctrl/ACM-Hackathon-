@@ -104,11 +104,21 @@ def read_telemetry() -> dict:
 
         if torch.cuda.is_available():
             free_b, total_b = torch.cuda.mem_get_info()
-            out["gpu"] = {
+            gpu = {
                 "name": torch.cuda.get_device_name(0),
                 "mem_used_gb": round((total_b - free_b) / 1e9, 2),
                 "mem_total_gb": round(total_b / 1e9, 2),
+                "util_percent": None,
             }
+            try:
+                # torch.cuda.utilization() shells out to nvidia-smi itself --
+                # no new dependency. Separate try/except: a driver/nvidia-smi
+                # hiccup here must not erase the memory numbers above, which
+                # come from CUDA directly and are more reliable.
+                gpu["util_percent"] = torch.cuda.utilization()
+            except Exception:
+                pass
+            out["gpu"] = gpu
     except Exception:
         pass
     return out
@@ -195,6 +205,27 @@ def reconcile_open_session() -> None:
         pass
 
 
+def build_current_mission() -> Optional[dict]:
+    """The same scoped detail History Details shows for a finished
+    mission (gotrain.history.load_session), but for whichever mission the
+    live dashboard should currently be attributed to. This is what fixes
+    "Experiment Timeline shows m-eurosat while m-nz-cattle is active" --
+    that panel's data previously came from the GLOBAL ledger
+    (ledger.get_history() with no dataset or time filter); it now comes
+    from exactly the same session-window filtering History Details uses,
+    so the two can never disagree about which runs belong to which
+    mission. Falls back to None gracefully (not an error) if no mission
+    has ever been launched from this dashboard yet.
+    """
+    try:
+        current = history_mod.get_current_session()
+        if current is None:
+            return None
+        return history_mod.load_session(current["session_id"])
+    except Exception:
+        return None
+
+
 def build_snapshot() -> dict:
     reconcile_open_session()
     status_data = get_status()
@@ -219,6 +250,11 @@ def build_snapshot() -> dict:
         "events": read_jsonl(EVENTS_PATH, tail=40)[::-1],
         "telemetry": read_telemetry(),
         "logs_dir": str(LOGS_DIR),
+        # Session-scoped: Decision Timeline, Run Comparison and the Live
+        # Event Feed's mission framing all read from here, NOT from the
+        # "history"/"events" fields above (which stay global/unscoped for
+        # Pipeline.jsx's unrelated "has anything ever happened" check).
+        "mission": build_current_mission(),
     }
 
 

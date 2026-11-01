@@ -36,6 +36,13 @@ from typing import Any, Optional
 
 from gotrain.logging_utils import EVENTS_PATH, LIVE_METRICS_PATH, LOGS_DIR
 
+# approval_requested/approval_decided live in their own file (see
+# gotrain/approval.py), not events.jsonl -- merged into a session's event
+# stream at read time so "History must record engineer
+# pause/resume/approval/reject/rollback/manual-control events" holds
+# without approval.py writing to two places.
+APPROVALS_LOG_PATH = LOGS_DIR / "approvals.jsonl"
+
 HISTORY_DIR = LOGS_DIR / "history"
 
 # Session status values. RUNNING is written at launch; the rest are
@@ -153,6 +160,24 @@ def get_open_session() -> Optional[dict]:
     return None
 
 
+def get_current_session() -> Optional[dict]:
+    """The session the live dashboard should attribute its Decision
+    Timeline / Run Comparison / Event Feed panels to: the RUNNING one if
+    there is one, else the single most recently started session overall
+    (so those panels don't go blank the instant a mission finishes --
+    they keep showing its final state until a new mission starts).
+    Returns a bare _derive()d summary; callers needing runs/events/
+    live_metrics should pass its session_id to load_session().
+    """
+    sessions = list_sessions()
+    if not sessions:
+        return None
+    for record in sessions:
+        if record.get("status") == RUNNING:
+            return record
+    return sessions[0]  # already sorted newest-first by list_sessions()
+
+
 def _read_jsonl(path: Path) -> list:
     if not path.exists():
         return []
@@ -177,6 +202,29 @@ def _in_window(ts: Optional[str], start: Optional[datetime], end: Optional[datet
         return False
     # An open session has no end yet -- everything after start belongs to it.
     return end is None or moment <= end
+
+
+def _windowed_events(start: Optional[datetime], end: Optional[datetime]) -> list:
+    """events.jsonl + approvals.jsonl, merged and time-sorted, filtered to
+    one session's window. One merge point so the live snapshot and
+    History Details can never see two different event streams for the
+    same mission. Deduplicated on (timestamp, event, run_id/key) -- two
+    processes racing to write the same fact (e.g. a reconciler and the
+    agent both logging the same control_transition) must not show twice.
+    """
+    merged = _read_jsonl(EVENTS_PATH) + _read_jsonl(APPROVALS_LOG_PATH)
+    windowed = [e for e in merged if _in_window(e.get("timestamp"), start, end)]
+    windowed.sort(key=lambda e: e.get("timestamp") or "")
+
+    seen = set()
+    deduped = []
+    for e in windowed:
+        key = (e.get("timestamp"), e.get("event"), e.get("run_id") or e.get("key"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(e)
+    return deduped
 
 
 def _derive(record: dict) -> dict:
@@ -207,21 +255,22 @@ def _derive(record: dict) -> dict:
     else:
         record["best_model"] = None
 
-    events = [e for e in _read_jsonl(EVENTS_PATH) if _in_window(e.get("timestamp"), start, end)]
+    events = _windowed_events(start, end)
     record["event_count"] = len(events)
     submitted = [e for e in events if e.get("event") == "final_model_submitted"]
     record["final_model_run_id"] = submitted[-1].get("run_id") if submitted else None
     record["timed_out_runs"] = sum(1 for e in events if e.get("event") == "training_timed_out")
+    # "Engineer intervention" = anything a human did to this mission from
+    # the dashboard: pause/resume/manual-control (control_transition),
+    # approve/reject (approval_decided -- approval_requested is the
+    # agent's own proposal, not an engineer action), and rollback
+    # (rollback_succeeded/rollback_failed, always engineer-initiated per
+    # gotrain/rollback.py).
     record["interventions"] = [
-        {
-            "timestamp": e.get("timestamp"),
-            "from_state": e.get("from_state"),
-            "to_state": e.get("to_state"),
-            "reason": e.get("reason"),
-            "requested_by": e.get("requested_by"),
-        }
-        for e in events
-        if e.get("event") == "control_transition" and e.get("requested_by") == "engineer"
+        e for e in events
+        if (e.get("event") == "control_transition" and e.get("requested_by") == "engineer")
+        or e.get("event") == "approval_decided"
+        or e.get("event") in ("rollback_succeeded", "rollback_failed")
     ]
     return record
 
@@ -267,9 +316,7 @@ def load_session(session_id: str) -> Optional[dict]:
         all_runs = []
 
     record["runs"] = [r for r in all_runs if _in_window(r.get("timestamp"), start, end)]
-    record["events"] = [
-        e for e in _read_jsonl(EVENTS_PATH) if _in_window(e.get("timestamp"), start, end)
-    ]
+    record["events"] = _windowed_events(start, end)
     record["live_metrics"] = [
         m for m in _read_jsonl(LIVE_METRICS_PATH) if _in_window(m.get("timestamp"), start, end)
     ]
