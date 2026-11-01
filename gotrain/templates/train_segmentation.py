@@ -30,6 +30,8 @@ if str(REPO_ROOT) not in sys.path:
     # only puts this file's own directory on sys.path by default.
     sys.path.insert(0, str(REPO_ROOT))
 
+from gotrain import reproducibility  # noqa: E402 -- needs sys.path fix above
+
 
 def report_progress(**fields) -> None:
     """Best-effort live per-epoch status update for the dashboard. Never
@@ -513,6 +515,31 @@ def main() -> None:
         print("OUT OF MEMORY while constructing the model. Try a smaller --batch_size or a lighter encoder.", file=sys.stderr)
         sys.exit(1)
 
+    # Recursive self-improvement -- see train_classification.py's
+    # identical block for the full rationale: if launch_training resolved
+    # a parent checkpoint (config["warm_start_from_parent"]), load its
+    # learned weights now, before fine-tuning strategy freezes anything.
+    warm_start_checkpoint_path = cfg.get("_warm_start_checkpoint_path")
+    warm_started_from = None
+    if warm_start_checkpoint_path:
+        try:
+            state_dict = torch.load(warm_start_checkpoint_path, map_location=device)
+            model.load_state_dict(state_dict)
+        except Exception as e:
+            logger.error(f"Warm-start failed to load parent checkpoint {warm_start_checkpoint_path}: {e}")
+            print(
+                f"WARM-START FAILED: could not load parent checkpoint into this architecture: {e}. "
+                "This usually means the architecture/encoder changed between parent and child run.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        warm_started_from = {
+            "parent_run_id": cfg.get("_warm_start_parent_run_id"),
+            "parent_version": cfg.get("_warm_start_parent_version"),
+            "checkpoint_path": warm_start_checkpoint_path,
+        }
+        logger.info(f"Warm-started from parent run {warm_started_from['parent_run_id']} ({warm_started_from['parent_version']})")
+
     from gotrain.finetuning import apply_fine_tuning_strategy, trainable_parameters
 
     fine_tuning_summary = apply_fine_tuning_strategy(model, "smp", fine_tuning_strategy)
@@ -683,6 +710,8 @@ def main() -> None:
         "n_bands": n_bands,
         "band_names": band_names,
         "n_classes": n_classes,
+        "dependency_versions": reproducibility.capture_dependency_versions(),
+        "warm_started_from": warm_started_from,
         "class_pixel_frequencies": class_freqs.tolist(),
         "best": best_metrics,
         "final_val_metric": final_val_metric,

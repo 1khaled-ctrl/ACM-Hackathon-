@@ -201,6 +201,11 @@ def get_history(dataset: Optional[str] = None) -> list:
     return records
 
 
+def get_run(run_id: str) -> Optional[dict]:
+    """Return the single run record for `run_id`, or None if not found."""
+    return next((r for r in _read_all() if r["run_id"] == run_id), None)
+
+
 def get_best(dataset: str) -> Optional[dict]:
     """Return the run with the highest val_metric for `dataset` (None if no runs)."""
     records = [

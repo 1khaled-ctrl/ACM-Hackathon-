@@ -43,19 +43,35 @@ def test_every_catalog_entry_has_required_shape_fields():
         assert not missing, f"{model_id} is missing fields: {missing}"
 
 
-def test_aspirational_entries_have_no_loader_and_are_honest_about_unknowns():
-    """The torchgeo/dinov2/Prithvi candidates must never claim a loader
-    exists, and Prithvi's genuinely-unconfirmed fields must stay null
-    rather than guessed.
+def test_still_aspirational_entries_have_no_loader_and_are_honest_about_unknowns():
+    """torchgeo and Prithvi remain unloadable (no torchgeo package, and
+    Prithvi needs vendored custom model code neither of which this
+    project has) -- their genuinely-unconfirmed fields must stay null
+    rather than guessed. DINOv2 is deliberately NOT in this list anymore
+    -- see test_dinov2_entry_has_a_real_loader_but_is_unpinned below.
     """
-    for model_id in ("torchgeo/resnet18_sentinel2_all_moco", "huggingface/facebook-dinov2-small",
-                      "ibm-nasa/prithvi-eo-2.0-tiny"):
+    for model_id in ("torchgeo/resnet18_sentinel2_all_moco", "ibm-nasa/prithvi-eo-2.0-tiny"):
         assert pretrained.CATALOG[model_id]["loader_family"] is None
 
     prithvi = pretrained.CATALOG["ibm-nasa/prithvi-eo-2.0-tiny"]
     assert prithvi["parameter_count"] is None
     assert prithvi["license"] is None
     assert prithvi["checkpoint_revision"] is None
+
+
+def test_dinov2_entry_has_a_real_loader_but_is_unpinned():
+    """DINOv2 has a genuine loader_family (gotrain.pretrained.
+    load_dinov2_classification_backbone, via transformers.AutoModel) --
+    but hf_revision is deliberately left unpinned until someone with
+    network access looks up an actual commit SHA. Both facts must hold
+    at once: the loader exists, but calling it should still refuse to
+    run (see test_pretrained_dinov2.py for that behavior).
+    """
+    entry = pretrained.CATALOG["huggingface/facebook-dinov2-small"]
+    assert entry["loader_family"] == "huggingface_transformers"
+    assert entry["hf_repo_id"] == "facebook/dinov2-small"
+    assert entry["hf_revision"] is None
+    assert entry["compatibility_verified"] is False
 
 
 def test_timm_and_smp_backed_entries_have_a_loader():

@@ -27,7 +27,7 @@ CLASSIFICATION_VALID_VALUES = {
     "optimizer": ["adam", "sgd", "adamw"],
     "scheduler": ["none", "cosine"],
     "augmentation": ["none", "basic", "strong"],
-    "backbone": ["resnet18", "resnet50", "efficientnet_b0", "convnext_tiny"],
+    "backbone": ["resnet18", "resnet50", "efficientnet_b0", "convnext_tiny", "dinov2_small"],
     "fine_tuning_strategy": FINE_TUNING_STRATEGIES,
 }
 

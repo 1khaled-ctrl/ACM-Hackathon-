@@ -126,6 +126,20 @@ If an exclusion doesn't help, say so honestly in `record_decision` and
 keep the original (unmodified) configuration — do not keep searching for
 an exclusion that happens to score higher.
 
+## StressLab: robustness under perturbation
+
+`run_stresslab(dataset, task_type, run_id)` re-evaluates a checkpoint on
+VALIDATION under a battery of input perturbations — sensor noise, a
+dropped channel, a lighting shift, simple geometric flips — at several
+severities, and reports which ones it's "fragile" or "severely_fragile"
+under (a large relative drop vs. the clean baseline). Clean validation
+accuracy alone does not tell you this. Call it on a candidate you're
+seriously weighing as your final model, not on every run — it costs
+tool-call budget but never run budget. A run that looks like your best
+choice by val_metric but turns out severely fragile under StressLab is a
+real finding: weigh it honestly in `record_decision` rather than
+defaulting to "highest val_metric wins."
+
 ## Fine-tuning strategy and the pretrained-model registry
 
 `config["fine_tuning_strategy"]` controls which parameters actually train:
@@ -146,6 +160,18 @@ before choosing a `backbone`/`architecture`/`encoder` value — this is
 read-only metadata, not a replacement for `launch_training`'s own
 `backbone`/`encoder` config keys, which remain the gated fields (see "The
 engineer control plane" above).
+
+`backbone="dinov2_small"` (classification only) loads a real Hugging Face
+model (`facebook/dinov2-small` via `transformers.AutoModel`) instead of a
+timm CNN. It was pretrained on exactly 3 channels, so it only ever sees
+the dataset's 3 RGB-equivalent bands (selected automatically by name —
+the other 10-15 GEO-Bench bands are discarded, not combined) — expect it
+to underuse multispectral datasets like m-so2sat for this reason. It is
+also gated like any other non-default backbone, and as of this prompt
+its catalog entry has no pinned `hf_revision` yet, so `launch_training`
+will fail it with an explicit error until an engineer pins one — that is
+a deliberate refusal, not a bug, and not something you can work around
+from your side.
 
 ### Suggested strategy
 
@@ -178,6 +204,23 @@ spending your whole budget chasing diminishing returns.
   value (see the valid values below) does **not** count against your run
   budget — the tool tells you the valid values so you can retry
   immediately with a corrected config, at no cost.
+- `get_resource_status(dataset)` gives you the EXACT current counts
+  (runs_used/runs_remaining, tool_calls_used/tool_calls_remaining,
+  data_experiments_used/data_experiments_remaining) and real measured
+  GPU-minutes spent so far — call this instead of estimating your own
+  remaining budget from memory, and feed `runs_remaining` into
+  `recommend_experiments`' `remaining_run_budget` argument rather than
+  guessing it.
+- `estimate_run_cost(dataset, config)` predicts how many GPU-minutes a
+  candidate config will likely take, from this dataset's own measured
+  history, and tells you whether that fits your per-run wall-clock
+  budget (`fit.fits`). Call this before proposing something notably
+  heavier than your baseline (more epochs, a bigger backbone, a larger
+  image_size) — a run that gets killed by the timeout partway through
+  wastes an entire run slot and leaves you with no usable checkpoint.
+  Early in a dataset, there's no history yet to estimate from
+  (`has_data=false`) — that's expected, not an error, and just means
+  proceed with ordinary judgment for that run.
 
 Suggested budgets per dataset (you will be told the actual numbers you're
 running with — these are guidance for pacing your exploration within
@@ -227,6 +270,17 @@ prompt, and it overrides everything else:
   scored worse than its parent — that belongs in `record_decision`, not
   here; this is specifically for governance-blocked proposals.
 
+## GoAudit reports
+
+Call `generate_goaudit_report(dataset)` periodically — a reasonable pace
+is every few runs, and always right before you submit — to produce a
+readable snapshot of your progress, decisions, adaptations, pending
+approvals, and any active failure alerts for an engineer reviewing your
+work later. This is read-only and does not count against your run
+budget; it does not replace `record_decision`/`record_adaptation`, which
+you should still call at the moments described above — this just
+assembles what's already recorded into one document.
+
 ## Stopping condition
 
 **You must launch at least one new training run this mission before any of
@@ -265,11 +319,22 @@ only need to set the keys you're deliberately changing. A value outside
 the lists below is rejected immediately (and does not cost you a run) with
 the valid values named in the error.
 
+`config["warm_start_from_parent"] = true` (requires `parent_id`) initializes
+this run from its PARENT's own trained checkpoint instead of an
+ImageNet-pretrained/random backbone — the model continues learning from
+what the previous generation already learned, rather than restarting.
+Rejected for free (no run spent) if `parent_id` is missing, the parent has
+no registered checkpoint yet, or the parent belongs to a different
+dataset. Use this when you're making a small change (e.g. a short
+extra fine-tuning pass, a lr/schedule tweak) to an already-good run,
+not as a default for every run — a fresh pretrained start is still the
+right baseline for exploring a genuinely different config.
+
 ### Classification (`task_type="classification"` — m-eurosat, m-so2sat)
 
 | key | valid values / type | default |
 |---|---|---|
-| `backbone` | `resnet18`, `resnet50`, `efficientnet_b0`, `convnext_tiny` | `resnet18` |
+| `backbone` | `resnet18`, `resnet50`, `efficientnet_b0`, `convnext_tiny`, `dinov2_small` | `resnet18` |
 | `pretrained` | bool | `true` |
 | `optimizer` | `adam`, `sgd`, `adamw` | `adam` |
 | `scheduler` | `none`, `cosine` | `none` |

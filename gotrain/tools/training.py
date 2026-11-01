@@ -16,6 +16,7 @@ from typing import Any, Optional
 from gotrain import approval, control, ledger, registry, status
 from gotrain.config_schema import (
     ConfigValidationError,
+    PreflightValidationError,
     validate_class_weights,
     validate_config,
     validate_fine_tuning_strategy,
@@ -31,6 +32,55 @@ TEMPLATES = {
     "segmentation": REPO_ROOT / "gotrain" / "templates" / "train_segmentation.py",
     "fake": REPO_ROOT / "gotrain" / "templates" / "fake_train.py",
 }
+
+
+class WarmStartError(PreflightValidationError):
+    """Raised before any subprocess runs when config["warm_start_from_parent"]
+    is set but there's no usable parent checkpoint to actually warm-start
+    from (no parent_id given, parent never registered a checkpoint, or
+    the parent belongs to a different dataset -- its checkpoint's
+    architecture/band-count has no reason to match this dataset's).
+    """
+
+
+def _resolve_warm_start_checkpoint(dataset: str, parent_id: Optional[str]) -> dict:
+    """Recursive self-improvement primitive: rather than always
+    initializing a new run from scratch or from ImageNet-pretrained
+    weights, this lets a run continue training from its PARENT run's own
+    learned checkpoint -- the model literally carries forward what the
+    previous generation already learned, not just its config lineage
+    (which gotrain.ledger already tracks regardless of this flag).
+
+    Resolved here (not inside the training template) so a bad request
+    -- no parent_id, a parent with no registered checkpoint, cross-
+    dataset parent -- is rejected before any subprocess runs, same as
+    every other pre-flight check in launch_training.
+    """
+    if parent_id is None:
+        raise WarmStartError(
+            "warm_start_from_parent=true requires parent_id (nothing to warm-start from otherwise)."
+        )
+    parent_record = ledger.get_run(parent_id)
+    if parent_record is None:
+        raise WarmStartError(f"parent_id {parent_id!r} not found in the ledger.")
+    if parent_record["dataset"] != dataset:
+        raise WarmStartError(
+            f"parent_id {parent_id!r} belongs to dataset {parent_record['dataset']!r}, not {dataset!r} "
+            "-- warm-starting across datasets isn't supported (checkpoint shapes wouldn't match)."
+        )
+    parent_version = parent_record.get("version_id")
+    if not parent_version:
+        raise WarmStartError(
+            f"parent_id {parent_id!r} has no registered checkpoint (version_id is empty) to warm-start from."
+        )
+    checkpoint_path = registry.get_version_dir(dataset, parent_version) / "model.pt"
+    if not checkpoint_path.exists():
+        raise WarmStartError(f"parent checkpoint not found at {checkpoint_path} for version {parent_version!r}.")
+    return {
+        "_warm_start_checkpoint_path": str(checkpoint_path),
+        "_warm_start_parent_run_id": parent_id,
+        "_warm_start_parent_version": parent_version,
+    }
 
 
 def launch_training(
@@ -98,15 +148,24 @@ def launch_training(
             n_classes = None
         validate_class_weights(task_type, class_weights, n_classes)
 
+    # Recursive self-improvement: warm_start_from_parent=true asks this run
+    # to initialize from its PARENT's own learned checkpoint instead of
+    # ImageNet-pretrained/random weights. Resolved here, before the
+    # subprocess runs, so a request with no usable parent checkpoint is
+    # rejected for free rather than discovered mid-run.
+    effective_config = config
+    if config.get("warm_start_from_parent"):
+        effective_config = {**config, **_resolve_warm_start_checkpoint(dataset, parent_id)}
+
     template_path = TEMPLATES[task_type]
     status.set_action("training", from_=parent_id or "agent", where=dataset)
-    log_event("training_started", dataset=dataset, task_type=task_type, config=config)
+    log_event("training_started", dataset=dataset, task_type=task_type, config=effective_config)
 
     import json
 
     try:
         proc = subprocess.run(
-            [sys.executable, str(template_path), "--dataset", dataset, "--config", json.dumps(config)],
+            [sys.executable, str(template_path), "--dataset", dataset, "--config", json.dumps(effective_config)],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -163,7 +222,7 @@ def launch_training(
 
     record = ledger.add_run(
         dataset=dataset,
-        config=config,
+        config=effective_config,
         val_metric=val_metric,
         parent_id=parent_id,
         gpu_minutes=result.get("gpu_minutes"),

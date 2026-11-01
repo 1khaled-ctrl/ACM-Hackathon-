@@ -24,7 +24,7 @@ from typing import Any, Optional
 from strands import Agent, tool
 from strands.hooks import AfterToolCallEvent, BeforeToolCallEvent, HookRegistry
 
-from gotrain import config, control, ledger, status
+from gotrain import config, control, goaudit, ledger, resource_intelligence, status
 from gotrain.config_schema import PreflightValidationError
 from gotrain.logging_utils import log_event
 from gotrain.tools import adaptation as adaptation_tools
@@ -34,6 +34,7 @@ from gotrain.tools import experiment_planner as experiment_planner_tools
 from gotrain.tools import geoguard as geoguard_tools
 from gotrain.tools import pretrained as pretrained_tools
 from gotrain.tools import s3 as s3_tools
+from gotrain.tools import stresslab as stresslab_tools
 from gotrain.tools import training as training_tools
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -140,6 +141,30 @@ def run_dataiq_loss_scan(dataset: str, task_type: str, run_id: str) -> dict:
 
 
 @tool
+def run_stresslab(dataset: str, task_type: str, run_id: str) -> dict:
+    """Robustness check: loads `run_id`'s saved checkpoint and re-evaluates
+    it on the VALIDATION split under a battery of input perturbations --
+    sensor noise, a dropped/dead channel, a lighting shift, and simple
+    geometric flips -- scaled to several severities. Reports each
+    perturbation's effect on the validation metric and flags any where
+    the model is "fragile" or "severely_fragile" (a large relative drop
+    vs. the clean baseline), not just the clean accuracy/IoU you already
+    have from the run itself. A model with strong clean validation
+    accuracy that is fragile here is a real finding worth weighing before
+    choosing it as your final model -- mention it in `record_decision` if
+    it changes your choice. Never touches the test split. Call this on a
+    candidate you're seriously considering submitting, not on every run
+    (it costs tool-call budget but not run budget).
+
+    Args:
+        dataset: the GEO-Bench dataset name.
+        task_type: "classification" or "segmentation".
+        run_id: the run whose checkpoint to stress-test.
+    """
+    return stresslab_tools.run_stresslab(dataset, task_type, run_id)
+
+
+@tool
 def list_data_proposals(dataset: Optional[str] = None, status_filter: Optional[str] = None) -> list:
     """List DataIQ data-quality proposals (from run_dataiq_structural_scan
     or run_dataiq_loss_scan), optionally filtered by dataset and/or status
@@ -241,6 +266,53 @@ def get_training_diagnostics(dataset: str, run_id: str) -> dict:
         run_id: the run to diagnose.
     """
     return experiment_planner_tools.get_training_diagnostics(dataset, run_id)
+
+
+@tool
+def get_resource_status(dataset: str) -> dict:
+    """Your current run/tool-call/data-experiment budget, read from live
+    counters -- not something to track or guess yourself. Returns
+    runs_used/runs_remaining, tool_calls_used/tool_calls_remaining,
+    data_experiments_used/data_experiments_remaining, the per-run
+    wall-clock budget (run_minutes), and real measured usage so far
+    (total_gpu_minutes_used across completed runs, from the ledger).
+    Call this before deciding what to try next, especially once you
+    suspect you're running low -- it's free (reading status, not a tool
+    call against anything metered) and gives you the exact number instead
+    of a guess. Pass `runs_remaining` into `recommend_experiments`'
+    `remaining_run_budget` argument rather than estimating it yourself.
+
+    Args:
+        dataset: the dataset to report budget status for.
+    """
+    live = status.get_status().get("resource_budget") or {}
+    usage = resource_intelligence.summarize_resource_usage(dataset)
+    return {**live, "measured_usage": usage}
+
+
+@tool
+def estimate_run_cost(dataset: str, config: dict) -> dict:
+    """Predicts wall-clock GPU-minutes for a candidate config BEFORE you
+    spend a run on it, using THIS dataset's own measured history (never
+    a generic guess) -- and judges whether that estimate fits within
+    your per-run wall-clock budget. A config estimated to exceed that
+    budget risks being killed by the timeout partway through, wasting an
+    entire run slot on no usable checkpoint at all. Call this before
+    `launch_training` whenever you're proposing something notably
+    heavier than your baseline (more epochs, a bigger backbone, a larger
+    image_size) -- not for every run, since early on there's no history
+    yet to estimate from anyway (has_data will say so honestly).
+
+    Args:
+        dataset: the GEO-Bench dataset name.
+        config: the exact config dict you're about to pass to
+            `launch_training` (same keys: backbone/architecture, epochs,
+            etc.).
+    """
+    cost = resource_intelligence.estimate_run_cost(dataset, config)
+    live = status.get_status().get("resource_budget") or {}
+    fit = resource_intelligence.check_fits_in_run_budget(cost, live.get("run_minutes"))
+    return {**cost, "fit": fit}
 
 
 @tool
@@ -403,6 +475,30 @@ def record_adaptation(dataset: str, rejected_proposal: str, new_plan: str, ratio
     return adaptation_tools.record_adaptation(dataset, rejected_proposal, new_plan, rationale)
 
 
+@tool
+def generate_goaudit_report(dataset: str) -> dict:
+    """Generate and persist a GoAudit engineering report for `dataset`:
+    a snapshot of progress so far, every kept/discarded decision and its
+    rationale, any adaptations recorded after a rejected/blocked
+    proposal, pending/rejected engineer approvals, currently active
+    failure alerts, and a statistical-confidence note on whether recent
+    validation-metric deltas can be told apart from ordinary run-to-run
+    noise yet. Call this periodically -- e.g. after every few runs, or
+    right before you stop -- so an engineer reviewing your work later
+    has a readable account of it instead of needing to reconstruct one
+    from raw logs. Purely read-only over your own history: it never
+    evaluates anything and never touches the test split. Each call is
+    saved as a new, separate report (never overwriting a previous one).
+
+    Args:
+        dataset: the dataset to report on.
+    """
+    report = goaudit.generate_report(dataset)
+    path = goaudit.write_report(dataset, report)
+    status.set_last_event(f"GoAudit report generated for {dataset}")
+    return {"report": report, "path": str(path)}
+
+
 class MissionRequiresNewExperimentError(ValueError):
     """Raised by submit_final_model when this mission hasn't launched a
     single new training run yet.
@@ -526,12 +622,15 @@ ALL_TOOLS = [
     run_geoguard,
     run_dataiq_structural_scan,
     run_dataiq_loss_scan,
+    run_stresslab,
     list_data_proposals,
     create_data_manifest,
     list_compatible_models,
     estimate_model_resources,
     validate_model_compatibility,
     get_training_diagnostics,
+    get_resource_status,
+    estimate_run_cost,
     recommend_experiments,
     launch_training,
     get_run_status,
@@ -540,6 +639,7 @@ ALL_TOOLS = [
     compare_runs,
     record_decision,
     record_adaptation,
+    generate_goaudit_report,
     submit_final_model,
     upload_to_s3,
     download_from_s3,
@@ -583,6 +683,30 @@ class LimitsAndLoggingHooks:
         manifest_id = (tool_input.get("config") or {}).get("manifest_id")
         return manifest_id not in (None, "base")
 
+    def _publish_resource_budget(self) -> None:
+        """Mirrors this hook's live, in-memory counters into
+        logs/status.json so they're visible from OUTSIDE this process --
+        gotrain.agent's get_resource_status tool and the dashboard both
+        read it back from there, since neither has (or should have)
+        direct access to this hook instance. Called on every tool call,
+        before and after, so the published snapshot is never more than
+        one call stale.
+        """
+        status.set_resource_budget({
+            "dataset": self.dataset,
+            "run_minutes": self.run_seconds / 60,
+            "runs_used": self.run_count, "max_runs": self.max_runs,
+            "runs_remaining": max(self.max_runs - self.run_count, 0),
+            "tool_calls_used": self.tool_call_count, "max_tool_calls": self.max_tool_calls,
+            "tool_calls_remaining": max(self.max_tool_calls - self.tool_call_count, 0),
+            "data_experiments_used": self.data_experiment_count,
+            "max_data_experiments": self.max_data_experiments,
+            "data_experiments_remaining": (
+                max(self.max_data_experiments - self.data_experiment_count, 0)
+                if self.max_data_experiments is not None else None
+            ),
+        })
+
     def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
         registry.add_callback(BeforeToolCallEvent, self._on_before)
         registry.add_callback(AfterToolCallEvent, self._on_after)
@@ -611,6 +735,7 @@ class LimitsAndLoggingHooks:
             return
 
         self.tool_call_count += 1
+        self._publish_resource_budget()
 
         if self.tool_call_count > self.max_tool_calls:
             event.cancel_tool = (
@@ -659,6 +784,7 @@ class LimitsAndLoggingHooks:
             self.run_count += 1
             if self._uses_data_experiment(tool_input):
                 self.data_experiment_count += 1
+            self._publish_resource_budget()
 
         result_text = ""
         if event.result is not None:

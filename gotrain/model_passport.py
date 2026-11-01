@@ -25,6 +25,7 @@ from gotrain.dataiq import manifest as dataiq_manifest
 from gotrain.dataiq import report as dataiq_report
 from gotrain.geoguard import report as geoguard_report
 from gotrain.logging_utils import EVENTS_PATH, LOGS_DIR
+from gotrain.stresslab import runner as stresslab_runner
 
 PASSPORTS_DIR = LOGS_DIR / "model_passports"
 
@@ -117,9 +118,16 @@ def generate_passport(dataset: str, run_id: Optional[str] = None) -> dict:
     version_id = run_record.get("version_id")
 
     checkpoint_sha256 = None
+    dependency_versions = None
+    warm_started_from = None
     if version_id:
-        checkpoint_path = registry.get_version_dir(dataset, version_id) / "model.pt"
-        checkpoint_sha256 = _sha256_of_file(checkpoint_path)
+        version_dir = registry.get_version_dir(dataset, version_id)
+        checkpoint_sha256 = _sha256_of_file(version_dir / "model.pt")
+        metrics_path = version_dir / "metrics.json"
+        if metrics_path.exists():
+            saved_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            dependency_versions = saved_metrics.get("dependency_versions")
+            warm_started_from = saved_metrics.get("warm_started_from")
 
     geoguard = geoguard_report.read_report(dataset)
     test_result = _find_test_result(dataset, run_id)
@@ -162,6 +170,8 @@ def generate_passport(dataset: str, run_id: Optional[str] = None) -> dict:
         "data_provenance": _data_provenance(dataset, run_record),
         "checkpoint_version": version_id,
         "checkpoint_sha256": checkpoint_sha256,
+        "dependency_versions": dependency_versions,
+        "warm_started_from": warm_started_from,
         "engineer_approval": {
             "config_gate_decisions": [
                 p for p in approval.list_proposals(kind="config_gate") if p["dataset"] == dataset
@@ -169,7 +179,7 @@ def generate_passport(dataset: str, run_id: Optional[str] = None) -> dict:
             "submitted_final": bool(run_record.get("submitted_final")),
         },
         "known_limitations": _known_limitations(dataset, run_record, geoguard, test_result),
-        "robustness_results": None,  # StressLab not implemented in this pass -- explicitly absent, not fabricated
+        "robustness_results": stresslab_runner.read_report(dataset, run_id),  # None if StressLab was never run for this run_id -- never fabricated
     }
     return passport
 
@@ -250,7 +260,8 @@ def format_passport_markdown(passport: dict) -> str:
         lines += [f"- {item}" for item in passport["known_limitations"]]
     else:
         lines.append("- None recorded.")
-    lines += ["", "## Robustness Results", "- Not run in this pass (StressLab not implemented)."]
+    lines += ["", "## Robustness Results (StressLab)"]
+    lines += [f"- {line}" for line in _format_robustness_results(passport.get("robustness_results")).splitlines()]
     return "\n".join(lines)
 
 
@@ -272,6 +283,44 @@ def _kv(label: str, value_html: str) -> str:
 
 def _status_pill(label: str, kind: str) -> str:
     return f'<span class="pill pill-{kind}">{_esc(label)}</span>'
+
+
+def _format_dependency_versions(dependency_versions: Optional[dict]) -> Optional[str]:
+    if not dependency_versions:
+        return None
+    return ", ".join(
+        f"{package}={version or 'not installed'}" for package, version in dependency_versions.items()
+    )
+
+
+def _format_warm_started_from(warm_started_from: Optional[dict]) -> Optional[str]:
+    if not warm_started_from:
+        return None
+    return f"run {warm_started_from.get('parent_run_id')} ({warm_started_from.get('parent_version')})"
+
+
+def _format_robustness_results(robustness_results: Optional[dict]) -> str:
+    """robustness_results is a raw gotrain.stresslab.runner.read_report()
+    payload ({"summary": {...}, "results": [...]}) or None if StressLab
+    was never run against this run_id -- never fabricated into a fake
+    "robust" verdict just to fill this section.
+    """
+    if not robustness_results:
+        return "Not yet run for this model (call run_stresslab before submitting, or run it manually) — not fabricated to fill this section."
+
+    summary = robustness_results["summary"]
+    lines = [f"Overall: {summary['overall_verdict']} ({summary['n_perturbations_tested']} perturbation(s) tested)."]
+    fragile = [r for r in robustness_results["results"] if r["fragility"] in ("fragile", "severely_fragile")]
+    if fragile:
+        for r in fragile:
+            lines.append(
+                f"  - {r['perturbation']} ({r['severity']}): {r['fragility']} "
+                f"(clean={r['clean_metric']:.4f}, perturbed={r['perturbed_metric']:.4f}, "
+                f"relative_drop={r['relative_drop']:.1%})"
+            )
+    else:
+        lines.append("  - No fragile perturbations found.")
+    return "\n".join(lines)
 
 
 def format_passport_html(passport: dict) -> str:
@@ -559,6 +608,8 @@ a {{ color: var(--accent); }}
     <h2>Checkpoint</h2>
     {_kv("Registry version", _esc(passport['checkpoint_version']))}
     {_kv("SHA-256", _code(passport.get('checkpoint_sha256')))}
+    {_kv("Dependency versions", _code(_format_dependency_versions(passport.get('dependency_versions'))))}
+    {_kv("Warm-started from", _code(_format_warm_started_from(passport.get('warm_started_from'))))}
   </section>
 
   <section>
@@ -567,8 +618,8 @@ a {{ color: var(--accent); }}
   </section>
 
   <section>
-    <h2>Robustness Results</h2>
-    <p class="prose muted">{_esc(passport.get('robustness_results')) if passport.get('robustness_results') else "Not run in this pass (StressLab not implemented) — not fabricated to fill this section."}</p>
+    <h2>Robustness Results (StressLab)</h2>
+    <pre class="prose muted wrap-x">{_esc(_format_robustness_results(passport.get('robustness_results')))}</pre>
   </section>
 
   <div class="footer">
