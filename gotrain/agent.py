@@ -403,18 +403,40 @@ def record_adaptation(dataset: str, rejected_proposal: str, new_plan: str, ratio
     return adaptation_tools.record_adaptation(dataset, rejected_proposal, new_plan, rationale)
 
 
-@tool
-def submit_final_model(dataset: str, run_id: str) -> dict:
-    """Submit your final chosen model for this dataset. This only RECORDS
-    your choice in the ledger — it does not evaluate anything and does not
-    touch the test split. Call this once, when you are done iterating, with
-    the run_id of your best validation run. A human will run the one-time
-    test evaluation separately afterward.
+class MissionRequiresNewExperimentError(ValueError):
+    """Raised by submit_final_model when this mission hasn't launched a
+    single new training run yet.
 
-    Args:
-        dataset: the dataset this submission is for.
-        run_id: the run_id of the model you are submitting as final.
+    Historical runs from previous missions (query_history, compare_runs)
+    remain fully visible as baselines/reference knowledge -- an agent is
+    expected to look at them before deciding what to try. What this
+    blocks is going straight from "I looked at history" to "I submit
+    that old run" with zero new work: a fresh dashboard mission exists
+    specifically to run new experiments, so it must run at least one
+    before it's allowed to call this done. Diminishing-returns early
+    stopping is legitimate -- but only after run #1 of THIS mission, not
+    instead of it.
     """
+
+
+def _submit_final_model(dataset: str, run_id: str, hooks: "LimitsAndLoggingHooks") -> dict:
+    """The real implementation behind the submit_final_model @tool,
+    parameterized by the session's LimitsAndLoggingHooks instance so it
+    can see how many NEW runs this mission has actually launched.
+    Bound into a per-session closure in build_agent, same pattern as
+    _launch_training below -- see that function's comment for why.
+    """
+    if hooks.run_count < 1:
+        raise MissionRequiresNewExperimentError(
+            f"This mission has launched 0 new training runs for {dataset!r} so far "
+            f"(run budget: {hooks.max_runs}). query_history may show strong runs from "
+            "earlier missions -- those remain valid reference knowledge, but this mission "
+            "must call launch_training at least once before submit_final_model is allowed. "
+            "If an earlier run's config still looks best, launch_training with that exact "
+            "config (as a new run, with it as parent_id) to confirm it reproduces, then "
+            "decide from there."
+        )
+
     record = training_tools.get_run_status(run_id)
     if record["dataset"] != dataset:
         raise ValueError(
@@ -440,6 +462,35 @@ def submit_final_model(dataset: str, run_id: str) -> dict:
         log_event("model_passport_generation_failed", dataset=dataset, run_id=run_id, error=str(e))
 
     return updated
+
+
+@tool
+def submit_final_model(dataset: str, run_id: str) -> dict:
+    """Submit your final chosen model for this dataset. This only RECORDS
+    your choice in the ledger — it does not evaluate anything and does not
+    touch the test split. Call this once, when you are done iterating, with
+    the run_id of your best validation run. A human will run the one-time
+    test evaluation separately afterward.
+
+    This mission must have launched at least one new training run before
+    this is allowed, even if query_history shows a strong run from an
+    earlier mission — that history is reference knowledge, not a
+    substitute for this mission actually training something.
+
+    Args:
+        dataset: the dataset this submission is for.
+        run_id: the run_id of the model you are submitting as final.
+    """
+    # This module-level stub is never actually registered on a live agent
+    # (build_agent swaps in a per-session closure bound to its
+    # LimitsAndLoggingHooks, the same way it does for launch_training) --
+    # it exists so ALL_TOOLS / tests can reference submit_final_model by
+    # name. Calling it directly without that binding is a programming
+    # error, not a reachable agent path.
+    raise RuntimeError(
+        "submit_final_model must be called through the per-session binding "
+        "build_agent() installs; the unbound @tool stub has no mission to check."
+    )
 
 
 @tool
@@ -704,7 +755,34 @@ def build_agent(
             timeout_seconds=timeout_seconds,
         )
 
-    tool_list = [t for t in ALL_TOOLS if t.tool_name != "launch_training"] + [_launch_training]
+    # submit_final_model's real implementation needs to see this session's
+    # hooks.run_count (how many NEW runs this mission has launched) before
+    # allowing submission -- bound here the same way _launch_training above
+    # is bound to this session's timeout, rather than trusting the model
+    # to only submit after actually training something.
+    @tool(name="submit_final_model")
+    def _submit_final_model_tool(dataset: str, run_id: str) -> dict:
+        """Submit your final chosen model for this dataset. This only RECORDS
+        your choice in the ledger — it does not evaluate anything and does not
+        touch the test split. Call this once, when you are done iterating, with
+        the run_id of your best validation run. A human will run the one-time
+        test evaluation separately afterward.
+
+        This mission must have launched at least one new training run before
+        this is allowed, even if query_history shows a strong run from an
+        earlier mission — that history is reference knowledge, not a
+        substitute for this mission actually training something.
+
+        Args:
+            dataset: the dataset this submission is for.
+            run_id: the run_id of the model you are submitting as final.
+        """
+        return _submit_final_model(dataset=dataset, run_id=run_id, hooks=hooks)
+
+    tool_list = [
+        t for t in ALL_TOOLS
+        if t.tool_name not in ("launch_training", "submit_final_model")
+    ] + [_launch_training, _submit_final_model_tool]
 
     status.write_status(stage="EXPLORE", action="agent initialized", where=dataset, iteration=0)
     log_event("agent_initialized", dataset=dataset, max_runs=max_runs, run_minutes=run_minutes, max_tool_calls=max_tool_calls)

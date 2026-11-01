@@ -48,9 +48,17 @@ For the dataset you are given, repeat this loop:
    and never requires engineer approval (only genuinely ambiguous data
    actions, below, do).
 2. Call `query_history` **before every single training run** — never launch
-   a run with a config you or a previous run has already tried. If the
-   history is empty, this is your first run; otherwise, read it and use it
-   to decide what to try next.
+   a run with a config you or a previous run has already tried. `query_history`
+   returns runs from this mission AND from any earlier mission on this
+   dataset — that earlier history is valid reference knowledge (it tells
+   you what's already been tried and what scored well), but it is not a
+   substitute for this mission's own work. Regardless of how strong a run
+   already in the history looks, **this mission must launch at least one
+   new `launch_training` run before `submit_final_model` is allowed** —
+   the tool will refuse submission otherwise. If an old run's config looks
+   like the best starting point, that's fine: launch it again as a new run
+   (with it as `parent_id`) to confirm it reproduces, then proceed from
+   there.
 3. Plan one run. Prefer an evidence-based choice over a guess: after your
    first couple of runs, call `get_training_diagnostics` and
    `recommend_experiments` on your best-so-far run_id — it reads what
@@ -221,20 +229,33 @@ prompt, and it overrides everything else:
 
 ## Stopping condition
 
-Stop iterating and submit as soon as **either** of these is true:
+**You must launch at least one new training run this mission before any of
+the conditions below can apply.** A strong run already sitting in
+`query_history` from an earlier mission does NOT satisfy this — it is
+reference knowledge, not this mission's work. `submit_final_model` enforces
+this in code and will refuse if you haven't launched a run yet, regardless
+of what history shows.
+
+Once you have launched at least one run this mission, stop iterating and
+submit as soon as **either** of these is true:
 
 - Your run budget or tool-call budget is spent (the tools will tell you), **or**
-- The last 2 consecutive runs each improved the validation metric by less
-  than 0.3 points (on whatever scale the metric is reported — e.g. accuracy
-  as a 0-100 value, or the equivalent small fractional change if reported
-  as 0-1) over their parent. This means you've hit diminishing returns —
-  further single-variable tweaks aren't worth the remaining budget.
+- The last 2 consecutive runs **launched by this mission** each improved
+  the validation metric by less than 0.3 points (on whatever scale the
+  metric is reported — e.g. accuracy as a 0-100 value, or the equivalent
+  small fractional change if reported as 0-1) over their parent — not 2
+  runs found in history from a previous mission. This means you've hit
+  diminishing returns — further single-variable tweaks aren't worth the
+  remaining budget. With only 1 run so far this mission, this condition
+  cannot yet be evaluated; launch at least one more before considering it.
 
 When you stop, call `submit_final_model(dataset, run_id)` with the run_id
-of your best validation run. `submit_final_model` only records your choice
-— it does not evaluate anything and it does not touch the test split. A
-human will run the final test evaluation separately, once, after you
-finish.
+of your best validation run — this can be a run from an earlier mission if
+it's genuinely still your best, as long as this mission has launched at
+least one run of its own first. `submit_final_model` only records your
+choice — it does not evaluate anything and it does not touch the test
+split. A human will run the final test evaluation separately, once, after
+you finish.
 
 ## Search space and valid config values
 

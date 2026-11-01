@@ -215,6 +215,98 @@ def test_submit_final_model_rejects_mismatched_dataset(isolated_logs):
     assert result["status"] == "error"
 
 
+def test_fresh_mission_cannot_submit_an_old_run_with_zero_new_experiments(isolated_logs):
+    """The actual bug this guards against: a strong run already sitting in
+    the ledger from an EARLIER mission must not let a brand-new mission
+    (fresh LimitsAndLoggingHooks, run_count starts at 0) call
+    submit_final_model straight away. query_history can see that old run
+    (it's valid reference knowledge) but submission must still be refused
+    until this mission launches at least one run of its own.
+    """
+    # Simulate a strong run left behind by a previous mission -- no agent
+    # involved in creating it, exactly like a dashboard-launched mission
+    # inheriting whatever is already in the ledger.
+    old_run = ledger.add_run(
+        dataset="m-eurosat",
+        config={"backbone": "convnext_tiny", "lr": 1e-3},
+        val_metric=0.99,
+        task_type="classification",
+        decision="kept",
+    )
+
+    agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=40)
+
+    # The old run IS visible through history -- it must remain available
+    # as reference knowledge; this is not about hiding it.
+    history = json.loads(_tool_result_text(agent.tool.query_history(dataset="m-eurosat")))
+    assert any(r["run_id"] == old_run["run_id"] for r in history)
+
+    # But submitting it directly, with 0 runs launched THIS mission, must
+    # be refused.
+    result = agent.tool.submit_final_model(dataset="m-eurosat", run_id=old_run["run_id"])
+    assert result["status"] == "error"
+    assert "0 new training runs" in _tool_result_text(result)
+
+    # The ledger record must be untouched -- rejected submission is not a
+    # partial submission.
+    reloaded = ledger.get_history(dataset="m-eurosat")
+    submitted = [r for r in reloaded if r.get("submitted_final")]
+    assert submitted == []
+    assert control.get_state() != control.COMPLETED
+
+
+def test_mission_can_submit_the_old_run_after_launching_at_least_one(isolated_logs):
+    """Once this mission has launched >=1 run, it IS allowed to submit an
+    older run as final (e.g. it re-confirmed the old config still wins) --
+    the gate is "did this mission do any new work", not "must the
+    submitted run itself be new".
+    """
+    old_run = ledger.add_run(
+        dataset="m-eurosat",
+        config={"backbone": "convnext_tiny", "lr": 1e-3},
+        val_metric=0.99,
+        task_type="classification",
+        decision="kept",
+    )
+
+    agent = agent_mod.build_agent("m-eurosat", max_runs=6, run_minutes=5, max_tool_calls=40)
+
+    launch_result = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="fake", config={"lr": 0.02}, parent_id=old_run["run_id"],
+        hypothesis={"change": "raised lr", "why": "testing", "expected_direction": "increase"},
+    )
+    assert launch_result["status"] == "success"
+    assert "run_id" in json.loads(_tool_result_text(launch_result))
+
+    result = agent.tool.submit_final_model(dataset="m-eurosat", run_id=old_run["run_id"])
+    assert result["status"] == "success"
+    assert control.get_state() == control.COMPLETED
+
+
+def test_submit_rejection_for_zero_new_runs_does_not_count_against_max_runs(isolated_logs):
+    """A rejected submit_final_model call is a PreflightValidationError-style
+    guard, not a launch_training call -- it must not consume run or
+    tool-call budget differently than any other informational refusal.
+    Mainly guards against a future refactor accidentally wiring the
+    rejection through launch_training's counting path.
+    """
+    old_run = ledger.add_run(
+        dataset="m-eurosat", config={"backbone": "resnet18"}, val_metric=0.9,
+        task_type="classification", decision="kept",
+    )
+    agent = agent_mod.build_agent("m-eurosat", max_runs=1, run_minutes=5, max_tool_calls=40)
+
+    agent.tool.submit_final_model(dataset="m-eurosat", run_id=old_run["run_id"])
+
+    # The run budget must be fully intact -- the rejected submit attempt
+    # didn't touch it, so the mission's one allowed run is still available.
+    launch_result = agent.tool.launch_training(
+        dataset="m-eurosat", task_type="fake", config={"lr": 0.01}, parent_id=old_run["run_id"],
+        hypothesis={"change": "lowered lr", "why": "testing", "expected_direction": "increase"},
+    )
+    assert launch_result["status"] == "success"
+
+
 def test_bad_config_rejection_does_not_count_against_max_runs(isolated_logs):
     """A launch rejected for an unsupported config value (a nonsense
     optimizer name the trainer doesn't support) must not consume one of the
