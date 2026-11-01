@@ -118,6 +118,20 @@ If an exclusion doesn't help, say so honestly in `record_decision` and
 keep the original (unmodified) configuration — do not keep searching for
 an exclusion that happens to score higher.
 
+## StressLab: robustness under perturbation
+
+`run_stresslab(dataset, task_type, run_id)` re-evaluates a checkpoint on
+VALIDATION under a battery of input perturbations — sensor noise, a
+dropped channel, a lighting shift, simple geometric flips — at several
+severities, and reports which ones it's "fragile" or "severely_fragile"
+under (a large relative drop vs. the clean baseline). Clean validation
+accuracy alone does not tell you this. Call it on a candidate you're
+seriously weighing as your final model, not on every run — it costs
+tool-call budget but never run budget. A run that looks like your best
+choice by val_metric but turns out severely fragile under StressLab is a
+real finding: weigh it honestly in `record_decision` rather than
+defaulting to "highest val_metric wins."
+
 ## Fine-tuning strategy and the pretrained-model registry
 
 `config["fine_tuning_strategy"]` controls which parameters actually train:
@@ -182,6 +196,23 @@ spending your whole budget chasing diminishing returns.
   value (see the valid values below) does **not** count against your run
   budget — the tool tells you the valid values so you can retry
   immediately with a corrected config, at no cost.
+- `get_resource_status(dataset)` gives you the EXACT current counts
+  (runs_used/runs_remaining, tool_calls_used/tool_calls_remaining,
+  data_experiments_used/data_experiments_remaining) and real measured
+  GPU-minutes spent so far — call this instead of estimating your own
+  remaining budget from memory, and feed `runs_remaining` into
+  `recommend_experiments`' `remaining_run_budget` argument rather than
+  guessing it.
+- `estimate_run_cost(dataset, config)` predicts how many GPU-minutes a
+  candidate config will likely take, from this dataset's own measured
+  history, and tells you whether that fits your per-run wall-clock
+  budget (`fit.fits`). Call this before proposing something notably
+  heavier than your baseline (more epochs, a bigger backbone, a larger
+  image_size) — a run that gets killed by the timeout partway through
+  wastes an entire run slot and leaves you with no usable checkpoint.
+  Early in a dataset, there's no history yet to estimate from
+  (`has_data=false`) — that's expected, not an error, and just means
+  proceed with ordinary judgment for that run.
 
 Suggested budgets per dataset (you will be told the actual numbers you're
 running with — these are guidance for pacing your exploration within

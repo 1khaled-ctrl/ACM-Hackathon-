@@ -81,6 +81,24 @@ def _calibration_alerts(dataset: str) -> list:
     return alerts
 
 
+def _stresslab_alerts(dataset: str) -> list:
+    alerts = []
+    for event in read_events(event="stresslab_finished", dataset=dataset):
+        n_fragile = event.get("n_fragile") or 0
+        if n_fragile == 0:
+            continue
+        severity = CRITICAL if n_fragile >= 3 else WARNING
+        alerts.append({
+            "severity": severity,
+            "type": "stresslab_fragility",
+            "run_id": event.get("run_id"),
+            "message": f"Run {event.get('run_id')} for {dataset!r} is fragile under "
+                       f"{n_fragile}/{event.get('n_perturbations_tested')} perturbation(s) tested -- "
+                       "clean validation accuracy alone does not reflect this.",
+        })
+    return alerts
+
+
 def _rollback_failure_alerts(dataset: str) -> list:
     alerts = []
     for event in read_events(event="rollback_failed", dataset=dataset):
@@ -104,6 +122,7 @@ def check_alerts(dataset: str) -> list:
         alerts.append(failed_safe)
     alerts.extend(_training_failure_alerts(dataset))
     alerts.extend(_calibration_alerts(dataset))
+    alerts.extend(_stresslab_alerts(dataset))
     alerts.extend(_rollback_failure_alerts(dataset))
 
     severity_order = {CRITICAL: 0, WARNING: 1}

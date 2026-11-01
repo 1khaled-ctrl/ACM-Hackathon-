@@ -9,6 +9,7 @@ import os
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +20,7 @@ from gotrain import approval, ledger, logging_utils, model_passport, registry
 from gotrain.dataiq import decision as dataiq_decision
 from gotrain.dataiq import manifest as dataiq_manifest
 from gotrain.geoguard import report as geoguard_report
+from gotrain.stresslab import runner as stresslab_runner
 
 
 @pytest.fixture
@@ -39,6 +41,7 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setattr(geoguard_report, "GEOGUARD_DIR", logs_dir / "geoguard")
     monkeypatch.setattr(model_passport, "EVENTS_PATH", logs_dir / "events.jsonl")
     monkeypatch.setattr(model_passport, "PASSPORTS_DIR", logs_dir / "model_passports")
+    monkeypatch.setattr(stresslab_runner, "STRESSLAB_DIR", logs_dir / "stresslab")
     return {"logs_dir": logs_dir, "models_dir": models_dir}
 
 
@@ -58,6 +61,22 @@ def test_generate_passport_defaults_to_submitted_run(isolated_env):
     assert passport["validation_metrics"]["val_metric"] == 0.9
     assert passport["engineer_approval"]["submitted_final"] is True
     assert passport["robustness_results"] is None  # never fabricated
+
+
+def test_generate_passport_includes_real_stresslab_report_when_run(isolated_env):
+    record = ledger.add_run("m-eurosat", {"backbone": "resnet18"}, val_metric=0.9, task_type="classification")
+    ledger.update_run(record["run_id"], submitted_final=True)
+
+    battery_result = stresslab_runner.run_perturbation_battery(lambda imgs: 0.9, np.zeros((2, 2, 2, 1)))
+    stresslab_runner._record_and_log("m-eurosat", record["run_id"], "classification", battery_result)
+
+    passport = model_passport.generate_passport("m-eurosat", record["run_id"])
+    assert passport["robustness_results"]["summary"]["overall_verdict"] == "robust"
+
+    html = model_passport.format_passport_html(passport)
+    assert "robust" in html
+    markdown = model_passport.format_passport_markdown(passport)
+    assert "robust" in markdown
 
 
 def test_generate_passport_for_explicit_run_id(isolated_env):
@@ -196,5 +215,5 @@ def test_format_passport_html_never_fabricates_missing_fields(isolated_env):
     assert passport["sensor"] is None  # no geoguard report in this isolated env
 
     html = model_passport.format_passport_html(passport)
-    assert "StressLab not implemented" in html  # robustness honestly absent, not invented
+    assert "Not yet run for this model" in html  # robustness honestly absent, not invented
     assert "Not yet evaluated" in html  # no test result, since none was run

@@ -94,6 +94,19 @@ def test_generate_report_includes_active_alerts(isolated_env):
     assert any("CRITICAL" in r for r in report["recommendations"])
 
 
+def test_generate_report_includes_resource_usage(isolated_env):
+    ledger.add_run(dataset="m-eurosat", config={}, val_metric=0.8, run_id="run-1", gpu_minutes=5.0)
+    ledger.add_run(dataset="m-eurosat", config={}, val_metric=0.85, run_id="run-2", parent_id="run-1", gpu_minutes=7.0)
+
+    report = goaudit.generate_report("m-eurosat")
+    assert report["resource_usage"]["total_gpu_minutes_used"] == pytest.approx(12.0)
+    assert report["resource_usage"]["n_runs_with_recorded_cost"] == 2
+
+    text = goaudit.format_report(report)
+    assert "## Resource Usage" in text
+    assert "12.0" in text
+
+
 def test_format_report_produces_readable_text(isolated_env):
     ledger.add_run(dataset="m-eurosat", config={"a": 1}, val_metric=0.80, run_id="run-1", decision="kept")
     report = goaudit.generate_report("m-eurosat")

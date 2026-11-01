@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from gotrain import alerts, approval, ledger, statistics
+from gotrain import alerts, approval, ledger, resource_intelligence, statistics
 from gotrain.logging_utils import LOGS_DIR, read_events
 
 GOAUDIT_DIR = LOGS_DIR / "goaudit"
@@ -49,6 +49,10 @@ def _progress_section(history: list) -> dict:
         "best_val_metric": best["val_metric"] if best else None,
         "trend": trend,
     }
+
+
+def _resource_usage_section(dataset: str) -> dict:
+    return resource_intelligence.summarize_resource_usage(dataset)
 
 
 def _decisions_section(history: list) -> list:
@@ -134,6 +138,7 @@ def generate_report(dataset: str) -> dict:
         "dataset": dataset,
         "generated_at": _now(),
         "progress": progress,
+        "resource_usage": _resource_usage_section(dataset),
         "decisions": _decisions_section(history),
         "adaptations": _adaptations_section(dataset),
         "approvals": approvals,
@@ -153,6 +158,13 @@ def format_report(report: dict) -> str:
         f"  Runs so far: {report['progress']['n_runs']} ({report['progress']['n_scored_runs']} scored)",
         f"  Best run: {report['progress']['best_run_id']} (val_metric={report['progress']['best_val_metric']})",
         f"  Trend: {report['progress']['trend']}",
+        "",
+        "## Resource Usage",
+        f"  GPU-minutes used: {report['resource_usage']['total_gpu_minutes_used']:.1f} "
+        f"across {report['resource_usage']['n_runs_with_recorded_cost']}/{report['resource_usage']['n_runs']} run(s) with recorded cost "
+        f"(avg {report['resource_usage']['avg_gpu_minutes_per_run']:.1f} min/run)"
+        if report["resource_usage"]["avg_gpu_minutes_per_run"] is not None
+        else "  GPU-minutes used: no runs with recorded cost yet",
         "",
         "## Decisions",
     ]

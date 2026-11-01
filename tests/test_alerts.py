@@ -84,6 +84,38 @@ def test_moderate_miscalibration_does_not_alert(isolated_logs):
     assert alerts.check_alerts("m-eurosat") == []
 
 
+def test_stresslab_fragility_produces_warning_alert(isolated_logs):
+    logging_utils.log_event(
+        "stresslab_finished", dataset="m-eurosat", run_id="run-1",
+        n_fragile=1, n_perturbations_tested=11, overall_verdict="fragile under 1/11 perturbation(s)",
+    )
+
+    result = alerts.check_alerts("m-eurosat")
+    stresslab_alerts = [a for a in result if a["type"] == "stresslab_fragility"]
+    assert len(stresslab_alerts) == 1
+    assert stresslab_alerts[0]["severity"] == alerts.WARNING
+    assert stresslab_alerts[0]["run_id"] == "run-1"
+
+
+def test_stresslab_heavy_fragility_escalates_to_critical(isolated_logs):
+    logging_utils.log_event(
+        "stresslab_finished", dataset="m-eurosat", run_id="run-1",
+        n_fragile=3, n_perturbations_tested=11, overall_verdict="fragile under 3/11 perturbation(s)",
+    )
+
+    result = alerts.check_alerts("m-eurosat")
+    stresslab_alerts = [a for a in result if a["type"] == "stresslab_fragility"]
+    assert stresslab_alerts[0]["severity"] == alerts.CRITICAL
+
+
+def test_stresslab_robust_result_does_not_alert(isolated_logs):
+    logging_utils.log_event(
+        "stresslab_finished", dataset="m-eurosat", run_id="run-1",
+        n_fragile=0, n_perturbations_tested=11, overall_verdict="robust",
+    )
+    assert alerts.check_alerts("m-eurosat") == []
+
+
 def test_rollback_failure_produces_critical_alert(isolated_logs):
     logging_utils.log_event(
         "rollback_failed", dataset="m-eurosat", version="v2", stage="integrity", problems=["model.pt missing"],

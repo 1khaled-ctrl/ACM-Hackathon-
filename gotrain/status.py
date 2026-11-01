@@ -72,5 +72,18 @@ def set_current_run(fields: Optional[dict]) -> dict:
     return write_status(current_run=fields)
 
 
+def set_resource_budget(resource_budget: dict) -> dict:
+    """Overwrite the live "resource_budget" snapshot: run/tool-call/
+    data-experiment counts used and remaining, plus the per-run
+    wall-clock budget (run_minutes). Called by
+    gotrain.agent.LimitsAndLoggingHooks on every tool call, since that
+    hook holds the only authoritative live counters (in-memory, scoped
+    to one agent process) -- this is how gotrain.tools.resource_intelligence's
+    get_resource_status tool and the dashboard see them from outside
+    that process.
+    """
+    return write_status(resource_budget=resource_budget)
+
+
 def get_status() -> dict:
     return read_status()
