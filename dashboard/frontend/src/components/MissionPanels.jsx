@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
-  Activity, Award, ClipboardList, GitFork, HeartPulse, Radio, ShieldAlert, XCircle,
+  Activity, Award, ChevronDown, ClipboardList, GitFork, HeartPulse, Radio, ShieldAlert, XCircle,
 } from 'lucide-react'
 import { Badge, Panel, PanelTitle, cn } from './ui'
 import { buildEventFeed, buildTimeline, finalEpochStatsByRun, isLikelyDiminishingReturns, normalizeLiveRun } from '../lib/mission'
@@ -414,26 +414,70 @@ const DOT_TONE = {
 
 export function EventFeed({ mission, title = 'Live Event Feed', maxItems = 60 }) {
   const feed = useMemo(() => buildEventFeed(mission?.events).slice(0, maxItems), [mission, maxItems])
+  const [expanded, setExpanded] = useState(() => new Set())
+
+  const toggle = (key) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
 
   return (
     <Panel>
       <PanelTitle right={<Radio className="h-3.5 w-3.5 text-emerald-400" />}>{title}</PanelTitle>
       <div className="max-h-[26rem] divide-y divide-edge/40 overflow-y-auto">
         <AnimatePresence initial={false}>
-          {feed.map((item) => (
-            <motion.div
-              key={item.key}
-              initial={{ opacity: 0, x: -8 }}
-              animate={{ opacity: 1, x: 0 }}
-              className="flex items-start gap-2.5 px-4 py-2"
-            >
-              <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', DOT_TONE[item.tone] || DOT_TONE.slate)} />
-              <div className="min-w-0 flex-1">
-                <div className="font-mono text-[0.68rem] text-slate-200">{item.text}</div>
-              </div>
-              <span className="shrink-0 font-mono text-[0.58rem] text-slate-600">{fmtTime(item.timestamp)}</span>
-            </motion.div>
-          ))}
+          {feed.map((item) => {
+            // "Technical details" is only worth showing when it actually
+            // differs from the friendly line -- several formatters set
+            // text===raw (e.g. the "no events yet" style one-liners),
+            // and an expand control with nothing new inside it is noise.
+            const hasDetail = item.raw && item.raw !== item.text
+            const isOpen = expanded.has(item.key)
+            return (
+              <motion.div
+                key={item.key}
+                initial={{ opacity: 0, x: -8 }}
+                animate={{ opacity: 1, x: 0 }}
+                className="px-4 py-2"
+              >
+                <div className="flex items-start gap-2.5">
+                  <span className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', DOT_TONE[item.tone] || DOT_TONE.slate)} />
+                  <button
+                    type="button"
+                    onClick={() => hasDetail && toggle(item.key)}
+                    disabled={!hasDetail}
+                    title={hasDetail ? item.raw : undefined}
+                    className={cn(
+                      'min-w-0 flex-1 text-left font-mono text-[0.68rem] text-slate-200',
+                      hasDetail && 'cursor-pointer hover:text-white',
+                    )}
+                  >
+                    {item.text}
+                    {item.isUnknown && (
+                      <span className="ml-1.5 font-mono text-[0.56rem] uppercase tracking-wider text-slate-600">
+                        unrecognized event
+                      </span>
+                    )}
+                  </button>
+                  {hasDetail && (
+                    <ChevronDown
+                      className={cn('mt-0.5 h-3 w-3 shrink-0 text-slate-600 transition-transform', isOpen && 'rotate-180')}
+                    />
+                  )}
+                  <span className="shrink-0 font-mono text-[0.58rem] text-slate-600">{fmtTime(item.timestamp)}</span>
+                </div>
+                {hasDetail && isOpen && (
+                  <div className="ml-4 mt-1 rounded-md border border-edge/50 bg-slate-900/50 px-2.5 py-1.5 font-mono text-[0.6rem] text-slate-400">
+                    {item.raw}
+                  </div>
+                )}
+              </motion.div>
+            )
+          })}
         </AnimatePresence>
         {feed.length === 0 && <Empty>no events yet</Empty>}
       </div>

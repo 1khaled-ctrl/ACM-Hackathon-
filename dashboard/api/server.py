@@ -87,9 +87,38 @@ def compute_eta_seconds(current_run: dict) -> Optional[float]:
     return (elapsed / epoch) * max(epochs - epoch, 0)
 
 
+def _gpu_utilization_via_nvidia_smi() -> Optional[int]:
+    """Fallback when torch.cuda.utilization() fails -- that call shells
+    out to nvidia-smi internally via a torch-controlled subprocess, which
+    can fail for reasons that have nothing to do with CUDA itself (PATH
+    not inheriting into torch's subprocess call, a restricted/managed
+    environment like SageMaker blocking that particular spawn pattern,
+    etc.). This calls nvidia-smi directly and parses its plain CSV
+    output -- same underlying tool, no new dependency (subprocess is
+    stdlib), just a more direct invocation than torch's wrapper.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        first_line = result.stdout.strip().splitlines()[0].strip()
+        return int(first_line)
+    except Exception:
+        return None
+
+
 def read_telemetry() -> dict:
     """Host CPU/RAM (and GPU when torch sees one). Best-effort: the UI
     degrades to '--' rather than erroring if anything is unavailable.
+
+    gpu.util_percent is a number when either method below succeeds, and
+    gpu.util_unavailable is true only when BOTH torch.cuda.utilization()
+    and the nvidia-smi fallback failed on a GPU that otherwise IS present
+    (VRAM/name resolved) -- that is a real "couldn't be read" case,
+    distinct from "no GPU at all" (gpu is None entirely, the normal
+    no-CUDA-device case), so the UI can show N/A instead of overloading
+    the generic '--' used for "nothing to measure yet".
     """
     out = {"cpu_percent": None, "ram_percent": None, "gpu": None}
     try:
@@ -109,15 +138,17 @@ def read_telemetry() -> dict:
                 "mem_used_gb": round((total_b - free_b) / 1e9, 2),
                 "mem_total_gb": round(total_b / 1e9, 2),
                 "util_percent": None,
+                "util_unavailable": False,
             }
             try:
-                # torch.cuda.utilization() shells out to nvidia-smi itself --
-                # no new dependency. Separate try/except: a driver/nvidia-smi
-                # hiccup here must not erase the memory numbers above, which
-                # come from CUDA directly and are more reliable.
+                # Separate try/except: a driver/nvidia-smi hiccup here
+                # must not erase the memory numbers above, which come
+                # from CUDA directly and are more reliable.
                 gpu["util_percent"] = torch.cuda.utilization()
             except Exception:
-                pass
+                gpu["util_percent"] = _gpu_utilization_via_nvidia_smi()
+            if gpu["util_percent"] is None:
+                gpu["util_unavailable"] = True
             out["gpu"] = gpu
     except Exception:
         pass

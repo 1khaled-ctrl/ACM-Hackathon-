@@ -260,6 +260,13 @@ export default function App() {
                 label="GPU"
                 percent={snap?.telemetry?.gpu?.util_percent}
                 tone="from-violet-400 to-fuchsia-500"
+                // util_unavailable means a GPU IS present (VRAM/name
+                // resolved) but both torch.cuda.utilization() and the
+                // nvidia-smi fallback failed to read a number -- distinct
+                // from "no GPU at all" (gpu is null entirely), where the
+                // Meter's default '--' is correct. N/A says "couldn't be
+                // read", not "nothing to measure yet".
+                valueLabel={snap?.telemetry?.gpu?.util_unavailable ? 'N/A' : undefined}
               />
               {snap?.telemetry?.gpu ? (
                 <>

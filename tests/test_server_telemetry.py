@@ -55,16 +55,46 @@ def test_gpu_present_reports_utilization_and_vram(server, monkeypatch):
     gpu = telemetry["gpu"]
     assert gpu["name"] == "Tesla T4"
     assert gpu["util_percent"] == 68
+    assert gpu["util_unavailable"] is False
     assert gpu["mem_used_gb"] == pytest.approx(11.7, abs=0.1)
     assert gpu["mem_total_gb"] == pytest.approx(16.0, abs=0.1)
 
 
-def test_gpu_present_but_utilization_call_fails_still_reports_memory(server, monkeypatch):
-    """torch.cuda.utilization() shells out to nvidia-smi and can fail
-    independently of CUDA memory queries (e.g. nvidia-smi not on PATH
-    inside a container that still has working CUDA). That failure must
-    degrade only util_percent to None, not drop the whole gpu dict --
-    the memory numbers come from a separate, more reliable CUDA call.
+def test_gpu_present_but_torch_utilization_fails_falls_back_to_nvidia_smi(server, monkeypatch):
+    """torch.cuda.utilization() shells out to nvidia-smi itself and can
+    fail independently of CUDA memory queries (e.g. that specific
+    subprocess spawn pattern blocked in a managed environment, even
+    though CUDA memory queries and a direct nvidia-smi call both work
+    fine). Must fall back to calling nvidia-smi directly and succeed,
+    rather than giving up and reporting unavailable.
+    """
+    fake_torch = mock.MagicMock()
+    fake_torch.cuda.is_available.return_value = True
+    fake_torch.cuda.mem_get_info.return_value = (4_300_000_000, 16_000_000_000)
+    fake_torch.cuda.get_device_name.return_value = "Tesla T4"
+    fake_torch.cuda.utilization.side_effect = RuntimeError("nvidia-smi not found")
+
+    fake_completed = mock.MagicMock(stdout="73\n")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: fake_completed)
+
+    telemetry = server.read_telemetry()
+    gpu = telemetry["gpu"]
+    assert gpu is not None
+    assert gpu["name"] == "Tesla T4"
+    assert gpu["util_percent"] == 73
+    assert gpu["util_unavailable"] is False
+    assert gpu["mem_used_gb"] == pytest.approx(11.7, abs=0.1)
+
+
+def test_gpu_present_but_both_utilization_methods_fail_reports_unavailable(server, monkeypatch):
+    """Both torch.cuda.utilization() AND the nvidia-smi fallback fail on
+    a GPU that otherwise IS present (VRAM/name resolved) -- util_percent
+    stays None, but util_unavailable must be True so the frontend can
+    show N/A ("couldn't be read") instead of the generic '--' used for
+    "nothing to measure" (no GPU at all). Memory numbers must still be
+    reported -- the whole gpu dict is never dropped just because
+    utilization specifically is unreadable.
     """
     fake_torch = mock.MagicMock()
     fake_torch.cuda.is_available.return_value = True
@@ -73,13 +103,34 @@ def test_gpu_present_but_utilization_call_fails_still_reports_memory(server, mon
     fake_torch.cuda.utilization.side_effect = RuntimeError("nvidia-smi not found")
 
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    telemetry = server.read_telemetry()
+    monkeypatch.setattr(
+        server.subprocess, "run",
+        mock.Mock(side_effect=FileNotFoundError("nvidia-smi: command not found")),
+    )
 
+    telemetry = server.read_telemetry()
     gpu = telemetry["gpu"]
     assert gpu is not None
     assert gpu["name"] == "Tesla T4"
     assert gpu["util_percent"] is None
+    assert gpu["util_unavailable"] is True
     assert gpu["mem_used_gb"] == pytest.approx(11.7, abs=0.1)
+
+
+def test_nvidia_smi_fallback_parses_real_csv_output_format(server, monkeypatch):
+    """nvidia-smi's actual --format=csv,noheader,nounits output includes
+    a trailing newline and no units -- confirm the parser handles the
+    real shape, not just a bare pre-stripped number.
+    """
+    fake_completed = mock.MagicMock(stdout=" 42 \n")
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: fake_completed)
+    assert server._gpu_utilization_via_nvidia_smi() == 42
+
+
+def test_nvidia_smi_fallback_returns_none_on_malformed_output(server, monkeypatch):
+    fake_completed = mock.MagicMock(stdout="not-a-number\n")
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **k: fake_completed)
+    assert server._gpu_utilization_via_nvidia_smi() is None
 
 
 def test_torch_import_failure_does_not_break_cpu_ram_reporting(server, monkeypatch):
