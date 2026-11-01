@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GoTrain Architecture</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#11151c; --panel:#161b23; --border:#2a3240; --border-soft:#232a36;
+    --text:#e7ecf3; --text-dim:#9aa7b8; --text-faint:#5c6878;
+    --blue:#5b9bd9; --blue-dim:#3d6a93;
+    --amber:#e3a63f; --amber-soft:#2c2416;
+    --red:#e3634f; --red-soft:#2a1716;
+    --mono:'IBM Plex Mono',monospace;
+    color-scheme: dark;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0; background:var(--bg);}
+  body{color:var(--text); font-family:var(--mono); -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1680px; margin:0 auto; padding:18px 18px 40px;}
+  header{display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px; margin-bottom:14px;}
+  header h1{font-size:16px; margin:0; letter-spacing:.04em; font-weight:600;}
+  header .sub{font-size:11.5px; color:var(--text-faint);}
+  figure{margin:0;}
+  svg{display:block; width:100%; height:auto;}
+  figcaption{font-size:11px; color:var(--text-faint); text-align:center; margin-top:10px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>GOTRAIN &mdash; AGENT RUNTIME ARCHITECTURE</h1>
+  <div class="sub">autonomous GEO-Bench training · 12 datasets · dataset_spec.py registry · validation-only tuning</div>
+</header>
+
+<figure>
+<svg viewBox="0 0 1620 1000" role="img" aria-label="Four-lane architecture diagram: Engineer, Agent Runtime, Execution, and State on Disk. The engineer dashboard writes control and approvals and reads logs. The agent runtime runs the Strands agent through logging hooks into twelve tools. Execution covers dataset support checks, GeoGuard, DataIQ, preflight gates, the training subprocess, and record and version. State on disk holds control files, the dataset registry cache, reports, ledgers, model registry, and the locked GEO-Bench test split, reachable only through final_eval.py.">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+  </marker>
+  <marker id="arrowRed" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="var(--red)"/>
+  </marker>
+</defs>
+<style>
+  text{font-family:'IBM Plex Mono',monospace; fill:var(--text);}
+  .lane-hdr{font-size:12px; fill:var(--text-faint); letter-spacing:.08em;}
+  .box{fill:var(--panel); stroke:var(--border); stroke-width:1.3; rx:7;}
+  .box-new{fill:var(--panel); stroke:var(--amber); stroke-width:1.6; rx:7;}
+  .box-test{fill:var(--red-soft); stroke:var(--red); stroke-width:1.6; rx:7;}
+  .box-hl{fill:#1a2430; stroke:var(--blue); stroke-width:1.5; rx:7;}
+  .title{font-size:13px; font-weight:600;}
+  .path{font-size:10.5px; fill:var(--text-dim);}
+  .desc{font-size:10px; fill:var(--text-faint);}
+  .badge-bg{fill:var(--amber-soft); stroke:var(--amber); stroke-width:1;}
+  .badge-txt{font-size:8.5px; fill:var(--amber); font-weight:700;}
+  .flow{fill:none; stroke:var(--blue-dim); stroke-width:1.4;}
+  .flow-lbl{font-size:9.5px; fill:var(--blue);}
+  .red-flow{fill:none; stroke:var(--red); stroke-width:1.5;}
+  .red-lbl{font-size:9.5px; fill:var(--red);}
+  .dashed{stroke-dasharray:3 3;}
+</style>
+
+<!-- lane headers -->
+<text x="20" y="22" class="lane-hdr">ENGINEER</text>
+<text x="430" y="22" class="lane-hdr">AGENT RUNTIME</text>
+<text x="880" y="22" class="lane-hdr">EXECUTION</text>
+<text x="1330" y="22" class="lane-hdr">STATE ON DISK</text>
+
+<!-- top connector: engineer <-> runtime/execution/state (control + log read) -->
+<path class="flow" d="M 180,46 L 180,38 L 1560,38 L 1560,46" marker-end="url(#arrow)"/>
+<path class="flow" d="M 1560,46 L 1560,38" marker-start="url(#arrow)"/>
+<text x="650" y="34" class="flow-lbl">writes control.json / approvals · reads every log live</text>
+
+<!-- ===================== ENGINEER LANE ===================== -->
+<rect class="box-new" x="20" y="56" width="340" height="270" />
+<text x="36" y="80" class="title">Engineer dashboard</text>
+<rect class="badge-bg" x="280" y="64" width="62" height="16" rx="3"/>
+<text x="289" y="75" class="badge-txt">NEW/UPD</text>
+<text x="36" y="98" class="path">dashboard/app.py · dashboard/api/server.py</text>
+<text x="36" y="114" class="path">dashboard/frontend (React/Vite)</text>
+<text x="36" y="136" class="desc">Pause · Resume · take manual control</text>
+<text x="36" y="152" class="desc">Approve / reject backbones</text>
+<text x="36" y="168" class="desc">Roll back a model version</text>
+<text x="36" y="184" class="desc">Live Mission panels, lineage, StressLab</text>
+<text x="36" y="200" class="desc">/api/datasets → list_datasets() (dynamic)</text>
+<text x="36" y="222" class="path" fill="var(--amber)">check_dataset_support(ds)</text>
+<text x="36" y="238" class="desc">supported/unsupported + reason</text>
+<text x="36" y="254" class="desc">before any download — all 12 datasets</text>
+<text x="36" y="276" class="path">report_all_datasets()</text>
+<text x="36" y="292" class="desc">one call → 12-row coverage table</text>
+<text x="36" y="312" class="desc" fill="var(--text-faint)">GET /api/lineage · /api/rollback/&lt;ds&gt;</text>
+
+<rect class="box-test" x="20" y="700" width="340" height="150"/>
+<text x="36" y="724" class="title" fill="var(--red)">Final test evaluation</text>
+<text x="36" y="742" class="path" fill="#f0a89c">gotrain/tools/final_eval.py</text>
+<text x="36" y="764" class="desc" fill="#f0a89c">Human-triggered, once per dataset</text>
+<text x="36" y="780" class="desc" fill="#f0a89c">final_test_eval(dataset, run_id)</text>
+<text x="36" y="796" class="desc" fill="#f0a89c">TestAlreadyEvaluatedError on re-run</text>
+<text x="36" y="816" class="desc" fill="#f0a89c">multi-label aware: micro/macro-F1,</text>
+<text x="36" y="832" class="desc" fill="#f0a89c">exact_match (bigearthnet) vs accuracy</text>
+
+<!-- ===================== AGENT RUNTIME LANE ===================== -->
+<rect class="box" x="400" y="56" width="340" height="68"/>
+<text x="416" y="80" class="title">Main loop</text>
+<text x="416" y="98" class="path">run_gotrain.py · control.wait_for_resume()</text>
+<text x="416" y="114" class="desc">blocks on PAUSED_FOR_ENGINEER state</text>
+
+<path class="flow" d="M 570,124 L 570,142" marker-end="url(#arrow)"/>
+<text x="582" y="136" class="flow-lbl">task prompt / resume</text>
+
+<rect class="box-hl" x="400" y="146" width="340" height="80"/>
+<text x="416" y="170" class="title">Strands Agent</text>
+<text x="416" y="188" class="path">Claude Sonnet via Amazon Bedrock</text>
+<text x="416" y="204" class="path">prompts/system_prompt.md</text>
+<text x="416" y="220" class="desc">ALL_TOOLS[:14] registered — no raw data access</text>
+
+<path class="flow" d="M 570,226 L 570,244" marker-end="url(#arrow)"/>
+<text x="582" y="238" class="flow-lbl">every tool call</text>
+<path class="flow dashed" d="M 700,244 L 700,226" marker-end="url(#arrow)"/>
+<text x="706" y="238" class="flow-lbl">cancel</text>
+
+<rect class="box-new" x="400" y="248" width="340" height="80"/>
+<text x="416" y="272" class="title">LimitsAndLoggingHooks</text>
+<rect class="badge-bg" x="640" y="256" width="62" height="16" rx="3"/>
+<text x="649" y="267" class="badge-txt">NEW/UPD</text>
+<text x="416" y="290" class="path">control.raise_if_blocking() first</text>
+<text x="416" y="306" class="desc">then max_runs / max_tool_calls / time budget</text>
+<text x="416" y="320" class="desc">logs every call → logs/events.jsonl</text>
+
+<path class="flow" d="M 570,328 L 570,346" marker-end="url(#arrow)"/>
+<text x="582" y="340" class="flow-lbl">allowed</text>
+
+<rect class="box" x="400" y="350" width="340" height="476"/>
+<text x="416" y="374" class="title">Agent tools (14)</text>
+<text x="416" y="396" class="path">list_datasets</text>
+<text x="416" y="412" class="path">get_dataset_info</text>
+<text x="416" y="428" class="path" fill="var(--amber)">check_dataset_support</text>
+<text x="416" y="444" class="path" fill="var(--amber)">report_all_datasets</text>
+<text x="416" y="460" class="path" fill="var(--blue)">run_geoguard</text>
+<text x="416" y="476" class="path">run_dataiq_structural_scan</text>
+<text x="416" y="492" class="path">run_dataiq_loss_scan</text>
+<text x="416" y="508" class="path">run_stresslab</text>
+<text x="416" y="524" class="path" fill="var(--blue)">launch_training</text>
+<text x="416" y="540" class="path">get_run_status · get_run_metrics</text>
+<text x="416" y="556" class="path">query_history · compare_runs</text>
+<text x="416" y="572" class="path">record_decision · record_adaptation</text>
+<text x="416" y="588" class="path">list_compatible_models</text>
+<text x="416" y="604" class="path">validate_model_compatibility</text>
+<text x="416" y="620" class="path">get_training_diagnostics</text>
+<text x="416" y="636" class="path">recommend_experiments</text>
+<text x="416" y="652" class="path">submit_final_model</text>
+<text x="416" y="668" class="path">upload_to_s3 · download_from_s3</text>
+<text x="416" y="692" class="desc" fill="var(--red)">no final_test_eval, no control tools</text>
+<text x="416" y="712" class="desc" fill="var(--text-faint)">agent.py wraps each with @tool</text>
+
+<!-- ===================== EXECUTION LANE ===================== -->
+<rect class="box-new" x="860" y="56" width="340" height="110"/>
+<text x="876" y="80" class="title">dataset_spec.py registry</text>
+<rect class="badge-bg" x="1130" y="64" width="40" height="16" rx="3"/>
+<text x="1136" y="75" class="badge-txt">NEW</text>
+<text x="876" y="98" class="path">spec_for(dataset) → DatasetSpec</text>
+<text x="876" y="114" class="desc">reads real geobench.LabelType, not a name table</text>
+<text x="876" y="130" class="desc">label_kind: single_label / multi_label / segmentation</text>
+<text x="876" y="146" class="desc">consumed by every box below — one source of truth</text>
+
+<path class="flow" d="M 1030,166 L 1030,184" marker-end="url(#arrow)"/>
+
+<rect class="box-new" x="860" y="188" width="340" height="110"/>
+<text x="876" y="212" class="title">GeoGuard</text>
+<rect class="badge-bg" x="950" y="196" width="40" height="16" rx="3"/>
+<text x="956" y="207" class="badge-txt">UPD</text>
+<text x="876" y="230" class="path">gotrain/geoguard/diagnostics.py, qa.py</text>
+<text x="876" y="246" class="desc">TRAIN split only, ≤ 300 samples</text>
+<text x="876" y="262" class="desc">band stats, SAR/optical modality, class balance</text>
+<text x="876" y="278" class="desc" fill="var(--amber)">compute_class_diagnostics: multi-hot aware now</text>
+
+<path class="flow" d="M 1030,298 L 1030,316" marker-end="url(#arrow)"/>
+
+<rect class="box-new" x="860" y="320" width="340" height="96"/>
+<text x="876" y="344" class="title">DataIQ</text>
+<rect class="badge-bg" x="930" y="328" width="40" height="16" rx="3"/>
+<text x="936" y="339" class="badge-txt">UPD</text>
+<text x="876" y="362" class="path">gotrain/dataiq/diagnostics.py, __init__.py</text>
+<text x="876" y="378" class="desc">structural scan: corruption, duplicates, auto-quarantine</text>
+<text x="876" y="394" class="desc" fill="var(--amber)">n_classes from registry, not labels.max()+1</text>
+<text x="876" y="408" class="desc" fill="var(--text-faint)">loss_scan: refuses multi-label explicitly (no silent wrong)</text>
+
+<path class="flow" d="M 1030,416 L 1030,434" marker-end="url(#arrow)"/>
+
+<rect class="box-new" x="860" y="438" width="340" height="80"/>
+<text x="876" y="462" class="title">Preflight gates</text>
+<rect class="badge-bg" x="1010" y="446" width="40" height="16" rx="3"/>
+<text x="1016" y="457" class="badge-txt">NEW</text>
+<text x="876" y="480" class="path">config_schema.validate_config()</text>
+<text x="876" y="496" class="desc">loss: auto/ce/bce · validate_class_weights</text>
+<text x="876" y="510" class="desc">rejection costs no run against max_runs</text>
+
+<path class="flow" d="M 1030,518 L 1030,536" marker-end="url(#arrow)"/>
+<text x="1042" y="530" class="flow-lbl">passes</text>
+
+<rect class="box-hl" x="860" y="540" width="340" height="140"/>
+<text x="876" y="564" class="title">Training subprocess</text>
+<rect class="badge-bg" x="1080" y="548" width="40" height="16" rx="3"/>
+<text x="1086" y="559" class="badge-txt">UPD</text>
+<text x="876" y="582" class="path">train_classification.py</text>
+<text x="876" y="598" class="path">train_segmentation.py</text>
+<text x="876" y="616" class="desc">single-label: CE / argmax / accuracy</text>
+<text x="876" y="632" class="desc" fill="var(--amber)">multi-label: BCE / sigmoid≥0.5 / micro-F1</text>
+<text x="876" y="648" class="desc">segmentation: CE·Dice·Focal / mIoU, any band count</text>
+<text x="876" y="664" class="desc" fill="var(--text-faint)">should_stop_training() checked every epoch</text>
+
+<path class="flow" d="M 1030,680 L 1030,698" marker-end="url(#arrow)"/>
+<text x="1042" y="692" class="flow-lbl">metrics + checkpoint</text>
+
+<rect class="box-new" x="860" y="702" width="340" height="110"/>
+<text x="876" y="726" class="title">StressLab</text>
+<rect class="badge-bg" x="950" y="710" width="40" height="16" rx="3"/>
+<text x="956" y="721" class="badge-txt">UPD</text>
+<text x="876" y="744" class="path">gotrain/stresslab/runner.py</text>
+<text x="876" y="760" class="desc">re-evaluates saved checkpoint on VALIDATION</text>
+<text x="876" y="776" class="desc">band dropout, noise, geometric perturbations</text>
+<text x="876" y="792" class="desc" fill="var(--amber)">multi-label: micro-F1 robustness score</text>
+
+<path class="flow" d="M 1030,812 L 1030,830" marker-end="url(#arrow)"/>
+
+<rect class="box" x="860" y="834" width="340" height="96"/>
+<text x="876" y="858" class="title">Record &amp; version</text>
+<text x="876" y="876" class="path">ledger.add_run · registry.register_run → vN</text>
+<text x="876" y="892" class="desc">hypothesis_outcome graded in code</text>
+<text x="876" y="908" class="desc">rollback.py: verify → activate prior vN</text>
+
+<!-- ===================== STATE ON DISK LANE ===================== -->
+<rect class="box-new" x="1320" y="56" width="280" height="64"/>
+<text x="1336" y="78" class="title">control.json</text>
+<rect class="badge-bg" x="1500" y="64" width="40" height="16" rx="3"/>
+<text x="1506" y="75" class="badge-txt">NEW</text>
+<text x="1336" y="96" class="desc">dashboard · hook · submit_final_model</text>
+<text x="1336" y="110" class="desc">PAUSED_FOR_ENGINEER / RESUME_REQUESTED</text>
+
+<rect class="box" x="1320" y="128" width="280" height="56"/>
+<text x="1336" y="150" class="title" style="font-size:12px;">approvals_state.json</text>
+<text x="1336" y="168" class="desc">approval gate · dashboard decisions</text>
+
+<rect class="box" x="1320" y="192" width="280" height="56"/>
+<text x="1336" y="214" class="title" style="font-size:12px;">ledger.jsonl</text>
+<text x="1336" y="232" class="desc">launch_training · record_decision history</text>
+
+<rect class="box" x="1320" y="256" width="280" height="56"/>
+<text x="1336" y="278" class="title" style="font-size:12px;">logs/events.jsonl · status.json</text>
+<text x="1336" y="296" class="desc">hooks · tools · training templates</text>
+
+<rect class="box-new" x="1320" y="320" width="280" height="64"/>
+<text x="1336" y="342" class="title" style="font-size:12px;">logs/geoguard/&lt;ds&gt;.json</text>
+<rect class="badge-bg" x="1512" y="328" width="40" height="16" rx="3"/>
+<text x="1518" y="339" class="badge-txt">NEW</text>
+<text x="1336" y="360" class="desc">run_geoguard report, label_kind included</text>
+<text x="1336" y="374" class="desc">DataIQ structural scan reports alongside</text>
+
+<rect class="box" x="1320" y="392" width="280" height="56"/>
+<text x="1336" y="414" class="title" style="font-size:12px;">runs/&lt;ds&gt;/&lt;run_id&gt;/</text>
+<text x="1336" y="432" class="desc">config.json · train.log · metrics.json</text>
+
+<rect class="box" x="1320" y="456" width="280" height="56"/>
+<text x="1336" y="478" class="title" style="font-size:12px;">models/&lt;ds&gt;/vN</text>
+<text x="1336" y="496" class="desc">registry.py · active_version (rollback target)</text>
+
+<rect class="box" x="1320" y="520" width="280" height="52"/>
+<text x="1336" y="541" class="title" style="font-size:12px;">S3 bucket</text>
+<text x="1336" y="558" class="desc">upload_to_s3 / download_from_s3, if configured</text>
+
+<rect class="box-hl" x="1320" y="580" width="280" height="90"/>
+<text x="1336" y="602" class="title">data/geobench/</text>
+<text x="1336" y="620" class="path">classification_v1.0/ · segmentation_v1.0/</text>
+<text x="1336" y="636" class="desc">TRAIN + VALIDATION read by templates, GeoGuard</text>
+<text x="1336" y="652" class="desc">recursix/geo-bench-1.0 on Hugging Face</text>
+
+<rect class="box-test" x="1320" y="700" width="280" height="150"/>
+<text x="1336" y="722" class="title" fill="var(--red)">GEO-Bench TEST split</text>
+<text x="1336" y="742" class="desc" fill="#f0a89c">locked · read only by final_eval.py</text>
+<text x="1336" y="758" class="desc" fill="#f0a89c">test_lock_&lt;ds&gt;.json marks "already evaluated"</text>
+<text x="1336" y="778" class="desc" fill="#f0a89c">never opened by: agent, tools, GeoGuard,</text>
+<text x="1336" y="794" class="desc" fill="#f0a89c">DataIQ, StressLab, training subprocess</text>
+
+<!-- cross-lane connectors (engine/execution/state) -->
+<path class="flow" d="M 740,460 L 820,460 L 820,242 L 856,242" marker-end="url(#arrow)"/>
+<text x="748" y="452" class="flow-lbl">run_geoguard</text>
+
+<path class="flow" d="M 740,524 L 800,524 L 800,610 L 856,610" marker-end="url(#arrow)"/>
+<text x="748" y="516" class="flow-lbl">launch_training</text>
+
+<path class="flow" d="M 1200,110 L 1260,110 L 1260,730 L 1316,730" marker-end="url(#arrow)"/>
+<text x="1206" y="102" class="flow-lbl">reports / reads</text>
+
+<path class="flow dashed" d="M 1200,546 L 1260,546 L 1260,600 L 1316,600" marker-end="url(#arrow)"/>
+<text x="1206" y="538" class="flow-lbl">reads TRAIN/VAL</text>
+
+<!-- engineer <-> execution: dashboard calls check_dataset_support directly -->
+<path class="flow" d="M 360,232 L 860,232" marker-end="url(#arrow)" opacity="0.55"/>
+<text x="560" y="226" class="flow-lbl" opacity="0.8">check_dataset_support / report_all_datasets</text>
+
+<!-- the ONE path to test, in red, spanning the whole bottom -->
+<path class="red-flow" d="M 360,775 L 1320,775" marker-end="url(#arrowRed)"/>
+<text x="750" y="768" class="red-lbl">only path to the TEST split — human-triggered, once per dataset</text>
+
+</svg>
+<figcaption>control / approvals / rollback flow in blue; the GEO-Bench TEST split is reachable only through the red path at bottom, via final_eval.py, triggered by a human, never by the agent.</figcaption>
+</figure>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GoPilot × GoTrain</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- =========================================================
+     SCREEN 1 — GoPilot product replica (full viewport)
+========================================================= -->
+<section id="demo-screen" class="demo-screen">
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <span class="brand-mark"><svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M12 2L2 19h20L12 2z" stroke="white" stroke-width="1.6" stroke-linejoin="round"/><circle cx="12" cy="14" r="2.2" fill="white"/></svg></span>
+      <span class="brand-name">GoPilot</span>
+      <span class="bell">&#128276;</span>
+    </div>
+
+    <button class="new-chat-btn" id="newChatBtn">+ New chat</button>
+
+    <nav class="sidebar-nav">
+      <a class="nav-item active"><span class="nav-ic">&#128172;</span>GoPilot</a>
+      <a class="nav-item"><span class="nav-ic">&#128230;</span>GoBox</a>
+      <a class="nav-item"><span class="nav-ic">&#128193;</span>Projects</a>
+      <a class="nav-item"><span class="nav-ic">&#128202;</span>Dashboard</a>
+      <a class="nav-item"><span class="nav-ic">&#128506;&#65039;</span>Map Studio</a>
+    </nav>
+
+    <div class="sidebar-section">
+      <div class="sidebar-section-label">GOTRAIN <span class="new-pill">NEW</span></div>
+      <nav class="sidebar-nav">
+        <a class="nav-item gotrain-item" id="navModelStudio"><span class="nav-ic">&#129514;</span>Model Studio</a>
+        <a class="nav-item gotrain-item" id="navEngConsole"><span class="nav-ic">&#128737;&#65039;</span>Engineer Console</a>
+      </nav>
+    </div>
+
+    <div class="sidebar-spacer"></div>
+
+    <div class="sidebar-section proposal-section">
+      <div class="sidebar-section-label">PROPOSAL</div>
+      <nav class="sidebar-nav">
+        <a class="nav-item" id="navArchitecture"><span class="nav-ic">&#128279;</span>Architecture</a>
+        <a class="nav-item" id="navBusiness"><span class="nav-ic">&#128200;</span>Business case</a>
+      </nav>
+    </div>
+
+    <div class="sidebar-footer">
+      Hackathon prototype (AUB ACM × RASID). Not endorsed by RASID.
+      Isolated from production. GoTrain is a proposed extension.
+    </div>
+  </aside>
+
+  <main class="map-pane">
+    <div class="map-badge">Prototype — map is a static image</div>
+    <img class="map-img" src="assets/map-crop.jpg" alt="satellite imagery — circular pivot-irrigation fields" />
+  </main>
+
+  <section class="chat-pane" id="chatPane">
+    <header class="chat-header">
+      <span>New chat</span>
+      <span class="chat-header-brand">GoPilot</span>
+    </header>
+
+    <div class="chat-body" id="chatBody">
+      <div class="chat-intro" id="chatIntro">
+        <p class="chat-intro-lead">Ask about any place on Earth. Try a suggestion:</p>
+        <div class="suggestion" data-idx="0"><span class="sug-ic sug-ic--blue">&#127970;</span>Map buildings within 2 km of the Eiffel Tower</div>
+        <div class="suggestion" data-idx="1"><span class="sug-ic sug-ic--green">&#127807;</span>How has Central Park's greenness changed?</div>
+        <div class="suggestion suggestion--demo" id="startDemoBtn" data-idx="2"><span class="sug-ic sug-ic--amber">&#128204;</span>I want to detect solar panels in my satellite images, but the existing model isn't performing well in my region.<span class="demo-tag">DEMO</span></div>
+        <div class="suggestion" data-idx="3"><span class="sug-ic sug-ic--teal">&#127757;</span>Carbon loss in the Brazilian Amazon</div>
+      </div>
+
+      <div class="chat-thread" id="chatThread"></div>
+    </div>
+
+    <footer class="chat-input-bar">
+      <span class="chat-input-ic">&#128206;</span>
+      <span class="chat-input-placeholder" id="chatInputPlaceholder">Click the highlighted action to continue the demo</span>
+      <button class="chat-send-btn" id="chatSendBtn" aria-label="send">&#10148;</button>
+    </footer>
+    <div class="restart-row"><button id="restartDemoBtn" class="restart-link">Restart demo</button></div>
+  </section>
+
+  <button class="scroll-cue" id="scrollCue">
+    <span>See the full GoTrain story</span>
+    <span class="scroll-cue-arrow">&#8595;</span>
+  </button>
+</section>
+
+<!-- =========================================================
+     SCREEN 1b — Model Studio (hidden until opened)
+========================================================= -->
+<section id="model-studio" class="overlay-screen">
+  <header class="overlay-header">
+    <div class="overlay-header-left">
+      <button class="icon-btn back-btn" data-close="model-studio">&#8592;</button>
+      <span class="overlay-title">Model Studio</span>
+      <span class="overlay-subtitle">GoTrain NEXUS · m-pv4ger-seg (solar panel segmentation)</span>
+    </div>
+    <div class="overlay-header-right">
+      <span class="sim-pill">SIMULATED DEMO DATA</span>
+      <button class="primary-btn" id="useInGoPilotBtn">Use in GoPilot</button>
+    </div>
+  </header>
+
+  <div class="studio-body" id="studioBody">
+    <!-- populated / interactive content lives in app.js + mirrors dashboard NEXUS panels -->
+  </div>
+</section>
+
+<!-- =========================================================
+     SCREEN 1c — Engineer Console (hidden until opened)
+========================================================= -->
+<section id="engineer-console" class="overlay-screen overlay-screen--eng">
+  <header class="overlay-header overlay-header--eng">
+    <div class="overlay-header-left">
+      <button class="icon-btn back-btn" data-close="engineer-console">&#8592;</button>
+      <span class="overlay-title">Engineer Console</span>
+      <span class="overlay-subtitle">Trust &amp; control plane — isolated from customer-facing GoPilot</span>
+    </div>
+    <div class="overlay-header-right">
+      <span class="eng-pill">ENGINEER-ONLY</span>
+    </div>
+  </header>
+
+  <div class="eng-body" id="engBody"></div>
+</section>
+
+<!-- =========================================================
+     SCROLL STORY — presentation sections
+========================================================= -->
+<main class="story">
+
+  <section class="story-section story-hero" id="story-top">
+    <div class="story-kicker">AUB ACM × RASID HACKATHON PROPOSAL</div>
+    <h1>GoTrain for GoPilot</h1>
+    <p class="story-hero-sub">An autonomous model-engineering agent, proposed as a native extension of RASID's GoPilot platform.</p>
+  </section>
+
+  <section class="story-section" id="problem">
+    <div class="story-label">A — The Problem</div>
+    <h2>GoPilot can analyze Earth.<br>But what happens when the model doesn't fit?</h2>
+    <div class="problem-grid">
+      <div class="problem-card">
+        <div class="problem-ic">&#127757;</div>
+        <h3>Regional drift</h3>
+        <p>A model trained on one region's imagery, sensor mix, and lighting degrades silently in another.</p>
+      </div>
+      <div class="problem-card">
+        <div class="problem-ic">&#128269;</div>
+        <h3>No diagnosis</h3>
+        <p>Customers see poor predictions, but have no way to know if it's the data, the model, or the task.</p>
+      </div>
+      <div class="problem-card">
+        <div class="problem-ic">&#9878;&#65039;</div>
+        <h3>No safe path to "fix it"</h3>
+        <p>Retraining a model today means a manual ML project — not something GoPilot can offer a customer in-chat.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="story-section story-solution" id="solution">
+    <div class="story-label">B — Our Solution</div>
+    <h2 class="solution-headline">
+      <span class="solution-line1">GoPilot tells you what Earth looks like.</span>
+      <span class="solution-line2">GoTrain teaches it what to look for next.</span>
+    </h2>
+    <p class="solution-copy">GoTrain is an autonomous model-engineering agent — Strands Agents running Claude Sonnet on Amazon Bedrock — that diagnoses a customer's dataset, adapts or trains a model, stress-tests it, and hands a reviewed, versioned model back to GoPilot. An engineer stays in the loop with pause, takeover, approval, and rollback at every step.</p>
+    <div class="solution-steps">
+      <div class="solution-step"><span class="step-num">1</span>Diagnose dataset &amp; model fit</div>
+      <div class="solution-arrow">&#8594;</div>
+      <div class="solution-step"><span class="step-num">2</span>Autonomously experiment</div>
+      <div class="solution-arrow">&#8594;</div>
+      <div class="solution-step"><span class="step-num">3</span>Stress-test robustness</div>
+      <div class="solution-arrow">&#8594;</div>
+      <div class="solution-step"><span class="step-num">4</span>Engineer review &amp; rollback safety</div>
+      <div class="solution-arrow">&#8594;</div>
+      <div class="solution-step"><span class="step-num">5</span>Return to GoPilot</div>
+    </div>
+  </section>
+
+  <section class="story-section story-arch" id="architecture">
+    <div class="story-label">C — Technical Architecture</div>
+    <h2>How GoTrain plugs into GoPilot</h2>
+    <p class="arch-sub">Click any component for a plain-language explanation. Dashed = proposed integration.</p>
+    <div class="arch-diagram-wrap">
+      <div id="archDiagramMount"></div>
+    </div>
+    <div class="arch-explain" id="archExplain">
+      <div class="arch-explain-placeholder">Click a component above to see what it does.</div>
+    </div>
+  </section>
+
+  <section class="story-section" id="different">
+    <div class="story-label">D — Why We're Different</div>
+    <h2>Four advantages</h2>
+    <div class="diff-grid">
+      <div class="diff-card">
+        <div class="diff-num">01</div>
+        <h3>Intelligent EO preprocessing</h3>
+        <p>GeoGuard and DataIQ diagnose band stats, modality, class balance, corruption, and duplicates before a single training run starts.</p>
+      </div>
+      <div class="diff-card">
+        <div class="diff-num">02</div>
+        <h3>Explainable autonomy</h3>
+        <p>Every experiment is logged with a hypothesis and an outcome graded in code — not just a black-box sweep.</p>
+      </div>
+      <div class="diff-card">
+        <div class="diff-num">03</div>
+        <h3>Robustness beyond accuracy</h3>
+        <p>StressLab re-evaluates checkpoints under band dropout, noise, and geometric perturbation — one accuracy number isn't trust.</p>
+      </div>
+      <div class="diff-card">
+        <div class="diff-num">04</div>
+        <h3>Engineer authority, always</h3>
+        <p>Pause, manual takeover, approve/reject, verified rollback, and a full audit trail — autonomy with a human backstop.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="story-section story-loop" id="loop">
+    <div class="story-label">E — Product Loop</div>
+    <h2>The cycle</h2>
+    <div class="loop-diagram" id="loopDiagram">
+      <div class="loop-node"><div class="loop-ic">&#128172;</div>GoPilot identifies a model limitation</div>
+      <div class="loop-arrow">&#8594;</div>
+      <div class="loop-node loop-node--accent"><div class="loop-ic">&#129514;</div>GoTrain adapts the model</div>
+      <div class="loop-arrow">&#8594;</div>
+      <div class="loop-node"><div class="loop-ic">&#128737;&#65039;</div>Engineer reviews</div>
+      <div class="loop-arrow">&#8594;</div>
+      <div class="loop-node"><div class="loop-ic">&#9989;</div>Approved model returns to GoPilot</div>
+      <div class="loop-arrow">&#8594;</div>
+      <div class="loop-node loop-node--proposed"><div class="loop-ic">&#128260;</div>Customer feedback <span class="proposed-tag">proposed</span></div>
+    </div>
+  </section>
+
+  <section class="story-section" id="business">
+    <div class="story-label">F — Business Opportunity</div>
+    <h2>Monetizing custom model training</h2>
+    <p class="business-disclaimer">Illustrative tiers only — not verified pricing or an official RASID offer.</p>
+    <div class="tier-grid">
+      <div class="tier-card">
+        <h3>Explore</h3>
+        <div class="tier-tagline">Dataset diagnostics</div>
+        <ul>
+          <li>GeoGuard + DataIQ scan</li>
+          <li>Model compatibility report</li>
+          <li>No training run included</li>
+        </ul>
+      </div>
+      <div class="tier-card tier-card--highlight">
+        <h3>Build</h3>
+        <div class="tier-tagline">Usage-based custom training</div>
+        <ul>
+          <li>Autonomous adaptation runs</li>
+          <li>StressLab robustness report</li>
+          <li>Pay per training hour / run</li>
+        </ul>
+      </div>
+      <div class="tier-card">
+        <h3>Enterprise</h3>
+        <div class="tier-tagline">Private deployment &amp; governance</div>
+        <ul>
+          <li>Private model registry</li>
+          <li>Engineer console &amp; audit export</li>
+          <li>SLA-backed rollback guarantees</li>
+        </ul>
+      </div>
+    </div>
+    <div class="business-benefits">
+      <span>Customer retention</span><span>Specialized regional models</span><span>Recurring training usage</span><span>Enterprise adoption</span>
+    </div>
+  </section>
+
+  <section class="story-section story-closing" id="closing">
+    <h2 class="closing-headline">We didn't just build an AI agent.<br>We designed how it becomes a product.</h2>
+    <p class="closing-sub">Autonomous when it can be. Accountable when it matters.</p>
+    <button class="reset-demo-btn" id="resetDemoBtn">&#8635; Reset demo</button>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
