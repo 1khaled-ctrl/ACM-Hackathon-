@@ -1,0 +1,356 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>GoTrain Tool Manifest</title>
+<style>
+  :root{
+    --bg:#0E141F;
+    --surface:#171F2E;
+    --surface-2:#1C2536;
+    --border:#2B3750;
+    --text:#E7ECF5;
+    --text-muted:#8C9AB2;
+    --accent:#F0A93D;
+    --accent-soft:rgba(240,169,61,0.14);
+    --restricted:#E2585A;
+    --restricted-soft:rgba(226,88,90,0.12);
+    --dot:rgba(140,154,178,0.16);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0E141F; --surface:#171F2E; --surface-2:#1C2536; --border:#2B3750;
+      --text:#E7ECF5; --text-muted:#8C9AB2; --accent:#F0A93D;
+      --accent-soft:rgba(240,169,61,0.14); --restricted:#E2585A;
+      --restricted-soft:rgba(226,88,90,0.12); --dot:rgba(140,154,178,0.16);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0E141F; --surface:#171F2E; --surface-2:#1C2536; --border:#2B3750;
+    --text:#E7ECF5; --text-muted:#8C9AB2; --accent:#F0A93D;
+    --accent-soft:rgba(240,169,61,0.14); --restricted:#E2585A;
+    --restricted-soft:rgba(226,88,90,0.12); --dot:rgba(140,154,178,0.16);
+  }
+  :root[data-theme="light"]{
+    --bg:#EEF1F7; --surface:#FFFFFF; --surface-2:#E6EBF3; --border:#CDD6E6;
+    --text:#141C2B; --text-muted:#5B6B82; --accent:#B5791A;
+    --accent-soft:rgba(181,121,26,0.12); --restricted:#C23A3C;
+    --restricted-soft:rgba(194,58,60,0.10); --dot:rgba(91,107,130,0.14);
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#EEF1F7; --surface:#FFFFFF; --surface-2:#E6EBF3; --border:#CDD6E6;
+      --text:#141C2B; --text-muted:#5B6B82; --accent:#B5791A;
+      --accent-soft:rgba(181,121,26,0.12); --restricted:#C23A3C;
+      --restricted-soft:rgba(194,58,60,0.10); --dot:rgba(91,107,130,0.14);
+    }
+  }
+
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:
+      radial-gradient(var(--dot) 1px, transparent 1px) 0 0/22px 22px,
+      var(--bg);
+    color:var(--text);
+    font-family:-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
+    line-height:1.5;
+  }
+  .wrap{max-width:980px;margin:0 auto;padding:64px 28px 96px;}
+
+  .mono{
+    font-family:ui-monospace,"SF Mono","Cascadia Code","Consolas","Liberation Mono",monospace;
+  }
+
+  /* ---- hero ---- */
+  .eyebrow{
+    font-size:12.5px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent);margin:0 0 14px;
+  }
+  h1{
+    font-size:clamp(32px,5vw,46px);
+    font-weight:750;
+    letter-spacing:-0.01em;
+    margin:0 0 14px;
+    text-wrap:balance;
+  }
+  .dek{
+    font-size:16.5px;color:var(--text-muted);max-width:62ch;margin:0 0 28px;
+  }
+  .meta{
+    display:flex;flex-wrap:wrap;gap:10px;
+    padding:0;margin:0 0 8px;list-style:none;
+  }
+  .meta li{
+    font-size:12.5px;color:var(--text-muted);
+    border:1px solid var(--border);border-radius:999px;
+    padding:6px 13px;background:var(--surface);
+  }
+  .meta b{color:var(--text);font-weight:650;}
+
+  hr.rule{border:none;border-top:1px solid var(--border);margin:44px 0 36px;}
+
+  /* ---- stage sections ---- */
+  .stage{margin-bottom:46px;}
+  .stage-head{
+    display:flex;align-items:baseline;gap:14px;margin-bottom:18px;
+  }
+  .stage-num{
+    font-family:ui-monospace,"SF Mono","Cascadia Code",monospace;
+    font-size:13px;font-weight:600;color:var(--text-muted);
+    border:1px solid var(--border);border-radius:6px;
+    padding:3px 8px;
+    font-variant-numeric:tabular-nums;
+  }
+  .stage-title{
+    font-size:19px;font-weight:700;letter-spacing:-0.005em;
+  }
+  .stage-sub{
+    font-size:13px;color:var(--text-muted);margin:2px 0 0 0;
+    flex:1 1 auto;text-align:right;
+  }
+
+  .grid{
+    display:grid;
+    grid-template-columns:repeat(auto-fill,minmax(258px,1fr));
+    gap:12px;
+  }
+  .card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:10px;
+    padding:14px 16px 15px;
+  }
+  .card .sig{
+    font-size:13px;font-weight:600;color:var(--text);
+    display:block;margin-bottom:6px;word-break:break-word;
+  }
+  .card .sig .fn{color:var(--accent);}
+  .card .desc{
+    font-size:13px;color:var(--text-muted);margin:0;
+  }
+
+  /* ---- restricted callout ---- */
+  .restricted{
+    border:1px dashed var(--restricted);
+    background:var(--restricted-soft);
+    border-radius:10px;
+    padding:20px 22px;
+    display:flex;gap:16px;align-items:flex-start;
+  }
+  .restricted .tag{
+    font-size:11px;font-weight:750;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--restricted);border:1px solid var(--restricted);
+    border-radius:5px;padding:4px 9px;white-space:nowrap;
+    flex-shrink:0;margin-top:2px;
+  }
+  .restricted .sig{font-size:13.5px;font-weight:650;margin-bottom:5px;display:block;}
+  .restricted p{margin:0;font-size:13.5px;color:var(--text-muted);max-width:66ch;}
+  .restricted .sig .fn{color:var(--restricted);}
+
+  footer{
+    margin-top:48px;font-size:12.5px;color:var(--text-muted);
+    border-top:1px solid var(--border);padding-top:20px;
+  }
+
+  @media (max-width:520px){
+    .stage-head{flex-wrap:wrap;}
+    .stage-sub{text-align:left;flex-basis:100%;}
+  }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">GoTrain &middot; Strands Agent on Amazon Bedrock</p>
+  <h1>Tool Manifest</h1>
+  <p class="dek">Every tool wired into the GoTrain training agent, in the order it moves through them &mdash; from first look at a dataset to a submitted model. 28 tools, six stages, one deliberately withheld.</p>
+  <ul class="meta">
+    <li><b>Runtime</b> &nbsp;strands-agents 1.63.0</li>
+    <li><b>Limits</b> &nbsp;max runs / time / tool-calls enforced in code</li>
+    <li><b>Logging</b> &nbsp;every call &rarr; logs/events.jsonl</li>
+  </ul>
+
+  <hr class="rule" />
+
+  <section class="stage">
+    <div class="stage-head">
+      <span class="stage-num mono">01</span>
+      <span class="stage-title">Dataset Intake</span>
+      <span class="stage-sub">4 tools</span>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <span class="sig mono"><span class="fn">list_datasets</span>()</span>
+        <p class="desc">Lists the GEO-Bench dataset names available locally.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">get_dataset_info</span>(dataset)</span>
+        <p class="desc">Split sizes, band names, image shape, label/class info.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">check_dataset_support</span>(dataset)</span>
+        <p class="desc">Checks training/eval code support for one dataset without downloading it.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">report_all_datasets</span>()</span>
+        <p class="desc">Runs that support check across all 12 hackathon datasets at once.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="stage">
+    <div class="stage-head">
+      <span class="stage-num mono">02</span>
+      <span class="stage-title">Data Quality</span>
+      <span class="stage-sub">6 tools</span>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <span class="sig mono"><span class="fn">run_geoguard</span>(dataset, task_type)</span>
+        <p class="desc">Pre-training scan of the train split's pixel stats and sensor characteristics.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">run_dataiq_structural_scan</span>(&hellip;)</span>
+        <p class="desc">Flags corrupted files and exact duplicates &mdash; NaNs, saturation, bad labels.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">run_dataiq_loss_scan</span>(&hellip;, run_id)</span>
+        <p class="desc">Model-assisted scan using a checkpoint to flag suspicious, high-loss examples.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">run_stresslab</span>(&hellip;, run_id)</span>
+        <p class="desc">Re-evaluates a checkpoint on validation under a battery of input perturbations.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">list_data_proposals</span>(dataset?)</span>
+        <p class="desc">Lists pending sample-exclusion proposals raised by the scans above.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">create_data_manifest</span>(&hellip;)</span>
+        <p class="desc">Builds a training manifest that excludes the flagged samples.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="stage">
+    <div class="stage-head">
+      <span class="stage-num mono">03</span>
+      <span class="stage-title">Model Selection</span>
+      <span class="stage-sub">3 tools</span>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <span class="sig mono"><span class="fn">list_compatible_models</span>(task_type, dataset?)</span>
+        <p class="desc">Candidate pretrained backbones/encoders from the curated model registry.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">estimate_model_resources</span>(model_id)</span>
+        <p class="desc">Rough, explicitly-labeled parameter-count and GPU estimate &mdash; never a measurement.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">validate_model_compatibility</span>(&hellip;)</span>
+        <p class="desc">Actually builds the model for the real band/class count and runs one forward pass.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="stage">
+    <div class="stage-head">
+      <span class="stage-num mono">04</span>
+      <span class="stage-title">Planning &amp; Diagnostics</span>
+      <span class="stage-sub">4 tools</span>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <span class="sig mono"><span class="fn">get_training_diagnostics</span>(dataset, run_id)</span>
+        <p class="desc">Deterministic read of a completed run's ledger entry and metrics &mdash; no inference.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">get_resource_status</span>(dataset)</span>
+        <p class="desc">Live run / tool-call / data-experiment budget counters.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">estimate_run_cost</span>(dataset, config)</span>
+        <p class="desc">Predicts GPU-minutes for a candidate config from this dataset's own run history.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">recommend_experiments</span>(dataset, run_id)</span>
+        <p class="desc">Ranked, single-variable suggestions for what to try next.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="stage">
+    <div class="stage-head">
+      <span class="stage-num mono">05</span>
+      <span class="stage-title">Training &amp; Run Tracking</span>
+      <span class="stage-sub">7 tools</span>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <span class="sig mono"><span class="fn">launch_training</span>(dataset, task_type, config)</span>
+        <p class="desc">Starts a run &mdash; hard-capped by run/time/tool-call limits enforced in code.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">get_run_status</span>(run_id)</span>
+        <p class="desc">Full ledger record: config, val_metric, decision, rationale, parent_id.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">get_run_metrics</span>(run_id)</span>
+        <p class="desc">Just the metrics: val_metric, delta_vs_parent, gpu_minutes.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">query_history</span>(dataset?)</span>
+        <p class="desc">Every past run &mdash; required reading before each launch_training call.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">compare_runs</span>(run_id_a, run_id_b)</span>
+        <p class="desc">Config diff and validation-metric delta between two runs.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">record_decision</span>(run_id, decision, rationale)</span>
+        <p class="desc">Marks a run kept, discarded, or pending.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">record_adaptation</span>(&hellip;)</span>
+        <p class="desc">Logs how the agent responded when a proposal was rejected or blocked.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="stage">
+    <div class="stage-head">
+      <span class="stage-num mono">06</span>
+      <span class="stage-title">Reporting &amp; Finalization</span>
+      <span class="stage-sub">4 tools</span>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <span class="sig mono"><span class="fn">generate_goaudit_report</span>(dataset)</span>
+        <p class="desc">Persists an engineering report: every kept/discarded decision and its rationale.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">submit_final_model</span>(dataset, run_id)</span>
+        <p class="desc">Records the agent's final choice in the ledger &mdash; evaluates nothing.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">upload_to_s3</span>(dataset, version)</span>
+        <p class="desc">Pushes a registered model version to S3, if a bucket is configured.</p>
+      </div>
+      <div class="card">
+        <span class="sig mono"><span class="fn">download_from_s3</span>(dataset, version)</span>
+        <p class="desc">Pulls a model version's files back into the local registry.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule" />
+
+  <div class="restricted">
+    <span class="tag">Withheld</span>
+    <div>
+      <span class="sig mono"><span class="fn">final_test_eval</span>()</span>
+      <p>Not in the agent's tool list, on purpose. The agent may only ever see validation metrics &mdash; the test split is scored exactly once, by a human, via <code>run_final_eval.py</code>.</p>
+    </div>
+  </div>
+
+  <footer>Source: <code class="mono">gotrain/agent.py</code> &middot; <code class="mono">ALL_TOOLS</code></footer>
+</div>
+
+</body></html>
